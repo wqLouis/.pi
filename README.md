@@ -8,6 +8,8 @@ self-managing, multi-agent system. Four extensions, loaded from
 2. **subagent** — the agent spawns, steers, waits on, and scopes subagents that work for it.
 3. **bash-timeout** — commands can't hang the agent forever.
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
+5. **agent-knowledge** — a persistent, cross-session knowledge base.
+6. **agent-schedule** — deferred reminders that fire in realtime.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -112,6 +114,38 @@ chromium (`bun add -g playwright && playwright install chromium`, with a
 verified headless launch) and reports status, with a `force` flag.
 
 ---
+
+## 5. agent-knowledge — long-term memory beyond the conversation
+
+A shared note store (`~/.pi/agent/kb/`, plain markdown files) that survives
+restarts, new sessions, and is visible to every subagent. The agent persists
+findings, decisions, and project facts it wants to remember long-term — the
+layer above the in-conversation memory tools.
+
+| Tool | Purpose |
+|------|---------|
+| `kb_save { name, content, overwrite? }` | Save/update a note (slugged filename, duplicate-safe) |
+| `kb_get { name }` | Read a note |
+| `kb_search { query }` | Case-insensitive search over names + contents, with snippets |
+| `kb_list` | All notes with size + last-updated |
+| `kb_delete { name }` | Remove a note |
+
+Plus `/kb list | get <name> | search <query> | delete <name>`.
+
+## 6. agent-schedule — deferred reminders
+
+The agent schedules reminders ("check the build in 10 minutes") persisted to
+`~/.pi/agent/schedule.json`. A poller fires due items in realtime
+(`followUp` + `triggerTurn`, so an idle agent wakes up and acts), and items
+that came due while pi was closed are fired on the next startup.
+
+| Tool | Purpose |
+|------|---------|
+| `schedule_add { text, inMinutes }` | Schedule a reminder (fractions allowed; max 24h) |
+| `schedule_list` | Pending reminders with due times |
+| `schedule_cancel { id }` | Cancel by id |
+
+Plus `/schedule list | cancel <id>`.
 
 ## Setup
 
