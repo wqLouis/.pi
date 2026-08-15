@@ -571,14 +571,43 @@ const running = new Map<string, RunningEntry>();
 function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
 	const failed = isFailedRun(run);
 	const preview = firstLine(rec.lastOutput).slice(0, 200);
-	const label = failed ? "failed" : "done";
+
+	if (failed) {
+		// Bubble the error to the main agent with concrete recovery options so it
+		// can steer the subagent (subagent_send) or respawn it (subagent_spawn).
+		const reason = run.stopReason ?? `exit code ${run.exitCode}`;
+		const detail = (run.errorMessage || run.stderr || preview || "(no output)").slice(0, 300);
+		const text =
+			`[subagent ${rec.id} error] ${reason}: ${detail}\n\n` +
+			`The subagent's run failed. Resolve it:\n` +
+			`- Steer it to fix the error: subagent_send { subagentId: "${rec.id}", message: "<what to fix>" } — it resumes with its full context\n` +
+			`- Respawn a fresh subagent: subagent_spawn { task: "<retry the work>", ... }\n` +
+			`- Inspect the full transcript first: subagent_result { subagentId: "${rec.id}" }\n` +
+			`- Discard it: subagent_forget { subagentId: "${rec.id}" }`;
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Subagent ${rec.id} error: ${reason}`, "error");
+		}
+		api.sendMessage(
+			{
+				customType: "subagent-error",
+				content: text,
+				display: true,
+				details: { subagentId: rec.id, status: "error", reason, error: detail, output: rec.lastOutput },
+			},
+			// Realtime: if the agent is idle this starts a turn immediately (triggerTurn);
+			// if it is streaming the message is queued into the current turn (followUp).
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+		return;
+	}
+
 	if (ctx.hasUI) {
-		ctx.ui.notify(`Subagent ${rec.id} ${label}${failed ? "" : `: ${preview}`}`, failed ? "error" : "info");
+		ctx.ui.notify(`Subagent ${rec.id} done: ${preview}`, "info");
 	}
 	api.sendMessage(
 		{
 			customType: "subagent-notify",
-			content: `[subagent ${rec.id} ${label}] ${preview || "(no output)"}`,
+			content: `[subagent ${rec.id} done] ${preview || "(no output)"}`,
 			display: true,
 			details: { subagentId: rec.id, status: rec.status, output: rec.lastOutput },
 		},
@@ -899,6 +928,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use subagent_spawn to delegate long or independent work to an isolated subagent; use await: false for background work, then subagent_wait.",
 			"Use subagent_send to steer a subagent — it continues with its full previous context.",
+			"If a subagent errors, steer it to fix the error with subagent_send or respawn it with subagent_spawn — don't just give up.",
 		],
 		parameters: SpawnParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -1234,6 +1264,9 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Only works when the subagent is not currently running — wait for it first with subagent_wait.",
 		promptSnippet: "Send a steering message to a subagent",
+		promptGuidelines: [
+			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_send (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
+		],
 		parameters: SendParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const message = params.message?.trim();
