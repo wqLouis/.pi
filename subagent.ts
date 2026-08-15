@@ -1864,70 +1864,82 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 		const effectiveModel = cfg.model ?? sessionModel ?? "(none)";
 
+		// items order is fixed (search disabled) — we mirror the selection to
+		// intercept digit input on the numeric rows for direct value entry.
+		const items: Array<{ id: string; label: string; description?: string; currentValue: string; submenu?: (cur: string, done: (v?: string) => void) => Component }> = [
+			{
+				id: "model",
+				label: "Model",
+				description: "Model used by new subagents. Enter to pick (inherits the session model when unset).",
+				currentValue: effectiveModel,
+			},
+			{
+				id: "maxDepth",
+				label: "Nesting layers",
+				description: "How many subagent generations deep nesting may go (1 = no sub-subagents). Type a number directly to set it.",
+				currentValue: String(getMaxDepth()),
+			},
+			{
+				id: "maxSubagents",
+				label: "Concurrent subagents",
+				description: "Maximum subagents running at once, across all layers. Type a number directly to set it.",
+				currentValue: String(getMaxSubagents()),
+			},
+			{
+				id: "cwd",
+				label: "Working directory",
+				description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
+				currentValue: cfg.cwd ?? "(inherit — session cwd)",
+			},
+			{
+				id: "tools",
+				label: "Tool allowlist",
+				description: "Tools available to subagents (all tools by default).",
+				currentValue: cfg.tools ?? "(all)",
+			},
+			{
+				id: "systemPrompt",
+				label: "System prompt",
+				description: "Custom system prompt for subagents (the default subagent prompt otherwise).",
+				currentValue: cfg.systemPrompt ? `custom (${cfg.systemPrompt.length} chars)` : "(default)",
+			},
+		];
+		items[0].submenu = (_cur, selectDone) =>
+			new SubagentModelPicker(collectModels(ctx), "", cfg.model ?? sessionModel, theme, (label) => {
+				if (label) {
+					const next = loadConfig();
+					next.model = label;
+					saveConfig(next);
+					settingsList.updateValue("model", label);
+				}
+				selectDone(label);
+			}) as unknown as Component;
+
+		const numericIds = new Set(["maxDepth", "maxSubagents"]);
+		let sel = 0; // mirrored selection (items order is fixed)
+		let buffer = ""; // in-progress digit entry for the numeric row
+
+		const currentValueOf = (id: string) => (id === "maxDepth" ? String(getMaxDepth()) : String(getMaxSubagents()));
+
+		const commitNumber = () => {
+			const id = items[sel].id;
+			const n = Number(buffer);
+			if (numericIds.has(id) && Number.isInteger(n) && n >= 1) {
+				const next = loadConfig();
+				if (id === "maxDepth") next.maxDepth = n;
+				else next.maxSubagents = n;
+				saveConfig(next);
+			}
+			buffer = "";
+			settingsList.updateValue(id, currentValueOf(id));
+		};
+
 		const settingsList = new SettingsList(
-			[
-				{
-					id: "model",
-					label: "Model",
-					description: "Model used by new subagents. Enter to pick (inherits the session model when unset).",
-					currentValue: effectiveModel,
-					submenu: (_cur, selectDone) =>
-						new SubagentModelPicker(collectModels(ctx), "", cfg.model ?? sessionModel, theme, (label) => {
-							if (label) {
-								const next = loadConfig();
-								next.model = label;
-								saveConfig(next);
-								settingsList.updateValue("model", label);
-							}
-							selectDone(label);
-						}) as unknown as Component,
-				},
-				{
-					id: "maxDepth",
-					label: "Nesting layers",
-					description: "How many subagent generations deep nesting may go (1 = no sub-subagents). Enter to change.",
-					currentValue: String(getMaxDepth()),
-					values: ["1", "2", "3", "4", "5", "6"],
-				},
-				{
-					id: "maxSubagents",
-					label: "Concurrent subagents",
-					description: "Maximum subagents running at once, across all layers. Enter to change.",
-					currentValue: String(getMaxSubagents()),
-					values: ["1", "2", "3", "4", "5", "6", "8", "10"],
-				},
-				{
-					id: "running",
-					label: "Running now",
-					description: "Subagents currently running vs the maxSubagents limit.",
-					currentValue: `${countRunningSubagents()}/${getMaxSubagents()}`,
-				},
-				{
-					id: "cwd",
-					label: "Working directory",
-					description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
-					currentValue: cfg.cwd ?? "(inherit — session cwd)",
-				},
-				{
-					id: "tools",
-					label: "Tool allowlist",
-					description: "Tools available to subagents (all tools by default).",
-					currentValue: cfg.tools ?? "(all)",
-				},
-				{
-					id: "systemPrompt",
-					label: "System prompt",
-					description: "Custom system prompt for subagents (the default subagent prompt otherwise).",
-					currentValue: cfg.systemPrompt ? `custom (${cfg.systemPrompt.length} chars)` : "(default)",
-				},
-			],
+			items,
 			10,
 			getSettingsListTheme(),
-			(id, newValue) => {
-				const next = loadConfig();
-				if (id === "maxDepth" || id === "maxSubagents") next[id] = Number(newValue);
-				else if (id === "model") next.model = newValue;
-				saveConfig(next);
+			(_id, _newValue) => {
+				/* numeric edits are committed by commitNumber */
 			},
 			() => done(undefined),
 			{ enableSearch: false },
@@ -1938,12 +1950,43 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		container.addChild(border);
 		container.addChild(new Text(theme.fg("accent", theme.bold("Subagent settings")), 1, 0));
 		container.addChild(settingsList);
-		container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · Enter change · Esc close"), 1, 0));
+		container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · type number to set · Enter commit · Esc close"), 1, 0));
 		container.addChild(border);
 		return {
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),
-			handleInput: (data: string) => settingsList.handleInput(data),
+			handleInput: (data: string) => {
+				// mirror SettingsList's selection navigation (wraps around)
+				if (matchesKey(data, "up")) sel = sel === 0 ? items.length - 1 : sel - 1;
+				else if (matchesKey(data, "down")) sel = sel === items.length - 1 ? 0 : sel + 1;
+
+				const row = items[sel];
+				if (row && numericIds.has(row.id)) {
+					// direct integer entry on numeric rows
+					if (data.length === 1 && data >= "0" && data <= "9") {
+						buffer = (buffer + data).slice(0, 3);
+						settingsList.updateValue(row.id, buffer);
+						return;
+					}
+					if (data === "\x7f" || data === "\b") {
+						buffer = buffer.slice(0, -1);
+						settingsList.updateValue(row.id, buffer || currentValueOf(row.id));
+						return;
+					}
+					if (matchesKey(data, "enter")) {
+						if (buffer) commitNumber();
+						return;
+					}
+					if (matchesKey(data, "escape")) {
+						if (buffer) {
+							buffer = "";
+							settingsList.updateValue(row.id, currentValueOf(row.id));
+							return;
+						}
+					}
+				}
+				settingsList.handleInput(data);
+			},
 		};
 	});
 }
