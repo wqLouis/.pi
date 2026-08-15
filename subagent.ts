@@ -710,6 +710,17 @@ async function waitForSubagent(
 		if (signal?.aborted) return { status: "aborted", output: "" };
 		if (Date.now() > deadline) return { status: "timeout", output: "" };
 
+		// An errored (or otherwise finished) record ends the wait immediately —
+		// never wait indefinitely on a subagent that has already failed.
+		const recNow = loadRecord(id);
+		if (recNow && recNow.status !== "running") {
+			return {
+				status: "done",
+				output: recNow.lastOutput ?? "",
+				note: recNow.status === "error" ? "subagent errored" : undefined,
+			};
+		}
+
 		const entry = running.get(id);
 		const partial = entry ? entry.getPartial() : "";
 		if (onUpdate) {
@@ -1173,14 +1184,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Live done-count: a target is done when its running entry is gone (and the
-			// record isn't running) OR its process is already dead (finalization pending).
+			// Live done-count: a target is done when its record is no longer running
+			// (finished OR errored), its running entry is gone, or its process is
+			// already dead (finalization pending).
 			const isDone = (tid: string): boolean => {
+				const rec = loadRecord(tid);
+				if (rec && rec.status !== "running") return true;
 				const entry = running.get(tid);
-				if (!entry) {
-					const rec = loadRecord(tid);
-					return !rec || rec.status !== "running";
-				}
+				if (!entry) return true;
 				if (entry.proc.pid != null) {
 					try {
 						process.kill(entry.proc.pid, 0);
