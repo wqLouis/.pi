@@ -8,7 +8,7 @@ self-managing, multi-agent system. Four extensions, loaded from
 2. **subagent** — the agent spawns, steers, waits on, and scopes subagents that work for it.
 3. **bash-timeout** — commands can't hang the agent forever.
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
-5. **agent-knowledge** — a persistent, cross-session knowledge base.
+5. **agent-tasks** — a plain-markdown task board per session.
 6. **agent-schedule** — deferred reminders that fire in realtime.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
@@ -115,22 +115,20 @@ verified headless launch) and reports status, with a `force` flag.
 
 ---
 
-## 5. agent-knowledge — long-term memory beyond the conversation
+## 5. agent-tasks — a plain-markdown task board
 
-A shared note store (`~/.pi/agent/kb/`, plain markdown files) that survives
-restarts, new sessions, and is visible to every subagent. The agent persists
-findings, decisions, and project facts it wants to remember long-term — the
-layer above the in-conversation memory tools.
+No tool-based task system — just a `TASK.md` file per session that the agent
+reads with `read` and updates directly with the `edit` tool (fully
+transparent, plain text). The extension only initializes the file and tells
+the agent where it lives via a system-prompt guideline.
 
-| Tool | Purpose |
-|------|---------|
-| `kb_save { name, content, overwrite? }` | Save/update a note (slugged filename, duplicate-safe) |
-| `kb_get { name }` | Read a note |
-| `kb_search { query }` | Case-insensitive search over names + contents, with snippets |
-| `kb_list` | All notes with size + last-updated |
-| `kb_delete { name }` | Remove a note |
+- **Main agent:** `/tmp/<session_id>/TASK.md`
+- **Subagents:** nested under their parent — `/tmp/<session_id>/<subagent_id>/TASK.md`
+  (and deeper layers nest further). The parent session id and chain are passed
+  to subagent processes via `PI_TASK_BASE`.
 
-Plus `/kb list | get <name> | search <query> | delete <name>`.
+`/task` shows the board (or `/task init` recreates it). Override the root dir
+with `PI_TASK_DIR` (default `/tmp`).
 
 ## 6. agent-schedule — deferred reminders
 

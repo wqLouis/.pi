@@ -425,6 +425,25 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
  * Spawn one subagent turn. Returns the child handle plus a promise that
  * resolves with the run result when the process exits (message stream parsed).
  */
+/** This process's task-board base: env PI_TASK_BASE (subagent) or /tmp/<session> (main). */
+function currentTaskBase(ctx: ExtensionContext | undefined): string {
+	if (process.env.PI_TASK_BASE) return process.env.PI_TASK_BASE;
+	const dir = process.env.PI_TASK_DIR || "/tmp";
+	let sessionId = "session";
+	try {
+		sessionId = ctx?.sessionManager.getSessionId() ?? "session";
+	} catch {
+		/* no session manager */
+	}
+	const safe = sessionId.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "session";
+	return path.join(dir, safe);
+}
+
+/** The child's task-board base: <parent base>/<child id> (nested under the session). */
+function childTaskBase(ctx: ExtensionContext | undefined, childId: string): string {
+	return path.join(currentTaskBase(ctx), childId);
+}
+
 async function spawnSubagentProcess(
 	rec: SubagentRecord,
 	userText: string,
@@ -432,6 +451,7 @@ async function spawnSubagentProcess(
 	signal: AbortSignal | undefined,
 	onUpdate?: (text: string) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
+	taskBase?: string,
 ): Promise<{ proc: ChildProcess; done: Promise<RunResult> }> {
 	const args: string[] = ["--mode", "json", "-p", "--session", sessionFile(rec.id)];
 	if (rec.model) args.push("--model", rec.model);
@@ -460,6 +480,7 @@ async function spawnSubagentProcess(
 			if (rec.scope && rec.scope.length > 0) {
 				env.PI_SUBAGENT_SCOPE = JSON.stringify(rec.scope);
 			}
+			if (taskBase) env.PI_TASK_BASE = taskBase;
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: rec.cwd,
 				shell: false,
@@ -559,8 +580,9 @@ async function runSubagentTurn(
 	signal: AbortSignal | undefined,
 	onUpdate?: (text: string) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
+	taskBase?: string,
 ): Promise<RunResult> {
-	const { done } = await spawnSubagentProcess(rec, userText, depth, signal, onUpdate, onBubble);
+	const { done } = await spawnSubagentProcess(rec, userText, depth, signal, onUpdate, onBubble, taskBase);
 	return done;
 }
 
@@ -586,6 +608,7 @@ async function runAndRecord(
 	signal: AbortSignal | undefined,
 	onUpdate?: (partial: AgentToolResult<SubagentDetails>) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
+	taskBase?: string,
 ): Promise<{ ok: boolean; error?: string; output: string; usage: RunUsage; bubbles: Array<{ text: string; request: boolean }> }> {
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	rec.status = "running";
@@ -604,7 +627,7 @@ async function runAndRecord(
 				},
 			});
 		}
-	}, onBubble);
+	}, onBubble, taskBase);
 
 	const { output, failed } = finalizeRecord(rec, run);
 	if (failed) {
@@ -726,6 +749,7 @@ async function startBackground(
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			},
+			childTaskBase(ctx, rec.id),
 		);
 		proc = spawned.proc;
 		done = spawned.done;
@@ -1110,7 +1134,7 @@ export default function (pi: ExtensionAPI) {
 						bubble.request ? "warning" : "info",
 					);
 				}
-			});
+			}, childTaskBase(ctx, record.id));
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: result.error ?? "Subagent failed." }],
@@ -1393,7 +1417,7 @@ export default function (pi: ExtensionAPI) {
 						bubble.request ? "warning" : "info",
 					);
 				}
-			});
+			}, childTaskBase(ctx, record.id));
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: result.error ?? "Failed to reach subagent." }],
@@ -1732,7 +1756,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (ctx.hasUI) ctx.ui.setStatus("subagent", `sending to ${id}...`);
-				const result = await runAndRecord(rec, message, ctx.signal);
+				const result = await runAndRecord(rec, message, ctx.signal, undefined, undefined, childTaskBase(ctx, rec.id));
 				if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
 				if (!result.ok) {
 					ctx.ui.notify(result.error ?? "Failed", "error");
@@ -1766,7 +1790,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			saveRecord(record);
 			if (ctx.hasUI) ctx.ui.setStatus("subagent", "spawning subagent...");
-			const result = await runAndRecord(record, task, ctx.signal);
+			const result = await runAndRecord(record, task, ctx.signal, undefined, undefined, childTaskBase(ctx, record.id));
 			if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
 			if (!result.ok) {
 				ctx.ui.notify(result.error ?? "Subagent failed", "error");
