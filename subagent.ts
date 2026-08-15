@@ -1860,9 +1860,14 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 	}
 
 	await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-		const cfg = loadConfig();
+		// Edits accumulate in a draft; Ctrl+S persists it (explicit save).
+		const draft: SubagentConfig = { ...loadConfig() };
+		let dirty = false;
+		let savedAt = 0;
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
-		const effectiveModel = cfg.model ?? sessionModel ?? "(none)";
+		const effectiveModel = draft.model ?? sessionModel ?? "(none)";
+		const rowValue = (id: string) =>
+			id === "maxDepth" ? String(draft.maxDepth ?? getMaxDepth()) : String(draft.maxSubagents ?? getMaxSubagents());
 
 		// items order is fixed (search disabled) — we mirror the selection to
 		// intercept digit input on the numeric rows for direct value entry.
@@ -1889,17 +1894,18 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				id: "cwd",
 				label: "Working directory",
 				description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
-				currentValue: cfg.cwd ?? "(inherit — session cwd)",
+				currentValue: draft.cwd ?? "(inherit — session cwd)",
 			},
 		];
 		items[0].submenu = (_cur, selectDone) =>
-			new SubagentModelPicker(collectModels(ctx), "", cfg.model ?? sessionModel, theme, (label) => {
+			new SubagentModelPicker(collectModels(ctx), "", draft.model ?? sessionModel, theme, (label) => {
 				if (label) {
-					const next = loadConfig();
-					next.model = label;
-					saveConfig(next);
+					draft.model = label;
+					dirty = true;
 					settingsList.updateValue("model", label);
 				}
+				updateFooter();
+				container.invalidate();
 				selectDone(label);
 			}) as unknown as Component;
 
@@ -1907,19 +1913,20 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		let sel = 0; // mirrored selection (items order is fixed)
 		let buffer = ""; // in-progress digit entry for the numeric row
 
-		const currentValueOf = (id: string) => (id === "maxDepth" ? String(getMaxDepth()) : String(getMaxSubagents()));
+		const refreshRow = (id: string) => settingsList.updateValue(id, rowValue(id));
 
 		const commitNumber = () => {
 			const id = items[sel].id;
 			const n = Number(buffer);
 			if (numericIds.has(id) && Number.isInteger(n) && n >= 1) {
-				const next = loadConfig();
-				if (id === "maxDepth") next.maxDepth = n;
-				else next.maxSubagents = n;
-				saveConfig(next);
+				if (id === "maxDepth") draft.maxDepth = n;
+				else draft.maxSubagents = n;
+				dirty = true;
 			}
 			buffer = "";
-			settingsList.updateValue(id, currentValueOf(id));
+			refreshRow(id);
+			updateFooter();
+			container.invalidate();
 		};
 
 		const settingsList = new SettingsList(
@@ -1935,15 +1942,31 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 
 		const container = new Container();
 		const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+		const footer = new Text(theme.fg("dim", ""), 1, 0);
+		const updateFooter = () => {
+			if (dirty) footer.setText(theme.fg("warning", "● unsaved changes · Ctrl+S save · Esc close"));
+			else if (Date.now() - savedAt < 2000) footer.setText(theme.fg("success", "✓ saved · Ctrl+S save · Esc close"));
+			else footer.setText(theme.fg("dim", "↑/↓ navigate · type number to set · Ctrl+S save · Esc close"));
+		};
+		updateFooter();
 		container.addChild(border);
 		container.addChild(new Text(theme.fg("accent", theme.bold("Subagent settings")), 1, 0));
 		container.addChild(settingsList);
-		container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · type number to set · Enter commit · Esc close"), 1, 0));
+		container.addChild(footer);
 		container.addChild(border);
 		return {
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
+				// Ctrl+S: persist the draft (explicit save)
+				if (matchesKey(data, "ctrl+s")) {
+					saveConfig(draft);
+					dirty = false;
+					savedAt = Date.now();
+					updateFooter();
+					container.invalidate();
+					return;
+				}
 				// mirror SettingsList's selection navigation (wraps around)
 				if (matchesKey(data, "up")) sel = sel === 0 ? items.length - 1 : sel - 1;
 				else if (matchesKey(data, "down")) sel = sel === items.length - 1 ? 0 : sel + 1;
@@ -1954,11 +1977,13 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 					if (data.length === 1 && data >= "0" && data <= "9") {
 						buffer = (buffer + data).slice(0, 3);
 						settingsList.updateValue(row.id, buffer);
+						container.invalidate();
 						return;
 					}
 					if (data === "\x7f" || data === "\b") {
 						buffer = buffer.slice(0, -1);
-						settingsList.updateValue(row.id, buffer || currentValueOf(row.id));
+						settingsList.updateValue(row.id, buffer || rowValue(row.id));
+						container.invalidate();
 						return;
 					}
 					if (matchesKey(data, "enter")) {
@@ -1968,12 +1993,18 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 					if (matchesKey(data, "escape")) {
 						if (buffer) {
 							buffer = "";
-							settingsList.updateValue(row.id, currentValueOf(row.id));
+							refreshRow(row.id);
+							container.invalidate();
 							return;
 						}
 					}
 				}
+				const before = dirty;
 				settingsList.handleInput(data);
+				if (before !== dirty) {
+					updateFooter();
+					container.invalidate();
+				}
 			},
 		};
 	});
