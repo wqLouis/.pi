@@ -18,8 +18,9 @@ Custom extensions for the pi coding agent, loaded from
   (`PI_BASH_DEFAULT_TIMEOUT` to override) and reminds the agent via a system
   prompt guideline.
 - **`playwright-browser.ts`** + **`browser-server.mjs`** — browser tools:
-  `browser_open`, `browser_click`, `browser_type`, `browser_content`,
-  `browser_eval`, `browser_screenshot`, `browser_status`, `browser_close`,
+  `browser_open`, `browser_search`, `browser_click`, `browser_type`,
+  `browser_content`, `browser_eval`, `browser_screenshot`, `browser_status`,
+  `browser_close`,
   backed by a persistent detached daemon (per-client sessions); plus a
   `/playwright-setup` command for users to install playwright + chromium.
 

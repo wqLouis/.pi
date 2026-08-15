@@ -337,7 +337,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		await finish(
 			true,
 			"playwright + chromium are already installed and ready to use.\n\n" +
-				"Use the browser_* tools (browser_open, browser_click, browser_type, browser_content, browser_eval, browser_screenshot, browser_status, browser_close).\n\n" +
+				"Use the browser_* tools (browser_open, browser_search, browser_click, browser_type, browser_content, browser_eval, browser_screenshot, browser_status, browser_close).\n\n" +
 				"Run `/playwright-setup force` to reinstall anyway.",
 		);
 		return;
@@ -409,7 +409,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 			true,
 			"playwright + chromium installed and verified (headless browser launches).\n\n" +
 				"Browser tools now available:\n" +
-				"- browser_open, browser_click, browser_type, browser_content\n" +
+				"- browser_open, browser_search, browser_click, browser_type, browser_content\n" +
 				"- browser_eval, browser_screenshot, browser_status, browser_close\n\n" +
 				"- The main agent can call them directly.\n" +
 				"- Subagents can drive the browser too — each gets its own page session.\n" +
@@ -605,6 +605,54 @@ export default function (pi: ExtensionAPI) {
 					data.url ? `Current: ${data.url} — ${data.title ?? ""}` : "No page open in this session yet.",
 				];
 				return { content: [{ type: "text", text: parts.join("\n") }], details: { url: data.url } };
+			} catch (error) {
+				return toolError(error);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "browser_search",
+		label: "Browser Search",
+		description:
+			"Search the web using the real browser (Google first, falling back to Bing/DuckDuckGo when Google blocks headless browsers) and return structured results: title, url, snippet for each. Use this instead of guessing URLs. The browser session navigates to the search page, so later browser_* calls act on it.",
+		promptSnippet: "Search the web for something",
+		parameters: Type.Object({
+			query: Type.String({ description: "The search query" }),
+			count: Type.Optional(
+				Type.Integer({ description: "Maximum number of results to return (1-20, default 10)", minimum: 1, maximum: 20 }),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			const query = requireText(params, "query");
+			if (!query) return toolError("Error: query is required.");
+			try {
+				const data = await daemonRequest("/search", { query, count: params.count ?? 10 }, 90000);
+				const results: Array<{ title: string; url: string; snippet: string }> = data.results ?? [];
+				const via = data.engine && data.engine !== "none" ? ` [via ${data.engine}]` : "";
+				if (results.length === 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `No results extracted for "${query}" (page: ${data.title ?? ""} @ ${data.url ?? "?"}). The search engine may have blocked extraction — try browser_content to read what loaded.`,
+							},
+						],
+						details: { query, engine: data.engine, url: data.url, results: [] },
+					};
+				}
+				const text = [
+					`Search: "${query}" — ${results.length} result(s)${via}:`,
+					"",
+					...results.map(
+						(r, i) =>
+							`${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`,
+					),
+				].join("\n");
+				return {
+					content: [{ type: "text", text }],
+					details: { query, engine: data.engine, url: data.url, results },
+				};
 			} catch (error) {
 				return toolError(error);
 			}

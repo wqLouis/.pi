@@ -104,6 +104,119 @@ const send = (res, code, obj) => {
 	res.end(JSON.stringify(obj));
 };
 
+/** Extract search results in-page (google h3, bing h2, ddg h2): title, url, snippet. */
+const SEARCH_EXTRACTOR = (maxResults) => {
+	const results = [];
+	const seen = new Set();
+	const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+	const decodeUrl = (href) => {
+		try {
+			const u = new URL(href, location.origin);
+			// google /url?q=...
+			if (u.pathname === "/url" && u.searchParams.get("q")) return u.searchParams.get("q");
+			// bing /ck/a?u=<base64>
+			if (u.hostname.includes("bing.com") && u.searchParams.get("u")) {
+				try {
+					return atob(String(u.searchParams.get("u")).replace(/^a1/, ""));
+			} catch {
+					/* fall through */
+				}
+			}
+			// duckduckgo /l/?uddg=...
+			if (u.hostname.includes("duckduckgo.com") && u.searchParams.get("uddg")) return u.searchParams.get("uddg");
+			if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+			return "https://" + location.host + u.pathname + u.search;
+		} catch {
+			return href;
+		}
+	};
+	const SNIPPET_SELECTOR =
+		".VwiC3b, [class*='VwiC3b'], [data-sncf], [class*='kb0PBd'], [class*='IsZvec'], .b_caption p, .result__snippet, [class*='result__snippet']";
+	const CONTAINER_SELECTOR = "div.g, div[data-hveid], li.b_algo, div.result, [class*='result']";
+	for (const h of document.querySelectorAll("h2, h3")) {
+		const a = h.closest("a");
+		if (!a || !a.href) continue;
+		const rawTitle = clean(h.textContent);
+		const url = decodeUrl(a.href);
+		const title = rawTitle.replace(url.replace(/\/$/, ""), "").trim() || rawTitle;
+		if (!title || seen.has(url)) continue;
+		const container = h.closest(CONTAINER_SELECTOR) || a.parentElement;
+		let snippet = "";
+		if (container) {
+			const sn = container.querySelector(SNIPPET_SELECTOR);
+			snippet = sn ? clean(sn.textContent) : clean(container.innerText).replace(title, "").slice(0, 300);
+		}
+		results.push({ title, url, snippet });
+		seen.add(url);
+		if (results.length >= maxResults) break;
+	}
+	if (results.length === 0) {
+		for (const a of document.querySelectorAll("a[href^='http']")) {
+			const title = clean(a.textContent);
+			if (!title || title.length < 4 || seen.has(a.href)) continue;
+			results.push({ title, url: decodeUrl(a.href), snippet: "" });
+			seen.add(a.href);
+			if (results.length >= maxResults) break;
+		}
+	}
+	return results;
+};
+
+/** Whether the current page is a bot/captcha/consent wall rather than results. */
+async function isBlocked(page) {
+	const url = page.url();
+	if (url.includes("/sorry") || url.includes("consent.")) return true;
+	try {
+		const head = await page.evaluate(() => (document.body ? document.body.innerText.slice(0, 300) : ""));
+		return /unusual traffic|verify you're a human|not a robot|captcha/i.test(head);
+	} catch {
+		return false;
+	}
+}
+
+const SEARCH_ENGINES = [
+	{ name: "google", url: (q, count) => `https://www.google.com/search?q=${q}&num=${count}` },
+	{ name: "bing", url: (q, count) => `https://www.bing.com/search?q=${q}&count=${count}` },
+	{ name: "duckduckgo", url: (q, count) => `https://duckduckgo.com/?q=${q}` },
+];
+
+/** Search the web: google first, then bing, then duckduckgo (google often blocks headless). */
+async function searchWeb(page, query, count) {
+	const q = encodeURIComponent(query);
+	let lastUrl = "";
+	for (const engine of SEARCH_ENGINES) {
+		try {
+			const url = engine.url(q, count);
+			await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+			lastUrl = page.url();
+			if (engine.name === "google") {
+				// skip Google's consent wall
+				try {
+					const accept = page.locator("button:has-text('Accept all'), button:has-text('Accept'), form[action*='consent'] button").first();
+					await accept.click({ timeout: 5000 });
+					await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+				} catch {
+					/* no consent wall */
+				}
+			}
+			if (await isBlocked(page)) continue;
+			try {
+				await page.waitForSelector("h2, h3, #search, #rso, .b_algo, .result", { timeout: 10000 });
+			} catch {
+				/* results may still be loading */
+			}
+			await page.waitForTimeout(500);
+			const results = await page.evaluate(SEARCH_EXTRACTOR, count);
+			if (results.length > 0) {
+				return { engine: engine.name, url: page.url(), title: await page.title().catch(() => ""), results };
+			}
+		} catch {
+			/* try next engine */
+		}
+	}
+	return { engine: "none", url: lastUrl, title: "", results: [] };
+}
+
 const server = http.createServer(async (req, res) => {
 	if (req.headers["x-browser-token"] !== token) {
 		return send(res, 401, { error: "unauthorized" });
@@ -173,6 +286,13 @@ const server = http.createServer(async (req, res) => {
 				const result = await page.evaluate(body.script);
 				const text = typeof result === "string" ? result : JSON.stringify(result ?? null);
 				return send(res, 200, { ok: true, result: text.slice(0, 20000) });
+			}
+			case "/search": {
+				if (!body.query) return send(res, 400, { error: "query required" });
+				const page = await getPage(session);
+				const count = Math.min(20, Math.max(1, Number(body.count) || 10));
+				const data = await searchWeb(page, String(body.query), count);
+				return send(res, 200, { ok: true, query: String(body.query), ...data });
 			}
 			case "/close":
 				await closeSession(session);
