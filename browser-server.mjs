@@ -138,7 +138,7 @@ const SEARCH_EXTRACTOR = (maxResults) => {
 		if (!a || !a.href) continue;
 		const rawTitle = clean(h.textContent);
 		const url = decodeUrl(a.href);
-		const title = rawTitle.replace(url.replace(/\/$/, ""), "").trim() || rawTitle;
+		const title = rawTitle.replace(/https?:\/\/[^\s]+/g, "").trim() || rawTitle;
 		if (!title || seen.has(url)) continue;
 		const container = h.closest(CONTAINER_SELECTOR) || a.parentElement;
 		let snippet = "";
@@ -152,7 +152,8 @@ const SEARCH_EXTRACTOR = (maxResults) => {
 	}
 	if (results.length === 0) {
 		for (const a of document.querySelectorAll("a[href^='http']")) {
-			const title = clean(a.textContent);
+			const rawTitle = clean(a.textContent);
+			const title = rawTitle.replace(/https?:\/\/[^\s]+/g, "").trim();
 			if (!title || title.length < 4 || seen.has(a.href)) continue;
 			results.push({ title, url: decodeUrl(a.href), snippet: "" });
 			seen.add(a.href);
