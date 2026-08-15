@@ -133,13 +133,15 @@ const SEARCH_EXTRACTOR = (maxResults) => {
 	const SNIPPET_SELECTOR =
 		".VwiC3b, [class*='VwiC3b'], [data-sncf], [class*='kb0PBd'], [class*='IsZvec'], .b_caption p, .result__snippet, [class*='result__snippet']";
 	const CONTAINER_SELECTOR = "div.g, div[data-hveid], li.b_algo, div.result, [class*='result']";
+	// skip the engine's own footer/nav links (they are not results)
+	const isOwned = (url) => /duckduckgo\.com|start\.duckduckgo|google\.com\/search|bing\.com/.test(url) && !url.includes("/url?q=") && !url.includes("/ck/a");
 	for (const h of document.querySelectorAll("h2, h3")) {
 		const a = h.closest("a");
 		if (!a || !a.href) continue;
 		const rawTitle = clean(h.textContent);
 		const url = decodeUrl(a.href);
 		const title = rawTitle.replace(/https?:\/\/[^\s]+/g, "").trim() || rawTitle;
-		if (!title || seen.has(url)) continue;
+		if (!title || seen.has(url) || isOwned(url)) continue;
 		const container = h.closest(CONTAINER_SELECTOR) || a.parentElement;
 		let snippet = "";
 		if (container) {
@@ -154,8 +156,9 @@ const SEARCH_EXTRACTOR = (maxResults) => {
 		for (const a of document.querySelectorAll("a[href^='http']")) {
 			const rawTitle = clean(a.textContent);
 			const title = rawTitle.replace(/https?:\/\/[^\s]+/g, "").trim();
-			if (!title || title.length < 4 || seen.has(a.href)) continue;
-			results.push({ title, url: decodeUrl(a.href), snippet: "" });
+			const url = decodeUrl(a.href);
+			if (!title || title.length < 4 || seen.has(a.href) || isOwned(url)) continue;
+			results.push({ title, url, snippet: "" });
 			seen.add(a.href);
 			if (results.length >= maxResults) break;
 		}
@@ -175,13 +178,20 @@ async function isBlocked(page) {
 	}
 }
 
-const SEARCH_ENGINES = [
-	{ name: "google", url: (q, count) => `https://www.google.com/search?q=${q}&num=${count}` },
-	{ name: "bing", url: (q, count) => `https://www.bing.com/search?q=${q}&count=${count}` },
-	{ name: "duckduckgo", url: (q, count) => `https://duckduckgo.com/?q=${q}` },
-];
+const SEARCH_ENGINE_DEFS = {
+	google: { url: (q, count) => `https://www.google.com/search?q=${q}&num=${count}` },
+	duckduckgo: { url: (q, count) => `https://duckduckgo.com/?q=${q}` },
+	bing: { url: (q, count) => `https://www.bing.com/search?q=${q}&count=${count}` },
+};
 
-/** Search the web: google first, then bing, then duckduckgo (google often blocks headless). */
+/** Active engines in order. Default: google, duckduckgo (no bing). Override with PI_SEARCH_ENGINES=google,duckduckgo,bing */
+const SEARCH_ENGINES = (process.env.PI_SEARCH_ENGINES ?? "google,duckduckgo")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s) => SEARCH_ENGINE_DEFS[s])
+	.map((name) => ({ name, ...SEARCH_ENGINE_DEFS[name] }));
+
+/** Search the web: google first, then duckduckgo (headless browsers are often blocked). */
 async function searchWeb(page, query, count) {
 	const q = encodeURIComponent(query);
 	let lastUrl = "";

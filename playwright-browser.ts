@@ -615,7 +615,7 @@ export default function (pi: ExtensionAPI) {
 		name: "browser_search",
 		label: "Browser Search",
 		description:
-			"Search the web using the real browser (Google first, falling back to Bing/DuckDuckGo when Google blocks headless browsers) and return structured results: title, url, snippet for each. Use this instead of guessing URLs. The browser session navigates to the search page, so later browser_* calls act on it.",
+			"Search the web using the real browser (Google first, falling back to DuckDuckGo when Google blocks headless browsers) and return structured results: title, url, snippet for each. Use this instead of guessing URLs. The browser session navigates to the search page, so later browser_* calls act on it.",
 		promptSnippet: "Search the web for something",
 		parameters: Type.Object({
 			query: Type.String({ description: "The search query" }),
