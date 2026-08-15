@@ -687,7 +687,18 @@ async function waitForSubagent(
 			onUpdate(partial ? `Waiting for ${id}...\n\n${partial}` : `Waiting for ${id}...`);
 		}
 
-		if (!entry) {
+		if (entry) {
+			// The process may have exited before the done-handler finalized the entry.
+			// Detect via pid liveness so we don't wait on a dead process.
+			if (entry.proc.pid != null) {
+				try {
+					process.kill(entry.proc.pid, 0);
+				} catch {
+					const rec = loadRecord(id);
+					return { status: "done", output: partial || rec?.lastOutput || "", note: "process finished" };
+				}
+			}
+		} else {
 			const rec = loadRecord(id);
 			if (rec && rec.status === "running") {
 				// handle lost (e.g. extension reloaded mid-run) — check pid
@@ -1132,11 +1143,30 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Live done-count: a target is done when its running entry is gone (and the
+			// record isn't running) OR its process is already dead (finalization pending).
+			const isDone = (tid: string): boolean => {
+				const entry = running.get(tid);
+				if (!entry) {
+					const rec = loadRecord(tid);
+					return !rec || rec.status !== "running";
+				}
+				if (entry.proc.pid != null) {
+					try {
+						process.kill(entry.proc.pid, 0);
+						return false;
+					} catch {
+						return true;
+					}
+				}
+				return false;
+			};
+
 			const results: Array<{ subagentId: string; status: string; output: string }> = [];
 			for (const id of targets) {
 				const waited = await waitForSubagent(id, deadline, signal, (text) => {
 					if (onUpdate) {
-						const done = results.filter((r) => r.status !== "running").length;
+						const done = targets.filter(isDone).length;
 						onUpdate({
 							content: [{ type: "text", text: `Waiting for subagents: ${done}/${targets.length} done\n\n${id}: ${text}` }],
 							details: { subagentId: id, output: text, status: "running", usage: EMPTY_USAGE() } as SubagentDetails,
@@ -1153,7 +1183,12 @@ export default function (pi: ExtensionAPI) {
 				const finalRec = loadRecord(id);
 				results.push({
 					subagentId: id,
-					status: waited.status === "timeout" ? "running" : (finalRec?.status ?? "idle"),
+					status:
+						waited.status === "timeout"
+							? "running"
+							: finalRec?.status && finalRec.status !== "running"
+								? finalRec.status
+								: "idle",
 					output: finalRec?.lastOutput ?? waited.output,
 				});
 				if (waited.status === "timeout") {
