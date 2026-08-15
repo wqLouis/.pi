@@ -45,9 +45,11 @@ import {
 	type ExtensionContext,
 	type Theme,
 	getAgentDir,
+	getSettingsListTheme,
 	withFileMutationQueue,
+	DynamicBorder,
 } from "@earendil-works/pi-coding-agent";
-import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, decodeKittyPrintable, matchesKey, SettingsList, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DEFAULT_MAX_DEPTH = 3; // default max nesting layers (user-configurable via settings)
@@ -1649,16 +1651,11 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`${key} set to ${cfg[key]}.`, "info");
 					return;
 				}
-				const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
-				ctx.ui.notify(
-					`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
-						`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
-						`maxDepth (nesting layers): ${cfg.maxDepth ?? "(default)"} → effective ${getMaxDepth()}\n` +
-						`maxSubagents (concurrent): ${cfg.maxSubagents ?? "(default)"} → effective ${getMaxSubagents()} · running now: ${countRunningSubagents()}\n` +
-						`systemPrompt: ${cfg.systemPrompt ? `${cfg.systemPrompt.length} chars` : "(default)"}\n` +
-						`file: ${configFile()}`,
-					"info",
-				);
+				if (key) {
+					ctx.ui.notify("Usage: /subagent config [maxDepth <n> | maxSubagents <n>] — no args opens the settings panel.", "info");
+					return;
+				}
+				await showSubagentConfigUi(ctx);
 				return;
 			}
 			if (first === "list") {
@@ -1843,6 +1840,113 @@ async function showModelPicker(
 }
 
 const PICKER_ROW_CAP = 40;
+
+/* Interactive settings panel for /subagent config (mirrors pi's settings UI) */
+/* ------------------------------------------------------------------ */
+
+async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void> {
+	if (ctx.mode !== "tui") {
+		// non-TUI fallback: notify the config summary
+		const cfg = loadConfig();
+		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
+		ctx.ui.notify(
+			`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
+				`maxDepth (layers): ${getMaxDepth()} · maxSubagents: ${getMaxSubagents()} (running ${countRunningSubagents()})\n` +
+				`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
+				`file: ${configFile()}`,
+			"info",
+		);
+		return;
+	}
+
+	await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+		const cfg = loadConfig();
+		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
+		const effectiveModel = cfg.model ?? sessionModel ?? "(none)";
+
+		const settingsList = new SettingsList(
+			[
+				{
+					id: "model",
+					label: "Model",
+					description: "Model used by new subagents. Enter to pick (inherits the session model when unset).",
+					currentValue: effectiveModel,
+					submenu: (_cur, selectDone) =>
+						new SubagentModelPicker(collectModels(ctx), "", cfg.model ?? sessionModel, theme, (label) => {
+							if (label) {
+								const next = loadConfig();
+								next.model = label;
+								saveConfig(next);
+								settingsList.updateValue("model", label);
+							}
+							selectDone(label);
+						}) as unknown as Component,
+				},
+				{
+					id: "maxDepth",
+					label: "Nesting layers",
+					description: "How many subagent generations deep nesting may go (1 = no sub-subagents). Enter to change.",
+					currentValue: String(getMaxDepth()),
+					values: ["1", "2", "3", "4", "5", "6"],
+				},
+				{
+					id: "maxSubagents",
+					label: "Concurrent subagents",
+					description: "Maximum subagents running at once, across all layers. Enter to change.",
+					currentValue: String(getMaxSubagents()),
+					values: ["1", "2", "3", "4", "5", "6", "8", "10"],
+				},
+				{
+					id: "running",
+					label: "Running now",
+					description: "Subagents currently running vs the maxSubagents limit.",
+					currentValue: `${countRunningSubagents()}/${getMaxSubagents()}`,
+				},
+				{
+					id: "cwd",
+					label: "Working directory",
+					description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
+					currentValue: cfg.cwd ?? "(inherit — session cwd)",
+				},
+				{
+					id: "tools",
+					label: "Tool allowlist",
+					description: "Tools available to subagents (all tools by default).",
+					currentValue: cfg.tools ?? "(all)",
+				},
+				{
+					id: "systemPrompt",
+					label: "System prompt",
+					description: "Custom system prompt for subagents (the default subagent prompt otherwise).",
+					currentValue: cfg.systemPrompt ? `custom (${cfg.systemPrompt.length} chars)` : "(default)",
+				},
+			],
+			10,
+			getSettingsListTheme(),
+			(id, newValue) => {
+				const next = loadConfig();
+				if (id === "maxDepth" || id === "maxSubagents") next[id] = Number(newValue);
+				else if (id === "model") next.model = newValue;
+				saveConfig(next);
+			},
+			() => done(undefined),
+			{ enableSearch: false },
+		);
+
+		const container = new Container();
+		const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+		container.addChild(border);
+		container.addChild(new Text(theme.fg("accent", theme.bold("Subagent settings")), 1, 0));
+		container.addChild(settingsList);
+		container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · Enter change · Esc close"), 1, 0));
+		container.addChild(border);
+		return {
+			render: (width: number) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => settingsList.handleInput(data),
+		};
+	});
+}
 
 class SubagentModelPicker {
 	private models: PickerModel[];
