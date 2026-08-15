@@ -1891,18 +1891,6 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
 				currentValue: cfg.cwd ?? "(inherit — session cwd)",
 			},
-			{
-				id: "tools",
-				label: "Tool allowlist",
-				description: "Tools available to subagents (all tools by default).",
-				currentValue: cfg.tools ?? "(all)",
-			},
-			{
-				id: "systemPrompt",
-				label: "System prompt",
-				description: "Custom system prompt for subagents (the default subagent prompt otherwise).",
-				currentValue: cfg.systemPrompt ? `custom (${cfg.systemPrompt.length} chars)` : "(default)",
-			},
 		];
 		items[0].submenu = (_cur, selectDone) =>
 			new SubagentModelPicker(collectModels(ctx), "", cfg.model ?? sessionModel, theme, (label) => {
