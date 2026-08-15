@@ -50,7 +50,8 @@ import {
 import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const MAX_SUBAGENT_DEPTH = 3; // subagents cannot nest deeper than this
+const DEFAULT_MAX_DEPTH = 3; // default max nesting layers (user-configurable via settings)
+const DEFAULT_MAX_SUBAGENTS = 4; // default max concurrently running subagents
 const MAX_ERROR_CHARS = 500;
 const POLL_INTERVAL_MS = 500;
 
@@ -62,7 +63,7 @@ const DEFAULT_SUBAGENT_PROMPT = [
 	"- The main agent may send follow-up messages to steer or redirect you. Treat them as updated instructions and adapt your work accordingly.",
 	"- When done, report concisely with concrete details (file paths, findings, decisions) that the main agent can act on without re-reading the code.",
 	"- If something is blocked or impossible, say so clearly instead of guessing.",
-	"- Do not spawn sub-subagents unless explicitly asked to.",
+	"- You may delegate to your own sub-subagents up to the configured layer limit (see subagent_config), but prefer doing the work yourself unless nesting is clearly useful.",
 ].join("\n");
 
 /* ------------------------------------------------------------------ */
@@ -70,8 +71,9 @@ const DEFAULT_SUBAGENT_PROMPT = [
 /* ------------------------------------------------------------------ */
 
 // True when this extension instance runs inside a spawned subagent process
-// (the parent sets PI_SUBAGENT_DEPTH=1 for every subagent). Subagents get a
-// minimal toolset: no subagent management, no nesting — only bubble-up tools.
+// (the parent sets PI_SUBAGENT_DEPTH=1 for every subagent). Subagents get the
+// bubble-up tools in addition to the full subagent toolset — nesting is
+// allowed up to the configured maxDepth, enforced at spawn time.
 const isSubagentProcess = Number(process.env.PI_SUBAGENT_DEPTH ?? "0") >= 1;
 
 /** True when the absolute target path lies inside any scope entry (dir or file). */
@@ -143,6 +145,10 @@ interface SubagentConfig {
 	systemPrompt?: string;
 	cwd?: string;
 	tools?: string;
+	/** Max nesting layers (1 = subagents cannot spawn sub-subagents). */
+	maxDepth?: number;
+	/** Max concurrently-running subagents across all layers. */
+	maxSubagents?: number;
 }
 
 interface RunningEntry {
@@ -253,6 +259,52 @@ function loadConfig(): SubagentConfig {
 
 function saveConfig(cfg: SubagentConfig): void {
 	fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
+}
+
+/** Max nesting depth: config > env > default. */
+function getMaxDepth(): number {
+	const cfg = loadConfig();
+	if (typeof cfg.maxDepth === "number" && Number.isFinite(cfg.maxDepth) && cfg.maxDepth >= 1) return Math.floor(cfg.maxDepth);
+	const env = Number(process.env.PI_SUBAGENT_MAX_DEPTH);
+	if (Number.isFinite(env) && env >= 1) return Math.floor(env);
+	return DEFAULT_MAX_DEPTH;
+}
+
+/** Max concurrently running subagents (global across layers): config > env > default. */
+function getMaxSubagents(): number {
+	const cfg = loadConfig();
+	if (typeof cfg.maxSubagents === "number" && Number.isFinite(cfg.maxSubagents) && cfg.maxSubagents >= 1)
+		return Math.floor(cfg.maxSubagents);
+	const env = Number(process.env.PI_SUBAGENT_MAX_SUBAGENTS);
+	if (Number.isFinite(env) && env >= 1) return Math.floor(env);
+	return DEFAULT_MAX_SUBAGENTS;
+}
+
+/** Count subagents currently running anywhere (shared records; stale dead records excluded). */
+function countRunningSubagents(): number {
+	let count = 0;
+	try {
+		for (const file of fs.readdirSync(subagentDir())) {
+			if (!file.endsWith(".json")) continue;
+			try {
+				const rec = JSON.parse(fs.readFileSync(path.join(subagentDir(), file), "utf-8")) as SubagentRecord;
+				if (rec?.status !== "running") continue;
+				if (rec.pid != null) {
+					try {
+						process.kill(rec.pid, 0);
+					} catch {
+						continue; // stale record: process is dead
+					}
+				}
+				count++;
+			} catch {
+				/* unreadable/corrupt record */
+			}
+		}
+	} catch {
+		/* dir missing */
+	}
+	return count;
 }
 
 /** Resolve spawn defaults: explicit param > user config > session model/cwd. */
@@ -629,8 +681,12 @@ async function startBackground(
 	userText: string,
 ): Promise<{ started: boolean; error?: string }> {
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-	if (depth >= MAX_SUBAGENT_DEPTH) {
-		return { started: false, error: `Maximum subagent depth (${MAX_SUBAGENT_DEPTH}) reached — refusing to nest further.` };
+	const maxDepth = getMaxDepth();
+	if (depth >= maxDepth) {
+		return {
+			started: false,
+			error: `Maximum subagent depth (${maxDepth}) reached — refusing to nest further. Raise maxDepth in the settings (/subagent config maxDepth N) to allow deeper layers.`,
+		};
 	}
 
 	rec.status = "running";
@@ -875,7 +931,9 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/* ---------------- subagent processes: bubble-up tools only ---------------- */
+	/* ---------------- subagent processes: bubble-up tools ---------------- */
+	// Subagents additionally get bubble-up tools; the full subagent toolset
+	// below is registered for every process (nesting is bounded by maxDepth).
 	if (isSubagentProcess) {
 		const bubble = (message: string, request: boolean) => {
 			process.stdout.write(
@@ -926,7 +984,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			},
 		});
-		return;
 	}
 
 	/* ---------------- subagent_spawn ---------------- */
@@ -934,12 +991,13 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
 		description:
-			"Spawn a subagent to work for you. It runs in an isolated context (its own session), using the user-configured model by default (falling back to the session model). With await: true (default) it blocks until the subagent finishes and returns its output. With await: false it spawns in the background and returns immediately — you will be notified when it finishes, and you can wait for it with subagent_wait, steer it with subagent_send, or read its transcript with subagent_result.",
+			"Spawn a subagent to work for you. It runs in an isolated context (its own session), using the user-configured model by default (falling back to the session model). With await: true (default) it blocks until the subagent finishes and returns its output. With await: false it spawns in the background and returns immediately — you will be notified when it finishes, and you can wait for it with subagent_wait, steer it with subagent_send, or read its transcript with subagent_result. Spawning respects the configured limits: maxDepth nesting layers and maxSubagents concurrent subagents (see subagent_config).",
 		promptSnippet: "Spawn an isolated subagent to delegate work to",
 		promptGuidelines: [
 			"Use subagent_spawn to delegate long or independent work to an isolated subagent; use await: false for background work, then subagent_wait.",
 			"Use subagent_send to steer a subagent — it continues with its full previous context.",
 			"If a subagent errors, steer it to fix the error with subagent_send or respawn it with subagent_spawn — don't just give up.",
+			"Check subagent_config to see how many subagents are currently running and the limits (maxSubagents concurrent, maxDepth nesting layers). Spawn only as many as you actually need.",
 		],
 		parameters: SpawnParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -953,12 +1011,29 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-			if (depth >= MAX_SUBAGENT_DEPTH) {
+			const maxDepth = getMaxDepth();
+			if (depth >= maxDepth) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Maximum subagent depth (${MAX_SUBAGENT_DEPTH}) reached — refusing to nest further.`,
+							text: `Maximum subagent depth (${maxDepth}) reached — refusing to nest further. Raise maxDepth in the settings (/subagent config maxDepth N) to allow deeper layers.`,
+						},
+					],
+					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
+					isError: true,
+				};
+			}
+
+			const maxSubagents = getMaxSubagents();
+			const runningNow = countRunningSubagents();
+			if (runningNow >= maxSubagents) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Maximum concurrent subagents reached (${runningNow}/${maxSubagents} running). Wait for some to finish (subagent_wait) or forget them (subagent_forget) before spawning more. Raise maxSubagents in the settings (/subagent config maxSubagents N) if you need more.`,
 						},
 					],
 					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
@@ -1353,7 +1428,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_list",
 		label: "Subagent List",
 		description:
-			"List spawned subagents: id, status (running/idle/error), model, turn count, usage, and a preview of their latest output.",
+			"List spawned subagents: id, status (running/idle/error), model, turn count, usage, and a preview of their latest output. Also shows how many are running vs the maxSubagents limit.",
 		promptSnippet: "List spawned subagents and their status",
 		parameters: ListParams,
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -1370,6 +1445,9 @@ export default function (pi: ExtensionAPI) {
 			records.sort((a, b) => b.createdAt - a.createdAt);
 
 			const out: string[] = [];
+			const runningNow = records.filter((r) => r.status === "running").length;
+			const maxSubagents = getMaxSubagents();
+			out.push(`Running: ${runningNow}/${maxSubagents} subagents · total spawned: ${records.length} · maxDepth: ${getMaxDepth()} layers`);
 			if (records.length === 0) {
 				out.push("No subagents spawned yet. Use subagent_spawn to delegate work.");
 			} else {
@@ -1486,12 +1564,15 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_config",
 		label: "Subagent Config",
 		description:
-			"Show the effective subagent configuration: the user-configured model/system prompt/cwd/tools (from ~/.pi/agent/subagent-config.json) and the current session model fallback.",
-		promptSnippet: "Show subagent configuration",
+			"Show the effective subagent configuration: the user-configured model/system prompt/cwd/tools/limits (from ~/.pi/agent/subagent-config.json), the current session model fallback, and how many subagents are running right now vs the limit.",
+		promptSnippet: "Show subagent configuration and current usage",
 		parameters: ConfigParams,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const cfg = loadConfig();
 			const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			const runningNow = countRunningSubagents();
+			const maxSubagents = getMaxSubagents();
+			const maxDepth = getMaxDepth();
 			const out: string[] = [];
 			out.push(`Config file: ${configFile()}`);
 			out.push(`User-configured model: ${cfg.model ?? "(not set — inherits session model)"}`);
@@ -1500,13 +1581,18 @@ export default function (pi: ExtensionAPI) {
 			out.push(`Custom system prompt: ${cfg.systemPrompt ? `set (${cfg.systemPrompt.length} chars)` : "(default)"}`);
 			out.push(`Working directory: ${cfg.cwd ?? "(current directory)"}`);
 			out.push(`Tool allowlist: ${cfg.tools ?? "(all tools)"}`);
-			out.push("Set the model with `/subagent model <provider/id>` or by editing subagent-config.json.");
+			out.push(`Subagents running: ${runningNow}/${maxSubagents} (maxSubagents)`);
+			out.push(`Nesting layers allowed: ${maxDepth} (maxDepth — 1 = no sub-subagents)`);
+			out.push("Set the model with `/subagent model <provider/id>`; set limits with `/subagent config maxDepth N` / `/subagent config maxSubagents N`.");
 			return {
 				content: [{ type: "text", text: out.join("\n") }],
 				details: {
 					config: cfg,
 					sessionModel,
 					effectiveModel: cfg.model ?? sessionModel,
+					runningSubagents: runningNow,
+					maxSubagents,
+					maxDepth,
 				},
 			};
 		},
@@ -1551,10 +1637,24 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (first === "config") {
 				const cfg = loadConfig();
+				const key = parts[1];
+				if (key === "maxDepth" || key === "maxSubagents") {
+					const val = Number(parts[2]);
+					if (!Number.isFinite(val) || val < 1) {
+						ctx.ui.notify(`Usage: /subagent config ${key} <positive integer>`, "info");
+						return;
+					}
+					cfg[key] = Math.floor(val);
+					saveConfig(cfg);
+					ctx.ui.notify(`${key} set to ${cfg[key]}.`, "info");
+					return;
+				}
 				const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 				ctx.ui.notify(
 					`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
 						`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
+						`maxDepth (nesting layers): ${cfg.maxDepth ?? "(default)"} → effective ${getMaxDepth()}\n` +
+						`maxSubagents (concurrent): ${cfg.maxSubagents ?? "(default)"} → effective ${getMaxSubagents()} · running now: ${countRunningSubagents()}\n` +
 						`systemPrompt: ${cfg.systemPrompt ? `${cfg.systemPrompt.length} chars` : "(default)"}\n` +
 						`file: ${configFile()}`,
 					"info",

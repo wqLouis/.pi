@@ -62,9 +62,15 @@ Key behaviors:
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
   `tool_call` hook: `write`/`edit` targeting out-of-scope paths are blocked
   with a clear reason, so parallel subagents never collide.
-- **No nesting** — subagent processes only register the bubble-up tools;
-  `subagent_spawn` doesn't exist inside a subagent (plus a depth guard on the
-  main agent).
+- **Multi-layer nesting** — subagents can spawn their own sub-subagents up to
+  the configured `maxDepth` layers (default 3), and at most `maxSubagents`
+  subagents run concurrently across all layers (default 4). Both limits are
+  user-configurable (`/subagent config maxDepth N` / `maxSubagents N`, or
+  `maxDepth` / `maxSubagents` in `subagent-config.json`).
+- **Limits visible to every agent** — `subagent_config` and `subagent_list`
+  report how many subagents are running right now vs the `maxSubagents` limit,
+  and the nesting depth; `subagent_spawn` refuses to exceed either limit with
+  a clear reason.
 - **Realtime notifications** — background completions and bubbles deliver
   immediately (`followUp` + `triggerTurn`), so an idle main agent wakes up and
   acts without the user prompting.
