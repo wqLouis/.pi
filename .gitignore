@@ -1,0 +1,4 @@
+# editor / OS junk
+node_modules/
+*.log
+.DS_Store
