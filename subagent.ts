@@ -582,7 +582,9 @@ function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecor
 			display: true,
 			details: { subagentId: rec.id, status: rec.status, output: rec.lastOutput },
 		},
-		{ deliverAs: "nextTurn" },
+		// Realtime: if the agent is idle this starts a turn immediately (triggerTurn);
+		// if it is streaming the message is queued into the current turn (followUp).
+		{ deliverAs: "followUp", triggerTurn: true },
 	);
 }
 
@@ -633,7 +635,8 @@ async function startBackground(
 						display: true,
 						details: { subagentId: rec.id, request: bubble.request },
 					},
-					{ deliverAs: "nextTurn" },
+					// Realtime: idle -> immediate new turn; streaming -> queued into current turn.
+					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			},
 		);
