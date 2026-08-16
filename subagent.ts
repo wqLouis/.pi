@@ -932,8 +932,9 @@ export default function (pi: ExtensionAPI) {
 	/* ---------------- edit-scope enforcement (subagent processes) ---------------- */
 	// The parent passes the scope via PI_SUBAGENT_SCOPE (JSON array of absolute
 	// paths). Writes outside it are blocked; reads are unrestricted.
-	// The subagent's own task board (PI_TASK_BASE/TASK.md) is always exempt so a
-	// scoped subagent can still maintain its task board.
+	// By default the OS temp dir (scratch space — the task board lives there)
+	// and the subagent's own task-board dir stay writable. Set
+	// PI_SUBAGENT_SCOPE_BLOCK_TMP=1 to disable the temp-dir exemption.
 	const scopeEnv = process.env.PI_SUBAGENT_SCOPE;
 	if (scopeEnv) {
 		let scope: string[] = [];
@@ -943,6 +944,8 @@ export default function (pi: ExtensionAPI) {
 			/* ignore malformed */
 		}
 		if (Array.isArray(scope) && scope.length > 0) {
+			const tmpDir = os.tmpdir();
+			const blockTmp = process.env.PI_SUBAGENT_SCOPE_BLOCK_TMP === "1";
 			const taskBoardDir = process.env.PI_TASK_BASE ? path.dirname(path.join(process.env.PI_TASK_BASE, "TASK.md")) : undefined;
 			pi.on("tool_call", (event, _ctx) => {
 				if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
@@ -951,11 +954,12 @@ export default function (pi: ExtensionAPI) {
 				const targetAbs = path.resolve(target);
 				if (isWithinScope(targetAbs, scope)) return undefined;
 				if (taskBoardDir && isWithinScope(targetAbs, [taskBoardDir])) return undefined;
+				if (!blockTmp && isWithinScope(targetAbs, [tmpDir])) return undefined;
 				return {
 					block: true,
 					reason:
 						`Writing to "${targetAbs}" is outside this subagent's edit scope. ` +
-						`Allowed scope: ${scope.join(", ")}. Reads are unrestricted; use write/edit only within scope.`,
+						`Allowed: scope (${scope.join(", ")}) and the temp dir. Reads are unrestricted; use write/edit only within those.`,
 				};
 			});
 		}
