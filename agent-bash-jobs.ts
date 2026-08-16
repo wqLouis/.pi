@@ -48,30 +48,49 @@ interface RunningJob {
 
 const running = new Map<string, RunningJob>();
 
-function jobFile(id: string): string {
-	return path.join(JOBS_DIR, `${id}.json`);
+// Job records are scoped per session: ~/.pi/agent/bash-jobs/<session_id>/*.json.
+// The session id is resolved from ctx on every call (each tool has ctx; the
+// completion notify only uses the already-finalized record, no file I/O).
+const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "default";
+
+function sessionIdFor(ctx?: { sessionManager?: { getSessionId?: () => string } }): string {
+	let id = "default";
+	try {
+		id = ctx?.sessionManager?.getSessionId?.() ?? "default";
+	} catch {
+		/* ignore */
+	}
+	return sanitizeId(id);
 }
 
-function loadRecord(id: string): BashJobRecord | undefined {
+function jobsDirFor(ctx?: { sessionManager?: { getSessionId?: () => string } }): string {
+	return path.join(JOBS_DIR, sessionIdFor(ctx));
+}
+
+function jobFile(id: string, ctx?: { sessionManager?: { getSessionId?: () => string } }): string {
+	return path.join(jobsDirFor(ctx), `${id}.json`);
+}
+
+function loadRecord(id: string, ctx?: { sessionManager?: { getSessionId?: () => string } }): BashJobRecord | undefined {
 	try {
-		const rec = JSON.parse(fs.readFileSync(jobFile(id), "utf-8")) as BashJobRecord;
+		const rec = JSON.parse(fs.readFileSync(jobFile(id, ctx), "utf-8")) as BashJobRecord;
 		return rec && typeof rec.id === "string" ? rec : undefined;
 	} catch {
 		return undefined;
 	}
 }
 
-function saveRecord(rec: BashJobRecord): void {
-	fs.mkdirSync(JOBS_DIR, { recursive: true });
-	fs.writeFileSync(jobFile(rec.id), JSON.stringify(rec, null, 2), { encoding: "utf-8", mode: 0o600 });
+function saveRecord(rec: BashJobRecord, ctx?: { sessionManager?: { getSessionId?: () => string } }): void {
+	fs.mkdirSync(jobsDirFor(ctx), { recursive: true });
+	fs.writeFileSync(jobFile(rec.id, ctx), JSON.stringify(rec, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
-function listRecords(): BashJobRecord[] {
+function listRecords(ctx?: { sessionManager?: { getSessionId?: () => string } }): BashJobRecord[] {
 	const records: BashJobRecord[] = [];
 	try {
-		for (const file of fs.readdirSync(JOBS_DIR)) {
+		for (const file of fs.readdirSync(jobsDirFor(ctx))) {
 			if (!file.endsWith(".json")) continue;
-			const rec = loadRecord(file.slice(0, -5));
+			const rec = loadRecord(file.slice(0, -5), ctx);
 			if (rec) records.push(rec);
 		}
 	} catch {
@@ -88,20 +107,30 @@ const toolError = (error: unknown) => ({
 
 /** Reconcile records from before a restart: dead "running" jobs are lost. */
 function reconcileOrphaned(): void {
-	for (const rec of listRecords()) {
-		if (rec.status !== "running") continue;
-		if (rec.pid != null) {
-			try {
-				process.kill(rec.pid, 0);
-				continue; // still alive
-			} catch {
-				/* dead */
+	// scan every session's record dir
+	let sessions: string[] = [];
+	try {
+		sessions = fs.readdirSync(JOBS_DIR);
+	} catch {
+		/* dir missing */
+	}
+	for (const session of sessions) {
+		const ctx = { sessionManager: { getSessionId: () => session } };
+		for (const rec of listRecords(ctx)) {
+			if (rec.status !== "running") continue;
+			if (rec.pid != null) {
+				try {
+					process.kill(rec.pid, 0);
+					continue; // still alive
+				} catch {
+					/* dead */
+				}
 			}
+			rec.status = "lost";
+			rec.finishedAt = Date.now();
+			rec.note = "process was lost (extension/pi restarted) — output up to that point";
+			saveRecord(rec, ctx);
 		}
-		rec.status = "lost";
-		rec.finishedAt = Date.now();
-		rec.note = "process was lost (extension/pi restarted) — output up to that point";
-		saveRecord(rec);
 	}
 }
 
@@ -161,7 +190,7 @@ export default function (pi: ExtensionAPI) {
 				startedAt: Date.now(),
 				pid: undefined,
 			};
-			saveRecord(rec);
+			saveRecord(rec, ctx);
 
 			let proc: ChildProcess;
 			let done: Promise<BashJobRecord>;
@@ -171,11 +200,11 @@ export default function (pi: ExtensionAPI) {
 				rec.status = "error";
 				rec.note = error instanceof Error ? error.message : String(error);
 				rec.finishedAt = Date.now();
-				saveRecord(rec);
+				saveRecord(rec, ctx);
 				return toolError(`Failed to start job: ${rec.note}`);
 			}
 			rec.pid = proc.pid;
-			saveRecord(rec);
+			saveRecord(rec, ctx);
 
 			const cap = (chunk: Buffer) => {
 				output += chunk.toString();
@@ -213,7 +242,7 @@ export default function (pi: ExtensionAPI) {
 					rec.output = output;
 					rec.finishedAt = Date.now();
 					rec.pid = undefined;
-					saveRecord(rec);
+					saveRecord(rec, ctx);
 					resolve(rec);
 				});
 				proc.on("error", (error) => {
@@ -223,7 +252,7 @@ export default function (pi: ExtensionAPI) {
 					rec.exitCode = 1;
 					rec.output = output;
 					rec.finishedAt = Date.now();
-					saveRecord(rec);
+					saveRecord(rec, ctx);
 					resolve(rec);
 				});
 			});
@@ -263,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({ description: "Max wait in ms (0 = wait indefinitely; default 0)" }),
 			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const id = params.jobId?.trim();
 			if (!id) return toolError("Error: jobId is required.");
 			const deadline = params.timeoutMs ? Date.now() + params.timeoutMs : Infinity;
@@ -285,7 +314,7 @@ export default function (pi: ExtensionAPI) {
 						details: { jobId: id, status: "running" },
 					};
 				}
-				const rec = loadRecord(id);
+				const rec = loadRecord(id, ctx);
 				if (!rec) return toolError(`Unknown job "#${id}". Start one with bash_job_start.`);
 				if (rec.status !== "running") {
 					return {
@@ -316,8 +345,8 @@ export default function (pi: ExtensionAPI) {
 		description: "List bash jobs: id, status, command, duration, output preview.",
 		promptSnippet: "List bash jobs",
 		parameters: Type.Object({}),
-		async execute() {
-			const records = listRecords().slice(0, 20);
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const records = listRecords(ctx).slice(0, 20);
 			if (records.length === 0) {
 				return {
 					content: [{ type: "text", text: "No bash jobs yet. Start one with bash_job_start." }],
@@ -343,10 +372,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			jobId: Type.String({ description: "Job id" }),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const id = params.jobId?.trim();
 			if (!id) return toolError("Error: jobId is required.");
-			const rec = loadRecord(id);
+			const rec = loadRecord(id, ctx);
 			if (!rec) return toolError(`Unknown job "#${id}".`);
 			if (rec.status === "running") {
 				return {
@@ -379,11 +408,11 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			jobId: Type.String({ description: "Job id" }),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const id = params.jobId?.trim();
 			if (!id) return toolError("Error: jobId is required.");
 			const entry = running.get(id);
-			const rec = loadRecord(id);
+			const rec = loadRecord(id, ctx);
 			if (!rec) return toolError(`Unknown job "#${id}".`);
 			if (rec.status !== "running" || !entry) {
 				return {
@@ -400,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 			rec.status = "cancelled";
 			rec.note = "cancelled by the agent";
 			rec.finishedAt = Date.now();
-			saveRecord(rec);
+			saveRecord(rec, ctx);
 			running.delete(id);
 			return { content: [{ type: "text", text: `Cancelled job #${id}.` }], details: { jobId: id, status: "cancelled" } };
 		},
@@ -410,7 +439,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("bash-jobs", {
 		description: "List bash jobs: /bash-jobs",
 		handler: async (_args, ctx) => {
-			const records = listRecords().slice(0, 20);
+			const records = listRecords(ctx).slice(0, 20);
 			ctx.ui.notify(
 				records.length
 					? records.map((r) => `#${r.id} [${r.status}] ${r.command.slice(0, 60)}`).join("\n")
