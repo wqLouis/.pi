@@ -130,6 +130,10 @@ interface SubagentRecord {
 	allowTmp?: boolean;
 	status: SubagentStatus;
 	pid?: number;
+	/** Human-readable failure reason, when the last run errored. */
+	lastError?: string;
+	/** When the completion/error message was pushed to the main agent (undelivered = not set). */
+	donePushedAt?: number;
 	createdAt: number;
 	updatedAt: number;
 	lastOutput: string;
@@ -603,6 +607,7 @@ function finalizeRecord(rec: SubagentRecord, run: RunResult): { output: string; 
 	rec.lastOutput = output;
 	rec.totalUsage = addUsage(rec.totalUsage, run.usage);
 	rec.status = isFailedRun(run) ? "error" : "idle";
+	rec.lastError = isFailedRun(run) ? (run.errorMessage || run.stderr || firstLine(output).slice(0, 300)) : undefined;
 	rec.pid = undefined;
 	saveRecord(rec);
 	return { output, failed: isFailedRun(run) };
@@ -652,53 +657,62 @@ async function runAndRecord(
 const running = new Map<string, RunningEntry>();
 
 /** Send the main agent a message when a background subagent finishes. */
-function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
-	const failed = isFailedRun(run);
+/** Build the visible completion/error text for a finished subagent record. */
+function buildCompletionText(rec: SubagentRecord): string {
 	const preview = firstLine(rec.lastOutput).slice(0, 200);
-
-	if (failed) {
-		// Bubble the error to the main agent with concrete recovery options so it
-		// can steer the subagent (subagent_send) or respawn it (subagent_spawn).
-		const reason = run.stopReason ?? `exit code ${run.exitCode}`;
-		const detail = (run.errorMessage || run.stderr || preview || "(no output)").slice(0, 300);
-		const text =
-			`[subagent ${rec.id} error] ${reason}: ${detail}\n\n` +
+	if (rec.status === "error") {
+		const detail = (rec.lastError || preview || "(no output)").slice(0, 300);
+		return (
+			`[subagent ${rec.id} error] ${detail}\n\n` +
 			`The subagent's run failed. Resolve it:\n` +
 			`- Steer it to fix the error: subagent_send { subagentId: "${rec.id}", message: "<what to fix>" } — it resumes with its full context\n` +
 			`- Respawn a fresh subagent: subagent_spawn { task: "<retry the work>", ... }\n` +
 			`- Inspect the full transcript first: subagent_result { subagentId: "${rec.id}" }\n` +
-			`- Discard it: subagent_forget { subagentId: "${rec.id}" }`;
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Subagent ${rec.id} error: ${reason}`, "error");
-		}
-		api.sendMessage(
-			{
-				customType: "subagent-error",
-				content: text,
-				display: true,
-				details: { subagentId: rec.id, status: "error", reason, error: detail, output: rec.lastOutput },
-			},
-			// Realtime: if the agent is idle this starts a turn immediately (triggerTurn);
-			// if it is streaming the message is queued into the current turn (followUp).
-			{ deliverAs: "followUp", triggerTurn: true },
+			`- Discard it: subagent_forget { subagentId: "${rec.id}" }`
 		);
-		return;
 	}
+	return `[subagent ${rec.id} done] ${preview || "(no output)"}`;
+}
 
+/**
+ * Deliver the completion as a REAL user message (sendUserMessage), so it
+ * auto-bubbles visibly into the agent's final turn and even when idle it
+ * triggers a fresh turn. Marks the record so the flusher doesn't re-send.
+ */
+function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
+	const text = buildCompletionText(rec);
+	const brief = rec.status === "error" ? `Subagent ${rec.id} error` : `Subagent ${rec.id} done`;
 	if (ctx.hasUI) {
-		ctx.ui.notify(`Subagent ${rec.id} done: ${preview}`, "info");
+		ctx.ui.notify(rec.status === "error" ? brief : `${brief}: ${firstLine(rec.lastOutput).slice(0, 200)}`, rec.status === "error" ? "error" : "info");
 	}
-	api.sendMessage(
-		{
-			customType: "subagent-notify",
-			content: `[subagent ${rec.id} done] ${preview || "(no output)"}`,
-			display: true,
-			details: { subagentId: rec.id, status: rec.status, output: rec.lastOutput },
-		},
-		// Realtime: if the agent is idle this starts a turn immediately (triggerTurn);
-		// if it is streaming the message is queued into the current turn (followUp).
-		{ deliverAs: "followUp", triggerTurn: true },
-	);
+	try {
+		api.sendUserMessage(text);
+		rec.donePushedAt = Date.now();
+		saveRecord(rec);
+	} catch {
+		/* stale ctx (e.g. extension reloaded) — the flusher re-delivers with a fresh ctx */
+	}
+}
+
+/**
+ * Re-deliver any finished subagent whose completion message was never pushed
+ * (e.g. the extension was reloaded mid-run and the captured ctx went stale).
+ * Runs with a FRESH ctx on agent_end, session_start, and an idle timer, so
+ * the message auto-bubbles in the agent's final turn — even while idle.
+ */
+function flushPendingNotifications(api: ExtensionAPI, ctx: ExtensionContext): void {
+	try {
+		for (const file of fs.readdirSync(subagentDir())) {
+			if (!file.endsWith(".json")) continue;
+			const rec = loadRecord(file.slice(0, -5));
+			if (!rec || rec.status === "running" || rec.donePushedAt) continue;
+			api.sendUserMessage(buildCompletionText(rec));
+			rec.donePushedAt = Date.now();
+			saveRecord(rec);
+		}
+	} catch {
+		/* ignore */
+	}
 }
 
 /**
@@ -935,6 +949,27 @@ export default function (pi: ExtensionAPI) {
 		}
 		running.clear();
 	});
+
+	/* ---------------- auto-bubble subagent completions ---------------- */
+	// Re-deliver any completion/error message that wasn't pushed (stale ctx after
+	// reload): at session start, at the end of every agent turn, and from an
+	// idle timer — so the message always auto-bubbles, even while idle.
+	let lastFlushCtx: ExtensionContext | undefined;
+	const scheduleFlush = (ctx: ExtensionContext, delayMs: number) => {
+		lastFlushCtx = ctx;
+		setTimeout(() => flushPendingNotifications(pi, ctx), delayMs);
+	};
+	pi.on("session_start", (_event, ctx) => scheduleFlush(ctx, 200));
+	pi.on("agent_end", (_event, ctx) => scheduleFlush(ctx, 50));
+	const flushTimer = setInterval(() => {
+		if (!lastFlushCtx) return;
+		try {
+			flushPendingNotifications(pi, lastFlushCtx);
+		} catch {
+			/* ignore */
+		}
+	}, 30_000);
+	pi.on("session_shutdown", () => clearInterval(flushTimer));
 
 	/* ---------------- edit-scope enforcement (subagent processes) ---------------- */
 	// The parent passes the scope via PI_SUBAGENT_SCOPE (JSON array of absolute

@@ -74,9 +74,11 @@ Key behaviors:
   report how many subagents are running right now vs the `maxSubagents` limit,
   and the nesting depth; `subagent_spawn` refuses to exceed either limit with
   a clear reason.
-- **Realtime notifications** — background completions and bubbles deliver
-  immediately (`followUp` + `triggerTurn`), so an idle main agent wakes up and
-  acts without the user prompting.
+- **Auto-bubbled completions** — when a background subagent finishes, a **real
+  user message** (`sendUserMessage`) auto-bubbles into the agent's final turn
+  (and triggers one even when idle). If a push was missed (e.g. extension
+  reloaded mid-run), a flusher re-delivers it at session start / turn end /
+  every 30s.
 - **`/subagent` command** — spawn, `list`, `result <id>`, `send <id> <msg>`,
   `forget <id>`, `model [provider/id]` (interactive model picker), `config`.
 
