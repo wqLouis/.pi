@@ -686,7 +686,7 @@ function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecor
 		ctx.ui.notify(rec.status === "error" ? brief : `${brief}: ${firstLine(rec.lastOutput).slice(0, 200)}`, rec.status === "error" ? "error" : "info");
 	}
 	try {
-		api.sendUserMessage(text);
+		api.sendUserMessage(text, { deliverAs: "followUp" });
 		rec.donePushedAt = Date.now();
 		saveRecord(rec);
 	} catch {
@@ -706,7 +706,7 @@ function flushPendingNotifications(api: ExtensionAPI, ctx: ExtensionContext): vo
 			if (!file.endsWith(".json")) continue;
 			const rec = loadRecord(file.slice(0, -5));
 			if (!rec || rec.status === "running" || rec.donePushedAt) continue;
-			api.sendUserMessage(buildCompletionText(rec));
+			api.sendUserMessage(buildCompletionText(rec), { deliverAs: "followUp" });
 			rec.donePushedAt = Date.now();
 			saveRecord(rec);
 		}

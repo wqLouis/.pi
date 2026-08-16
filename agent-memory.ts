@@ -402,7 +402,11 @@ function maybePushNudge(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
 	if (nudgeInFlight) return false;
 	nudgeInFlight = true;
 	try {
-		pi.sendUserMessage(buildNudgeText(usage.percent, usage.tokens, usage.contextWindow, dropped.size, droppable.length));
+		pi.sendUserMessage(buildNudgeText(usage.percent, usage.tokens, usage.contextWindow, dropped.size, droppable.length), {
+			// Queue into the current turn if the agent is mid-processing; starts a
+			// turn when idle. Without deliverAs, pi throws "Agent is already processing".
+			deliverAs: "followUp",
+		});
 	} catch {
 		/* delivery failed — try again later */
 	}
