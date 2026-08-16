@@ -51,7 +51,7 @@ against that session, so steering truly continues its work with full history.
 | Tool | Purpose |
 |------|---------|
 | `subagent_spawn { task, model?, cwd?, tools?, scope?, await? }` | Spawn a subagent. `await: false` returns immediately (background) |
-| `subagent_send { subagentId, message }` | Push a message / steer — resumes its session with full context |
+| `subagent_send { subagentId, message }` | Push a message / steer — **always async**: returns immediately, completion auto-bubbles |
 | `subagent_wait { subagentId \| all: true }` | Block until one (or all) finish, streaming live `done/total` progress |
 | `subagent_list` | Running/finished subagents: id, model, usage, latest output |
 | `subagent_result { subagentId }` | Full transcript: task, steering messages, tool activity, outputs |

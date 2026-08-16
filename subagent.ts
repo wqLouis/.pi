@@ -1427,13 +1427,14 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_send",
 		label: "Subagent Send",
 		description:
-			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Only works when the subagent is not currently running — wait for it first with subagent_wait.",
+			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: it returns immediately, the subagent runs the steering turn in the background, and you're notified (a message auto-bubbles) when it finishes — block with subagent_wait or inspect with subagent_result. Only works when the subagent is not currently running.",
 		promptSnippet: "Send a steering message to a subagent",
 		promptGuidelines: [
 			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_send (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
+			"subagent_send is async — it returns immediately and the completion auto-bubbles; you can keep working or wait with subagent_wait.",
 		],
 		parameters: SendParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const message = params.message?.trim();
 			if (!message) {
 				return {
@@ -1463,40 +1464,36 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await runAndRecord(record, message, signal, onUpdate, (bubble) => {
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						`[subagent ${record.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, 200)}`,
-						bubble.request ? "warning" : "info",
-					);
-				}
-			}, childTaskBase(ctx, record.id));
-			if (!result.ok) {
+			// Always async: start the steering turn in the background; the completion
+			// auto-bubbles as a real user message when it finishes.
+			const started = await startBackground(pi, ctx, record, message);
+			if (!started.started) {
 				return {
-					content: [{ type: "text", text: result.error ?? "Failed to reach subagent." }],
+					content: [{ type: "text", text: started.error ?? "Failed to start the subagent turn." }],
 					details: {
 						subagentId: params.subagentId,
 						model: record.model,
-						output: result.output,
+						output: "",
 						status: "error",
-						usage: result.usage ?? EMPTY_USAGE(),
+						usage: record.totalUsage,
 					} as SubagentDetails,
 					isError: true,
 				};
 			}
-			const bubbleText =
-				result.bubbles.length > 0
-					? "\n\n[subagent bubbles — messages the subagent sent you during the run]\n" +
-						result.bubbles.map((b) => `- ${b.request ? "[request] " : ""}${b.text}`).join("\n")
-					: "";
 			return {
-				content: [{ type: "text", text: `[subagent ${params.subagentId}] ${result.output}${bubbleText}` }],
+				content: [
+					{
+						type: "text",
+						text:
+							`Steering message sent to subagent ${params.subagentId} in the background — it will run its turn and you'll be notified when it finishes. Block with subagent_wait, or inspect the output with subagent_result.`,
+					},
+				],
 				details: {
 					subagentId: params.subagentId,
 					model: record.model,
-					output: result.output,
-					status: "idle",
-					usage: result.usage ?? EMPTY_USAGE(),
+					output: "",
+					status: "running",
+					usage: record.totalUsage,
 				} as SubagentDetails,
 			};
 		},
