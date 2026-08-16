@@ -1,7 +1,7 @@
 # pi agent harness
 
 A set of extensions that turn the [pi coding agent](https://github.com/earendil-works/pi) into a
-self-managing, multi-agent system. Four extensions, loaded from
+self-managing, multi-agent system. Six extensions, loaded from
 `~/.pi/agent/extensions/`:
 
 1. **agent-memory** — the agent manages its own conversation memory (not just compaction).
@@ -14,6 +14,29 @@ self-managing, multi-agent system. Four extensions, loaded from
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
 tools too.
+
+## Design: async-first, work as much as possible
+
+This harness is built to be **long-running and high-throughput**: the agent
+should never idle waiting on something while it can still be doing work.
+Everything that takes time is pushed to the background and reports back
+automatically:
+
+- `subagent_spawn { await: false }` — delegate and move on; the completion
+  **auto-bubbles** as a real message.
+- `subagent_send` — steering is **always async**: push the message, keep
+  working, get pinged when it finishes.
+- `bash_job_start` — run a long command in the background, get pinged when
+  it's done.
+- **Idle timers** re-deliver anything that was missed (reloads, busy turns)
+  at session start / turn end / every 30s — no notification is ever lost.
+- Busy-safe pushes: every notification passes `deliverAs: "followUp"`, so it
+  queues into the current turn instead of throwing or interrupting.
+
+The agent *can* block (`subagent_wait`, `bash_job_wait`) when it genuinely
+needs the result before continuing — but the default posture is: start it,
+forget it, get pinged. Subagents themselves run the same way, so the whole
+tree fans out into background work and results flow back to the top.
 
 ---
 
@@ -163,6 +186,8 @@ ln -s "$(pwd)"/subagent.ts ~/.pi/agent/extensions/
 ln -s "$(pwd)"/bash-timeout.ts ~/.pi/agent/extensions/
 ln -s "$(pwd)"/playwright-browser.ts ~/.pi/agent/extensions/
 ln -s "$(pwd)"/browser-server.mjs ~/.pi/agent/extensions/
+ln -s "$(pwd)"/agent-tasks.ts ~/.pi/agent/extensions/
+ln -s "$(pwd)"/agent-bash-jobs.ts ~/.pi/agent/extensions/
 
 # browser tools need playwright + chromium (or run /playwright-setup inside pi)
 bun add -g playwright && playwright install chromium
@@ -176,19 +201,27 @@ Then start pi (or `/reload`) and the tools are live. Commands run in pi's TUI:
 | Variable | Effect |
 |----------|--------|
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
-| `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` | Set on subagent processes (depth guard, browser session id, edit scope) |
+| `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, nested task board) |
+| `PI_SUBAGENT_MAX_DEPTH` / `PI_SUBAGENT_MAX_SUBAGENTS` | Override nesting depth / concurrency limits |
+| `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
+| `PI_TASK_DIR` | Task-board root (default `/tmp`) |
 | `PI_PLAYWRIGHT_IMPORT` | Absolute path to a playwright entry file (override) |
 | `PI_BROWSER_DAEMON_FILE` | Absolute path to `browser-server.mjs` |
 | `PI_PLAYWRIGHT_GLOBAL_DIR` | Extra global node_modules dir to scan for playwright |
 
 ## Architecture notes
 
+- **Async-first, never blocked** — spawns, steering, and long commands all
+  return immediately; completions auto-bubble as real messages (idle timers
+  guarantee delivery). Waiting is opt-in (`subagent_wait`, `bash_job_wait`).
 - **Nothing destructive** — memory drops rewrite only the LLM context; the
   session files (main and subagent) always hold the full history.
-- **State survives** — memory drops and subagent records persist as session
-  entries, so they survive restarts, `/reload`, and branching.
+- **State survives** — memory drops, subagent records, and bash-job records
+  persist (per-session for jobs), so they survive restarts, `/reload`, and
+  branching.
 - **Isolated enforcement** — edit scope lives in the subagent process itself;
   the browser lives in its own daemon with per-client sessions.
 - **Realtime by design** — completion/bubble notifications and memory nudges
-  are injected into the running agent (`triggerTurn` / `before_agent_start`),
-  not queued behind the next user input.
+  are pushed into the running agent (`sendUserMessage` + `followUp`, so they
+  queue when busy and trigger a turn when idle) — not queued behind the next
+  user input.
