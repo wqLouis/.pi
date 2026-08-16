@@ -9,8 +9,7 @@ self-managing, multi-agent system. Four extensions, loaded from
 3. **bash-timeout** — commands can't hang the agent forever.
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
 5. **agent-tasks** — a plain-markdown task board per session.
-6. **agent-schedule** — deferred reminders that fire in realtime.
-7. **agent-bash-jobs** — background bash commands with realtime completion.
+6. **agent-bash-jobs** — background bash commands with realtime completion.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -131,22 +130,7 @@ the agent where it lives via a system-prompt guideline.
 `/task` shows the board (or `/task init` recreates it). Override the root dir
 with `PI_TASK_DIR` (default `/tmp`).
 
-## 6. agent-schedule — deferred reminders
-
-The agent schedules reminders ("check the build in 10 minutes") persisted to
-`~/.pi/agent/schedule.json`. A poller fires due items in realtime
-(`followUp` + `triggerTurn`, so an idle agent wakes up and acts), and items
-that came due while pi was closed are fired on the next startup.
-
-| Tool | Purpose |
-|------|---------|
-| `schedule_add { text, inMinutes }` | Schedule a reminder (fractions allowed; max 24h) |
-| `schedule_list` | Pending reminders with due times |
-| `schedule_cancel { id }` | Cancel by id |
-
-Plus `/schedule list | cancel <id>`.
-
-## 7. agent-bash-jobs — run commands in the background
+## 6. agent-bash-jobs — run commands in the background
 
 Long commands no longer block the agent: `bash_job_start { command }` returns a
 job id immediately, the job runs in the background, and when it finishes a
