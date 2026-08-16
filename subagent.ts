@@ -126,6 +126,8 @@ interface SubagentRecord {
 	tools?: string;
 	/** Absolute edit-scope paths (dirs or files). Writes outside are blocked. */
 	scope?: string[];
+	/** Whether the subagent may write to the OS temp dir (default true). */
+	allowTmp?: boolean;
 	status: SubagentStatus;
 	pid?: number;
 	createdAt: number;
@@ -151,6 +153,10 @@ interface SubagentConfig {
 	maxDepth?: number;
 	/** Max concurrently-running subagents across all layers. */
 	maxSubagents?: number;
+	/** Default edit scope for spawned subagents (dir or list of dirs/files). */
+	scope?: string | string[];
+	/** Whether subagents may write to the OS temp dir when scoped (default true). */
+	allowTmp?: boolean;
 }
 
 interface RunningEntry {
@@ -481,6 +487,7 @@ async function spawnSubagentProcess(
 				env.PI_SUBAGENT_SCOPE = JSON.stringify(rec.scope);
 			}
 			if (taskBase) env.PI_TASK_BASE = taskBase;
+			if (rec.allowTmp === false) env.PI_SUBAGENT_SCOPE_BLOCK_TMP = "1";
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: rec.cwd,
 				shell: false,
@@ -1081,7 +1088,9 @@ export default function (pi: ExtensionAPI) {
 				cwd: params.cwd,
 				tools: params.tools,
 			});
-			const scope = normalizeScope(opts.cwd, params.scope);
+			const cfg = loadConfig();
+			const scope = normalizeScope(opts.cwd, params.scope ?? cfg.scope);
+			const allowTmp = cfg.allowTmp ?? true;
 
 			const record: SubagentRecord = {
 				id: newSubagentId(),
@@ -1090,6 +1099,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: opts.cwd,
 				tools: opts.tools,
 				scope,
+				allowTmp,
 				status: "running",
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
@@ -1617,6 +1627,10 @@ export default function (pi: ExtensionAPI) {
 			out.push(`Tool allowlist: ${cfg.tools ?? "(all tools)"}`);
 			out.push(`Subagents running: ${runningNow}/${maxSubagents} (maxSubagents)`);
 			out.push(`Nesting layers allowed: ${maxDepth} (maxDepth — 1 = no sub-subagents)`);
+			out.push(
+				`Default edit scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none — full access)"}`,
+			);
+			out.push(`Allow temp writes: ${cfg.allowTmp === false ? "no" : "yes"}`);
 			out.push("Set the model with `/subagent model <provider/id>`; set limits with `/subagent config maxDepth N` / `/subagent config maxSubagents N`.");
 			return {
 				content: [{ type: "text", text: out.join("\n") }],
@@ -1627,6 +1641,8 @@ export default function (pi: ExtensionAPI) {
 					runningSubagents: runningNow,
 					maxSubagents,
 					maxDepth,
+					defaultScope: cfg.scope,
+					allowTmp: cfg.allowTmp !== false,
 				},
 			};
 		},
@@ -1683,8 +1699,33 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`${key} set to ${cfg[key]}.`, "info");
 					return;
 				}
+				if (key === "scope") {
+					const v = parts.slice(2).join(" ").trim();
+					cfg.scope = v
+						? v.includes(",")
+							? v.split(",").map((x) => x.trim()).filter(Boolean)
+							: v
+						: undefined;
+					saveConfig(cfg);
+					ctx.ui.notify(v ? `Default edit scope set to: ${v}` : "Default edit scope cleared (full access).", "info");
+					return;
+				}
+				if (key === "allowTmp") {
+					const v = parts[2]?.toLowerCase();
+					if (v !== "yes" && v !== "no") {
+						ctx.ui.notify("Usage: /subagent config allowTmp yes|no", "info");
+						return;
+					}
+					cfg.allowTmp = v === "yes";
+					saveConfig(cfg);
+					ctx.ui.notify(`allowTmp set to ${cfg.allowTmp ? "yes" : "no"}.`, "info");
+					return;
+				}
 				if (key) {
-					ctx.ui.notify("Usage: /subagent config [maxDepth <n> | maxSubagents <n>] — no args opens the settings panel.", "info");
+					ctx.ui.notify(
+						"Usage: /subagent config [maxDepth <n> | maxSubagents <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
+						"info",
+					);
 					return;
 				}
 				await showSubagentConfigUi(ctx);
@@ -1884,6 +1925,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		ctx.ui.notify(
 			`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
 				`maxDepth (layers): ${getMaxDepth()} · maxSubagents: ${getMaxSubagents()} (running ${countRunningSubagents()})\n` +
+				`scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none)"} · allowTmp: ${cfg.allowTmp === false ? "no" : "yes"}\n` +
 				`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
 				`file: ${configFile()}`,
 			"info",
@@ -1903,7 +1945,14 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 
 		// items order is fixed (search disabled) — we mirror the selection to
 		// intercept digit input on the numeric rows for direct value entry.
-		const items: Array<{ id: string; label: string; description?: string; currentValue: string; submenu?: (cur: string, done: (v?: string) => void) => Component }> = [
+		const items: Array<{
+			id: string;
+			label: string;
+			description?: string;
+			currentValue: string;
+			values?: string[];
+			submenu?: (cur: string, done: (v?: string) => void) => Component;
+		}> = [
 			{
 				id: "model",
 				label: "Model",
@@ -1927,6 +1976,22 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				label: "Working directory",
 				description: "Where new subagents run. Edit subagent-config.json or use the CLI form.",
 				currentValue: draft.cwd ?? "(inherit — session cwd)",
+			},
+			{
+				id: "scope",
+				label: "Default edit scope",
+				description:
+					"Edit scope applied to spawned subagents (overridden by the spawn scope param). Set with /subagent config scope <path>.",
+				currentValue: Array.isArray(draft.scope)
+					? draft.scope.join(", ")
+					: draft.scope ?? "(none — full access)",
+			},
+			{
+				id: "allowTmp",
+				label: "Allow temp writes",
+				description: "Whether subagents may write to the OS temp dir when scoped. Enter to toggle.",
+				currentValue: draft.allowTmp === false ? "no" : "yes",
+				values: ["yes", "no"],
 			},
 		];
 		items[0].submenu = (_cur, selectDone) =>
@@ -1965,8 +2030,14 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			items,
 			10,
 			getSettingsListTheme(),
-			(_id, _newValue) => {
-				/* numeric edits are committed by commitNumber */
+			(id, newValue) => {
+				if (id === "allowTmp") {
+					draft.allowTmp = newValue === "yes";
+					dirty = true;
+					updateFooter();
+					container.invalidate();
+				}
+				/* numbers are handled by direct input; scope row is display-only */
 			},
 			() => done(undefined),
 			{ enableSearch: false },
