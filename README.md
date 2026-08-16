@@ -35,11 +35,12 @@ undone.
 Plus a `/memory [index | status | drop <ids> | restore [ids]]` command for
 humans (renders the index as a scrollable panel in the TUI).
 
-The agent is **nudged proactively**: `before_agent_start` injects a message
-when live context usage crosses the 30% / 50% / 70% bands ("context is at X% —
-consider calling memory_drop…"), once per band, only when droppable turns
-exist. Band state persists in the session, so it doesn't re-nag across
-restarts.
+The agent is **nudged proactively**: when live context usage crosses the
+30% / 50% / 70% bands ("context is at X% — consider calling memory_drop…"), a
+**real user steering message** is pushed (`sendUserMessage`, so it always
+triggers a turn and is visible in the chat) — once per band, only when
+droppable turns exist. It fires after each turn settles, at session start, and
+from an idle timer. Band state persists in the session, so it doesn't re-nag.
 
 ## 2. subagent — spawn, steer, wait, scope
 

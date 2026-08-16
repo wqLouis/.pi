@@ -33,7 +33,6 @@ import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const MEMORY_CUSTOM_TYPE = "agent-memory";
-const NUDGE_CUSTOM_TYPE = "agent-memory-nudge";
 const DEFAULT_LINES = 4;
 const MAX_PREVIEW_LINES = 20; // upper bound for stored previews (index can slice further)
 const MAX_STUB_CHARS = 160; // max chars kept for tool-call arguments in stubs
@@ -43,6 +42,9 @@ const MAX_STUB_CHARS = 160; // max chars kept for tool-call arguments in stubs
 // these percentages of the model's context window, so it nudges at 30% → 50%
 // → 70% and never nags between bands.
 const NUDGE_THRESHOLDS_PERCENT = [30, 50, 70];
+
+/** Guards against racing nudge triggers (agent_end + idle timer) double-pushing. */
+let nudgeInFlight = false;
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -325,16 +327,22 @@ function updateStatusWidget(ctx: ExtensionContext) {
 /* Context-usage nudge (tells the agent to drop unneeded memory)       */
 /* ------------------------------------------------------------------ */
 
-/** Most recent nudge custom message on the branch, if any. */
+/** Most recent nudge percent on the branch, parsed from pushed user messages. */
 function getLastNudge(ctx: ExtensionContext): { percentAtNudge: number } | undefined {
 	let last: { percentAtNudge: number } | undefined;
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type === "custom_message" && entry.customType === NUDGE_CUSTOM_TYPE) {
-			const details = (entry as { details?: unknown }).details;
-			if (details && typeof details === "object" && typeof (details as { percentAtNudge?: unknown }).percentAtNudge === "number") {
-				last = details as { percentAtNudge: number };
+	try {
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const msg = (entry as { message?: unknown }).message as { role?: string; content?: unknown } | undefined;
+			if (msg?.role !== "user") continue;
+			const m = extractText(msg.content).match(/\[memory notice\][^\n]*?at (\d+)%/);
+			if (m) {
+				const p = Number(m[1]);
+				if (!last || p > last.percentAtNudge) last = { percentAtNudge: p };
 			}
 		}
+	} catch {
+		/* ignore */
 	}
 	return last;
 }
@@ -359,18 +367,24 @@ function buildNudgeText(percent: number, tokens: number | null, contextWindow: n
 }
 
 /**
- * Nudge the agent when context usage crosses the next threshold and there are
- * turns worth dropping. Fires at most once per usage band: 30%, then 50%,
- * then 70% (no re-nudge until usage climbs into a higher band).
+ * Nudge the agent by pushing a REAL user steering message (sendUserMessage),
+ * which always triggers a turn and is visible in the chat — unlike a hidden
+ * custom message injected into the context. Fires at most once per usage band
+ * (30%, 50%, 70%) and only when there are turns worth dropping.
  */
-function maybeNudge(event: { prompt: string }, ctx: ExtensionContext): { message: { customType: string; content: string; display: boolean; details: { percentAtNudge: number } } } | undefined {
-	const usage = ctx.getContextUsage();
-	if (!usage || usage.percent == null) return undefined;
+function maybePushNudge(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+	let usage;
+	try {
+		usage = ctx.getContextUsage();
+	} catch {
+		return false;
+	}
+	if (!usage || usage.percent == null) return false;
 	const percent = usage.percent;
 
 	// Current band = highest threshold at or below the current usage.
 	const band = NUDGE_THRESHOLDS_PERCENT.filter((t) => percent >= t).pop();
-	if (!band) return undefined;
+	if (!band) return false;
 
 	// Only nudge when there is something worth dropping (exclude the current turn).
 	const state = loadState(ctx);
@@ -378,20 +392,24 @@ function maybeNudge(event: { prompt: string }, ctx: ExtensionContext): { message
 	const lastTurn = turns[turns.length - 1];
 	const dropped = new Set(state.drops.map((d) => d.turnId));
 	const droppable = turns.filter((t) => !dropped.has(t.turnId) && (!lastTurn || t.turnId !== lastTurn.turnId));
-	if (droppable.length === 0) return undefined;
+	if (droppable.length === 0) return false;
 
 	// Once per band: skip if the last nudge already happened at or above this band.
 	const lastNudge = getLastNudge(ctx);
-	if (lastNudge && lastNudge.percentAtNudge >= band) return undefined;
+	if (lastNudge && lastNudge.percentAtNudge >= band) return false;
 
-	return {
-		message: {
-			customType: NUDGE_CUSTOM_TYPE,
-			content: buildNudgeText(usage.percent, usage.tokens, usage.contextWindow, dropped.size, droppable.length),
-			display: false,
-			details: { percentAtNudge: usage.percent },
-		},
-	};
+	// Guard against racing triggers (agent_end + idle timer) pushing twice.
+	if (nudgeInFlight) return false;
+	nudgeInFlight = true;
+	try {
+		pi.sendUserMessage(buildNudgeText(usage.percent, usage.tokens, usage.contextWindow, dropped.size, droppable.length));
+	} catch {
+		/* delivery failed — try again later */
+	}
+	setTimeout(() => {
+		nudgeInFlight = false;
+	}, 5000);
+	return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -554,12 +572,35 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/* ---------------- lifecycle ---------------- */
-	pi.on("session_start", async (_event, ctx) => updateStatusWidget(ctx));
+	let lastEventCtx: ExtensionContext | undefined;
+
+	pi.on("session_start", async (_event, ctx) => {
+		lastEventCtx = ctx;
+		updateStatusWidget(ctx);
+		// Check shortly after start (context may already be high from prior work).
+		setTimeout(() => maybePushNudge(pi, ctx), 200);
+	});
 	pi.on("session_tree", async (_event, ctx) => updateStatusWidget(ctx));
 	pi.on("turn_end", async (_event, ctx) => updateStatusWidget(ctx));
 
 	/* ---------------- context-usage nudge ---------------- */
-	pi.on("before_agent_start", (event, ctx) => maybeNudge(event, ctx));
+	// Push a REAL user steering message (sendUserMessage) when context usage
+	// crosses 30/50/70% — after each turn settles, and from an idle timer so a
+	// long-running idle session still gets nudged.
+	pi.on("agent_end", async (_event, ctx) => {
+		lastEventCtx = ctx;
+		// Defer until the turn fully settles so the push triggers a fresh turn.
+		setTimeout(() => maybePushNudge(pi, ctx), 100);
+	});
+	const nudgeTimer = setInterval(() => {
+		if (!lastEventCtx) return;
+		try {
+			maybePushNudge(pi, lastEventCtx);
+		} catch {
+			/* ignore */
+		}
+	}, 30_000);
+	pi.on("session_shutdown", () => clearInterval(nudgeTimer));
 
 	/* ---------------- memory_index ---------------- */
 	pi.registerTool({
