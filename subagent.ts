@@ -1,37 +1,4 @@
-/**
- * Subagent — a single generic subagent the main agent can spawn, wait for,
- * and steer.
- *
- * One kind of subagent, using a model resolved in this order:
- *   1. the `model` parameter passed to subagent_spawn
- *   2. the user-configured model in ~/.pi/agent/subagent-config.json
- *      (set it with `/subagent model <provider/id>`)
- *   3. the user's currently selected session model
- *
- * Each subagent owns a private pi session file, so its context survives
- * between turns. Spawning can be synchronous (await: true, default) or
- * background (await: false). Background subagents notify the main agent when
- * they finish, and the main agent can wait on them:
- *
- *   subagent_spawn  – spawn a subagent (sync or background), returns subagentId
- *   subagent_wait   – wait until a subagent (or all running subagents) finish;
- *                     streams progress and returns the final outputs
- *   subagent_send   – push a follow-up message / steering instruction to a
- *                     finished subagent (continues its private session)
- *   subagent_list   – list subagents and their status (running/idle/error)
- *   subagent_result – read a subagent's full transcript
- *   subagent_forget – delete a subagent (kills it if still running)
- *   subagent_config – show the effective subagent configuration
- *
- * Implementation: each turn spawns a one-shot `pi --mode json -p` process
- * resumed on the subagent's private session file (`--session <file>`), so the
- * subagent always has its exact history without re-serializing anything.
- *
- * State lives in ~/.pi/agent/subagents/:
- *   <id>.json      – metadata record (model, system prompt, cwd, status, usage)
- *   <id>.jsonl     – the subagent's pi session file
- * and user configuration in ~/.pi/agent/subagent-config.json.
- */
+
 
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -52,10 +19,18 @@ import {
 import { Container, decodeKittyPrintable, matchesKey, SettingsList, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const DEFAULT_MAX_DEPTH = 3; // default max nesting layers (user-configurable via settings)
-const DEFAULT_MAX_SUBAGENTS = 4; // default max concurrently running subagents
+const DEFAULT_MAX_DEPTH = 3;
+const DEFAULT_MAX_SUBAGENTS = 4;
 const MAX_ERROR_CHARS = 500;
 const POLL_INTERVAL_MS = 500;
+const PREVIEW_CHARS = 200;
+const DETAIL_CHARS = 300;
+const KILL_GRACE_MS = 5000;
+const FLUSH_DELAY_MS = 50;
+const SESSION_START_FLUSH_DELAY_MS = 200;
+const FLUSH_INTERVAL_MS = 30_000;
+const SETTINGS_MAX_VISIBLE = 10;
+const FILTER_MAX_CHARS = 40;
 
 const DEFAULT_SUBAGENT_PROMPT = [
 	"You are a subagent working for a main agent. You run in an isolated context, so the main agent's conversation is not visible to you — only the task you receive and any follow-up instructions.",
@@ -68,17 +43,10 @@ const DEFAULT_SUBAGENT_PROMPT = [
 	"- You may delegate to your own sub-subagents up to the configured layer limit (see subagent_config), but prefer doing the work yourself unless nesting is clearly useful.",
 ].join("\n");
 
-/* ------------------------------------------------------------------ */
-/* Scope & subagent-process detection                                  */
-/* ------------------------------------------------------------------ */
 
-// True when this extension instance runs inside a spawned subagent process
-// (the parent sets PI_SUBAGENT_DEPTH=1 for every subagent). Subagents get the
-// bubble-up tools in addition to the full subagent toolset — nesting is
-// allowed up to the configured maxDepth, enforced at spawn time.
 const isSubagentProcess = Number(process.env.PI_SUBAGENT_DEPTH ?? "0") >= 1;
 
-/** True when the absolute target path lies inside any scope entry (dir or file). */
+
 function isWithinScope(targetAbs: string, scope: string[]): boolean {
 	return scope.some((s) => {
 		const rel = path.relative(s, targetAbs);
@@ -86,7 +54,7 @@ function isWithinScope(targetAbs: string, scope: string[]): boolean {
 	});
 }
 
-/** Normalize a scope (dir path or list of paths) into absolute paths. */
+
 function normalizeScope(baseCwd: string, scope: string | string[] | undefined): string[] | undefined {
 	if (!scope) return undefined;
 	const list = Array.isArray(scope) ? scope : [scope];
@@ -114,7 +82,7 @@ interface RunResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
-	/** Messages/requests the subagent bubbled up to the main agent during the run. */
+
 	bubbles?: Array<{ text: string; request: boolean }>;
 }
 
@@ -124,15 +92,15 @@ interface SubagentRecord {
 	systemPrompt: string;
 	cwd: string;
 	tools?: string;
-	/** Absolute edit-scope paths (dirs or files). Writes outside are blocked. */
+
 	scope?: string[];
-	/** Whether the subagent may write to the OS temp dir (default true). */
+
 	allowTmp?: boolean;
 	status: SubagentStatus;
 	pid?: number;
-	/** Human-readable failure reason, when the last run errored. */
+
 	lastError?: string;
-	/** When the completion/error message was pushed to the main agent (undelivered = not set). */
+
 	donePushedAt?: number;
 	createdAt: number;
 	updatedAt: number;
@@ -153,13 +121,13 @@ interface SubagentConfig {
 	systemPrompt?: string;
 	cwd?: string;
 	tools?: string;
-	/** Max nesting layers (1 = subagents cannot spawn sub-subagents). */
+
 	maxDepth?: number;
-	/** Max concurrently-running subagents across all layers. */
+
 	maxSubagents?: number;
-	/** Default edit scope for spawned subagents (dir or list of dirs/files). */
+
 	scope?: string | string[];
-	/** Whether subagents may write to the OS temp dir when scoped (default true). */
+
 	allowTmp?: boolean;
 }
 
@@ -179,9 +147,6 @@ const EMPTY_USAGE = (): RunUsage => ({
 	turns: 0,
 });
 
-/* ------------------------------------------------------------------ */
-/* Small helpers                                                       */
-/* ------------------------------------------------------------------ */
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -250,9 +215,6 @@ function extractText(content: unknown): string {
 	return parts.join("\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* User configuration (~/.pi/agent/subagent-config.json)               */
-/* ------------------------------------------------------------------ */
 
 function configFile(): string {
 	return path.join(getAgentDir(), "subagent-config.json");
@@ -264,7 +226,7 @@ function loadConfig(): SubagentConfig {
 		const cfg = JSON.parse(raw) as SubagentConfig;
 		if (cfg && typeof cfg === "object") return cfg;
 	} catch {
-		/* missing or corrupted */
+
 	}
 	return {};
 }
@@ -273,7 +235,7 @@ function saveConfig(cfg: SubagentConfig): void {
 	fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
-/** Max nesting depth: config > env > default. */
+
 function getMaxDepth(): number {
 	const cfg = loadConfig();
 	if (typeof cfg.maxDepth === "number" && Number.isFinite(cfg.maxDepth) && cfg.maxDepth >= 1) return Math.floor(cfg.maxDepth);
@@ -282,7 +244,7 @@ function getMaxDepth(): number {
 	return DEFAULT_MAX_DEPTH;
 }
 
-/** Max concurrently running subagents (global across layers): config > env > default. */
+
 function getMaxSubagents(): number {
 	const cfg = loadConfig();
 	if (typeof cfg.maxSubagents === "number" && Number.isFinite(cfg.maxSubagents) && cfg.maxSubagents >= 1)
@@ -292,7 +254,7 @@ function getMaxSubagents(): number {
 	return DEFAULT_MAX_SUBAGENTS;
 }
 
-/** Count subagents currently running anywhere (shared records; stale dead records excluded). */
+
 function countRunningSubagents(): number {
 	let count = 0;
 	try {
@@ -305,21 +267,21 @@ function countRunningSubagents(): number {
 					try {
 						process.kill(rec.pid, 0);
 					} catch {
-						continue; // stale record: process is dead
+						continue;
 					}
 				}
 				count++;
 			} catch {
-				/* unreadable/corrupt record */
+
 			}
 		}
 	} catch {
-		/* dir missing */
+
 	}
 	return count;
 }
 
-/** Resolve spawn defaults: explicit param > user config > session model/cwd. */
+
 function resolveSpawnOptions(
 	ctx: ExtensionContext,
 	params: { model?: string; systemPrompt?: string; cwd?: string; tools?: string },
@@ -335,9 +297,6 @@ function resolveSpawnOptions(
 	};
 }
 
-/* ------------------------------------------------------------------ */
-/* Subagent storage (metadata records + pi session files)              */
-/* ------------------------------------------------------------------ */
 
 function subagentDir(): string {
 	const dir = path.join(getAgentDir(), "subagents");
@@ -362,11 +321,11 @@ function loadRecord(id: string): SubagentRecord | undefined {
 		const raw = fs.readFileSync(recordFile(id), "utf-8");
 		const rec = JSON.parse(raw) as SubagentRecord;
 		if (rec && typeof rec.id === "string") {
-			if (!rec.status) rec.status = "idle"; // old records
+			if (!rec.status) rec.status = "idle";
 			return rec;
 		}
 	} catch {
-		/* corrupted or missing */
+
 	}
 	return undefined;
 }
@@ -376,7 +335,7 @@ function saveRecord(rec: SubagentRecord): void {
 	fs.writeFileSync(recordFile(rec.id), JSON.stringify(rec, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
-/** Read a subagent's session file and render it as a plain-text transcript. */
+
 function readTranscript(id: string): string {
 	try {
 		const raw = fs.readFileSync(sessionFile(id), "utf-8");
@@ -403,10 +362,6 @@ function readTranscript(id: string): string {
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* Process spawning (one-shot pi per turn, resumed on the subagent's   */
-/* private session file)                                               */
-/* ------------------------------------------------------------------ */
 
 async function writePromptToTempFile(prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
@@ -431,11 +386,7 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
-/**
- * Spawn one subagent turn. Returns the child handle plus a promise that
- * resolves with the run result when the process exits (message stream parsed).
- */
-/** This process's task-board base: env PI_TASK_BASE (subagent) or /tmp/<session> (main). */
+
 function currentTaskBase(ctx: ExtensionContext | undefined): string {
 	if (process.env.PI_TASK_BASE) return process.env.PI_TASK_BASE;
 	const dir = process.env.PI_TASK_DIR || "/tmp";
@@ -443,13 +394,13 @@ function currentTaskBase(ctx: ExtensionContext | undefined): string {
 	try {
 		sessionId = ctx?.sessionManager.getSessionId() ?? "session";
 	} catch {
-		/* no session manager */
+
 	}
 	const safe = sessionId.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "session";
 	return path.join(dir, safe);
 }
 
-/** The child's task-board base: <parent base>/<child id> (nested under the session). */
+
 function childTaskBase(ctx: ExtensionContext | undefined, childId: string): string {
 	return path.join(currentTaskBase(ctx), childId);
 }
@@ -561,7 +512,7 @@ async function spawnSubagentProcess(
 					proc!.kill("SIGTERM");
 					setTimeout(() => {
 						if (!proc!.killed) proc!.kill("SIGKILL");
-					}, 5000);
+					}, KILL_GRACE_MS);
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -573,17 +524,17 @@ async function spawnSubagentProcess(
 		try {
 			fs.unlinkSync(tmp.filePath);
 		} catch {
-			/* ignore */
+
 		}
 		try {
 			fs.rmdirSync(tmp.dir);
 		} catch {
-			/* ignore */
+
 		}
 	}
 }
 
-/** Synchronous turn: spawn and await completion. */
+
 async function runSubagentTurn(
 	rec: SubagentRecord,
 	userText: string,
@@ -601,19 +552,19 @@ function isFailedRun(run: RunResult): boolean {
 	return run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
 }
 
-/** Write the turn outcome into the record and persist it. */
+
 function finalizeRecord(rec: SubagentRecord, run: RunResult): { output: string; failed: boolean } {
 	const output = getFinalOutput(run.messages) || "(no output)";
 	rec.lastOutput = output;
 	rec.totalUsage = addUsage(rec.totalUsage, run.usage);
 	rec.status = isFailedRun(run) ? "error" : "idle";
-	rec.lastError = isFailedRun(run) ? (run.errorMessage || run.stderr || firstLine(output).slice(0, 300)) : undefined;
+	rec.lastError = isFailedRun(run) ? (run.errorMessage || run.stderr || firstLine(output).slice(0, DETAIL_CHARS)) : undefined;
 	rec.pid = undefined;
 	saveRecord(rec);
 	return { output, failed: isFailedRun(run) };
 }
 
-/** Run one synchronous turn for a record, updating + persisting it. */
+
 async function runAndRecord(
 	rec: SubagentRecord,
 	userText: string,
@@ -650,18 +601,14 @@ async function runAndRecord(
 	return { ok: true, output, usage: run.usage, bubbles: run.bubbles ?? [] };
 }
 
-/* ------------------------------------------------------------------ */
-/* Background execution + completion notification                      */
-/* ------------------------------------------------------------------ */
 
 const running = new Map<string, RunningEntry>();
 
-/** Send the main agent a message when a background subagent finishes. */
-/** Build the visible completion/error text for a finished subagent record. */
+
 function buildCompletionText(rec: SubagentRecord): string {
-	const preview = firstLine(rec.lastOutput).slice(0, 200);
+	const preview = firstLine(rec.lastOutput).slice(0, PREVIEW_CHARS);
 	if (rec.status === "error") {
-		const detail = (rec.lastError || preview || "(no output)").slice(0, 300);
+		const detail = (rec.lastError || preview || "(no output)").slice(0, DETAIL_CHARS);
 		return (
 			`[subagent ${rec.id} error] ${detail}\n\n` +
 			`The subagent's run failed. Resolve it:\n` +
@@ -674,52 +621,39 @@ function buildCompletionText(rec: SubagentRecord): string {
 	return `[subagent ${rec.id} done] ${preview || "(no output)"}`;
 }
 
-/**
- * Deliver the completion as a REAL user message (sendUserMessage), so it
- * auto-bubbles visibly into the agent's final turn and even when idle it
- * triggers a fresh turn. Marks the record so the flusher doesn't re-send.
- */
-function notifyDone(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
+
+function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
 	const text = buildCompletionText(rec);
 	const brief = rec.status === "error" ? `Subagent ${rec.id} error` : `Subagent ${rec.id} done`;
 	if (ctx.hasUI) {
-		ctx.ui.notify(rec.status === "error" ? brief : `${brief}: ${firstLine(rec.lastOutput).slice(0, 200)}`, rec.status === "error" ? "error" : "info");
+		ctx.ui.notify(rec.status === "error" ? brief : `${brief}: ${firstLine(rec.lastOutput).slice(0, PREVIEW_CHARS)}`, rec.status === "error" ? "error" : "info");
 	}
 	try {
-		api.sendUserMessage(text, { deliverAs: "followUp" });
+		pi.sendUserMessage(text, { deliverAs: "followUp" });
 		rec.donePushedAt = Date.now();
 		saveRecord(rec);
 	} catch {
-		/* stale ctx (e.g. extension reloaded) — the flusher re-delivers with a fresh ctx */
+
 	}
 }
 
-/**
- * Re-deliver any finished subagent whose completion message was never pushed
- * (e.g. the extension was reloaded mid-run and the captured ctx went stale).
- * Runs with a FRESH ctx on agent_end, session_start, and an idle timer, so
- * the message auto-bubbles in the agent's final turn — even while idle.
- */
-function flushPendingNotifications(api: ExtensionAPI, ctx: ExtensionContext): void {
+
+function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	try {
 		for (const file of fs.readdirSync(subagentDir())) {
 			if (!file.endsWith(".json")) continue;
 			const rec = loadRecord(file.slice(0, -5));
 			if (!rec || rec.status === "running" || rec.donePushedAt) continue;
-			api.sendUserMessage(buildCompletionText(rec), { deliverAs: "followUp" });
+			pi.sendUserMessage(buildCompletionText(rec), { deliverAs: "followUp" });
 			rec.donePushedAt = Date.now();
 			saveRecord(rec);
 		}
 	} catch {
-		/* ignore */
+
 	}
 }
 
-/**
- * Start a background turn. The tool call returns immediately; the process
- * keeps running, and when it finishes the record is finalized and the main
- * agent is notified.
- */
+
 async function startBackground(
 	api: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -751,11 +685,11 @@ async function startBackground(
 				partial = text;
 			},
 			(bubble) => {
-				// Bubble up to the main agent: notify immediately + deliver as a
-				// message in the next turn so the agent can act on it.
+
+
 				if (ctx.hasUI) {
 					ctx.ui.notify(
-						`[subagent ${rec.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, 200)}`,
+						`[subagent ${rec.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, PREVIEW_CHARS)}`,
 					bubble.request ? "warning" : "info",
 				);
 				}
@@ -766,7 +700,7 @@ async function startBackground(
 						display: true,
 						details: { subagentId: rec.id, request: bubble.request },
 					},
-					// Realtime: idle -> immediate new turn; streaming -> queued into current turn.
+
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			},
@@ -799,10 +733,7 @@ async function startBackground(
 	return { started: true };
 }
 
-/**
- * Wait until a subagent is no longer running. Handles lost process handles
- * (extension reloaded) by checking the recorded pid liveness.
- */
+
 async function waitForSubagent(
 	id: string,
 	deadline: number,
@@ -813,8 +744,7 @@ async function waitForSubagent(
 		if (signal?.aborted) return { status: "aborted", output: "" };
 		if (Date.now() > deadline) return { status: "timeout", output: "" };
 
-		// An errored (or otherwise finished) record ends the wait immediately —
-		// never wait indefinitely on a subagent that has already failed.
+
 		const recNow = loadRecord(id);
 		if (recNow && recNow.status !== "running") {
 			return {
@@ -831,8 +761,8 @@ async function waitForSubagent(
 		}
 
 		if (entry) {
-			// The process may have exited before the done-handler finalized the entry.
-			// Detect via pid liveness so we don't wait on a dead process.
+
+
 			if (entry.proc.pid != null) {
 				try {
 					process.kill(entry.proc.pid, 0);
@@ -844,7 +774,7 @@ async function waitForSubagent(
 		} else {
 			const rec = loadRecord(id);
 			if (rec && rec.status === "running") {
-				// handle lost (e.g. extension reloaded mid-run) — check pid
+
 				if (rec.pid) {
 					try {
 						process.kill(rec.pid, 0);
@@ -865,9 +795,6 @@ async function waitForSubagent(
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* Tool param schemas                                                  */
-/* ------------------------------------------------------------------ */
 
 const SpawnParams = Type.Object({
 	task: Type.String({ description: "The task to delegate to the subagent" }),
@@ -933,57 +860,46 @@ const ForgetParams = Type.Object({
 
 const ConfigParams = Type.Object({});
 
-/* ------------------------------------------------------------------ */
-/* Extension factory                                                   */
-/* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
-	/* ---------------- kill background subagents on shutdown ---------------- */
+
 	pi.on("session_shutdown", () => {
 		for (const { proc } of running.values()) {
 			try {
 				proc.kill("SIGTERM");
 			} catch {
-				/* ignore */
+
 			}
 		}
 		running.clear();
 	});
 
-	/* ---------------- auto-bubble subagent completions ---------------- */
-	// Re-deliver any completion/error message that wasn't pushed (stale ctx after
-	// reload): at session start, at the end of every agent turn, and from an
-	// idle timer — so the message always auto-bubbles, even while idle.
+
 	let lastFlushCtx: ExtensionContext | undefined;
 	const scheduleFlush = (ctx: ExtensionContext, delayMs: number) => {
 		lastFlushCtx = ctx;
 		setTimeout(() => flushPendingNotifications(pi, ctx), delayMs);
 	};
-	pi.on("session_start", (_event, ctx) => scheduleFlush(ctx, 200));
-	pi.on("agent_end", (_event, ctx) => scheduleFlush(ctx, 50));
+	pi.on("session_start", (_event, ctx) => scheduleFlush(ctx, SESSION_START_FLUSH_DELAY_MS));
+	pi.on("agent_end", (_event, ctx) => scheduleFlush(ctx, FLUSH_DELAY_MS));
 	const flushTimer = setInterval(() => {
 		if (!lastFlushCtx) return;
 		try {
 			flushPendingNotifications(pi, lastFlushCtx);
 		} catch {
-			/* ignore */
+
 		}
-	}, 30_000);
+	}, FLUSH_INTERVAL_MS);
 	pi.on("session_shutdown", () => clearInterval(flushTimer));
 
-	/* ---------------- edit-scope enforcement (subagent processes) ---------------- */
-	// The parent passes the scope via PI_SUBAGENT_SCOPE (JSON array of absolute
-	// paths). Writes outside it are blocked; reads are unrestricted.
-	// By default the OS temp dir (scratch space — the task board lives there)
-	// and the subagent's own task-board dir stay writable. Set
-	// PI_SUBAGENT_SCOPE_BLOCK_TMP=1 to disable the temp-dir exemption.
+
 	const scopeEnv = process.env.PI_SUBAGENT_SCOPE;
 	if (scopeEnv) {
 		let scope: string[] = [];
 		try {
 			scope = JSON.parse(scopeEnv);
 		} catch {
-			/* ignore malformed */
+
 		}
 		if (Array.isArray(scope) && scope.length > 0) {
 			const tmpDir = os.tmpdir();
@@ -1007,9 +923,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/* ---------------- subagent processes: bubble-up tools ---------------- */
-	// Subagents additionally get bubble-up tools; the full subagent toolset
-	// below is registered for every process (nesting is bounded by maxDepth).
+
 	if (isSubagentProcess) {
 		const bubble = (message: string, request: boolean) => {
 			process.stdout.write(
@@ -1062,7 +976,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	/* ---------------- subagent_spawn ---------------- */
+
 	pi.registerTool({
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
@@ -1183,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
 			const result = await runAndRecord(record, task, signal, onUpdate, (bubble) => {
 				if (ctx.hasUI) {
 					ctx.ui.notify(
-						`[subagent ${record.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, 200)}`,
+						`[subagent ${record.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, PREVIEW_CHARS)}`,
 						bubble.request ? "warning" : "info",
 					);
 				}
@@ -1224,7 +1138,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_wait ---------------- */
+
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent Wait",
@@ -1329,7 +1243,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// all: wait for every currently running subagent
+
 			const targets = [...running.keys()];
 			if (targets.length === 0) {
 				return {
@@ -1338,9 +1252,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Live done-count: a target is done when its record is no longer running
-			// (finished OR errored), its running entry is gone, or its process is
-			// already dead (finalization pending).
+
 			const isDone = (tid: string): boolean => {
 				const rec = loadRecord(tid);
 				if (rec && rec.status !== "running") return true;
@@ -1422,7 +1334,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_send ---------------- */
+
 	pi.registerTool({
 		name: "subagent_send",
 		label: "Subagent Send",
@@ -1464,8 +1376,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Always async: start the steering turn in the background; the completion
-			// auto-bubbles as a real user message when it finishes.
+
 			const started = await startBackground(pi, ctx, record, message);
 			if (!started.started) {
 				return {
@@ -1499,7 +1410,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_list ---------------- */
+
 	pi.registerTool({
 		name: "subagent_list",
 		label: "Subagent List",
@@ -1516,7 +1427,7 @@ export default function (pi: ExtensionAPI) {
 					if (rec) records.push(rec);
 				}
 			} catch {
-				/* dir missing */
+
 			}
 			records.sort((a, b) => b.createdAt - a.createdAt);
 
@@ -1554,7 +1465,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_result ---------------- */
+
 	pi.registerTool({
 		name: "subagent_result",
 		label: "Subagent Result",
@@ -1588,7 +1499,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_forget ---------------- */
+
 	pi.registerTool({
 		name: "subagent_forget",
 		label: "Subagent Forget",
@@ -1610,7 +1521,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					entry.proc.kill("SIGTERM");
 				} catch {
-					/* ignore */
+
 				}
 				running.delete(params.subagentId);
 			}
@@ -1620,7 +1531,7 @@ export default function (pi: ExtensionAPI) {
 					fs.unlinkSync(file);
 					removed++;
 				} catch {
-					/* ignore */
+
 				}
 			}
 			return {
@@ -1635,7 +1546,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- subagent_config ---------------- */
+
 	pi.registerTool({
 		name: "subagent_config",
 		label: "Subagent Config",
@@ -1680,7 +1591,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- /subagent command (for humans) ---------------- */
+
 	pi.registerCommand("subagent", {
 		description:
 			"Spawn or manage subagents: /subagent <task> | list | result <id> | send <id> <msg> | forget <id> | model [provider/id] | config",
@@ -1699,7 +1610,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				if (modelArg) {
-					// exact provider/id match → set directly; otherwise open the picker pre-filtered
+
 					const exact = findExactModel(ctx, modelArg);
 					if (exact) {
 						setModel(exact);
@@ -1711,7 +1622,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// no arg → open the model picker panel (like /model)
+
 				const picked = await showModelPicker(ctx, "", cfg.model ?? sessionModelLabel(ctx));
 				if (picked) setModel(picked);
 				else ctx.ui.notify("Model selection cancelled.", "info");
@@ -1772,7 +1683,7 @@ export default function (pi: ExtensionAPI) {
 						if (rec) records.push(rec);
 					}
 				} catch {
-					/* dir missing */
+
 				}
 				records.sort((a, b) => b.createdAt - a.createdAt);
 				const lines = records.map(
@@ -1808,7 +1719,7 @@ export default function (pi: ExtensionAPI) {
 						try {
 							entry.proc.kill("SIGTERM");
 						} catch {
-							/* ignore */
+
 						}
 						running.delete(id);
 					}
@@ -1816,7 +1727,7 @@ export default function (pi: ExtensionAPI) {
 						try {
 							fs.unlinkSync(file);
 						} catch {
-							/* ignore */
+
 						}
 					}
 					ctx.ui.notify(`Forgot subagent ${id}.`, "info");
@@ -1847,7 +1758,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// default: spawn with the given task
+
 			if (!first) {
 				ctx.ui.notify(
 					"Usage: /subagent <task> | list | result <id> | send <id> <msg> | forget <id> | model [provider/id] | config",
@@ -1882,18 +1793,15 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-/* ------------------------------------------------------------------ */
-/* Interactive model picker (like /model)                              */
-/* ------------------------------------------------------------------ */
 
 interface PickerModel {
 	provider: string;
 	id: string;
-	label: string; // provider/id
+	label: string;
 	name: string;
 }
 
-/** All selectable models: session-scoped models if any, else the full catalog. */
+
 function collectModels(ctx: ExtensionCommandContext): PickerModel[] {
 	const map = new Map<string, PickerModel>();
 	const add = (provider: string, id: string, name: string) => {
@@ -1908,23 +1816,23 @@ function collectModels(ctx: ExtensionCommandContext): PickerModel[] {
 			for (const m of ctx.modelRegistry.getAvailable()) add(m.provider, m.id, m.name);
 		}
 	} catch {
-		/* registry unavailable */
+
 	}
 	return [...map.values()].sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
 }
 
-/** Exact provider/id match, or undefined. */
+
 function findExactModel(ctx: ExtensionCommandContext, arg: string): string | undefined {
 	const q = arg.trim().toLowerCase();
 	return collectModels(ctx).find((m) => m.label.toLowerCase() === q)?.label;
 }
 
-/** The user's currently selected session model, as provider/id. */
+
 function sessionModelLabel(ctx: ExtensionCommandContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
-/** Open the picker; resolves with the chosen model label or undefined (cancelled). */
+
 async function showModelPicker(
 	ctx: ExtensionCommandContext,
 	initialFilter: string,
@@ -1946,12 +1854,10 @@ async function showModelPicker(
 
 const PICKER_ROW_CAP = 40;
 
-/* Interactive settings panel for /subagent config (mirrors pi's settings UI) */
-/* ------------------------------------------------------------------ */
 
 async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") {
-		// non-TUI fallback: notify the config summary
+
 		const cfg = loadConfig();
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 		ctx.ui.notify(
@@ -1966,7 +1872,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 	}
 
 	await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-		// Edits accumulate in a draft; Ctrl+S persists it (explicit save).
+
 		const draft: SubagentConfig = { ...loadConfig() };
 		let dirty = false;
 		let savedAt = 0;
@@ -1975,8 +1881,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		const rowValue = (id: string) =>
 			id === "maxDepth" ? String(draft.maxDepth ?? getMaxDepth()) : String(draft.maxSubagents ?? getMaxSubagents());
 
-		// items order is fixed (search disabled) — we mirror the selection to
-		// intercept digit input on the numeric rows for direct value entry.
+
 		const items: Array<{
 			id: string;
 			label: string;
@@ -2039,20 +1944,20 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			}) as unknown as Component;
 
 		const numericIds = new Set(["maxDepth", "maxSubagents"]);
-		let sel = 0; // mirrored selection (items order is fixed)
-		let buffer = ""; // in-progress digit entry for the numeric row
+		let selectedRowIndex = 0;
+		let digitInput = "";
 
 		const refreshRow = (id: string) => settingsList.updateValue(id, rowValue(id));
 
 		const commitNumber = () => {
-			const id = items[sel].id;
-			const n = Number(buffer);
+			const id = items[selectedRowIndex].id;
+			const n = Number(digitInput);
 			if (numericIds.has(id) && Number.isInteger(n) && n >= 1) {
 				if (id === "maxDepth") draft.maxDepth = n;
 				else draft.maxSubagents = n;
 				dirty = true;
 			}
-			buffer = "";
+			digitInput = "";
 			refreshRow(id);
 			updateFooter();
 			container.invalidate();
@@ -2060,7 +1965,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 
 		const settingsList = new SettingsList(
 			items,
-			10,
+			SETTINGS_MAX_VISIBLE,
 			getSettingsListTheme(),
 			(id, newValue) => {
 				if (id === "allowTmp") {
@@ -2069,7 +1974,6 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 					updateFooter();
 					container.invalidate();
 				}
-				/* numbers are handled by direct input; scope row is display-only */
 			},
 			() => done(undefined),
 			{ enableSearch: false },
@@ -2093,7 +1997,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
-				// Ctrl+S: persist the draft (explicit save)
+
 				if (matchesKey(data, "ctrl+s")) {
 					saveConfig(draft);
 					dirty = false;
@@ -2102,32 +2006,31 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 					container.invalidate();
 					return;
 				}
-				// mirror SettingsList's selection navigation (wraps around)
-				if (matchesKey(data, "up")) sel = sel === 0 ? items.length - 1 : sel - 1;
-				else if (matchesKey(data, "down")) sel = sel === items.length - 1 ? 0 : sel + 1;
 
-				const row = items[sel];
+				if (matchesKey(data, "up")) selectedRowIndex = selectedRowIndex === 0 ? items.length - 1 : selectedRowIndex - 1;
+				else if (matchesKey(data, "down")) selectedRowIndex = selectedRowIndex === items.length - 1 ? 0 : selectedRowIndex + 1;
+
+				const row = items[selectedRowIndex];
 				if (row && numericIds.has(row.id)) {
-					// direct integer entry on numeric rows
 					if (data.length === 1 && data >= "0" && data <= "9") {
-						buffer = (buffer + data).slice(0, 3);
-						settingsList.updateValue(row.id, buffer);
+						digitInput = (digitInput + data).slice(0, 3);
+						settingsList.updateValue(row.id, digitInput);
 						container.invalidate();
 						return;
 					}
 					if (data === "\x7f" || data === "\b") {
-						buffer = buffer.slice(0, -1);
-						settingsList.updateValue(row.id, buffer || rowValue(row.id));
+						digitInput = digitInput.slice(0, -1);
+						settingsList.updateValue(row.id, digitInput || rowValue(row.id));
 						container.invalidate();
 						return;
 					}
 					if (matchesKey(data, "enter")) {
-						if (buffer) commitNumber();
+						if (digitInput) commitNumber();
 						return;
 					}
 					if (matchesKey(data, "escape")) {
-						if (buffer) {
-							buffer = "";
+						if (digitInput) {
+							digitInput = "";
 							refreshRow(row.id);
 							container.invalidate();
 							return;
@@ -2216,7 +2119,7 @@ class SubagentModelPicker {
 		}
 		const ch = decodeKittyPrintable(data) ?? (data.length === 1 ? data : undefined);
 		if (ch && ch.length === 1 && ch >= " ") {
-			this.filterText = (this.filterText + ch).slice(0, 40);
+			this.filterText = (this.filterText + ch).slice(0, FILTER_MAX_CHARS);
 			this.selected = 0;
 			this.invalidate();
 		}

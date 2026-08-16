@@ -1,18 +1,5 @@
-/**
- * Async Bash Jobs — run commands in the background, get results pushed back.
- *
- * The agent can start a long command without blocking: bash_job_start returns
- * a job id immediately, the job runs in the background, and when it finishes a
- * message is pushed to the agent in realtime (followUp + triggerTurn, so an
- * idle agent wakes up). The agent can either do other things or block on it
- * with bash_job_wait.
- *
- * Tools: bash_job_start, bash_job_wait, bash_job_list, bash_job_result,
- * bash_job_cancel (+ /bash-jobs command).
- *
- * Records persist in ~/.pi/agent/bash-jobs/ so results survive restarts;
- * jobs orphaned by a restart (dead pid, status running) are marked lost.
- */
+
+
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -25,6 +12,9 @@ const JOBS_DIR = path.join(getAgentDir(), "bash-jobs");
 const POLL_INTERVAL_MS = 500;
 const MAX_OUTPUT_BYTES = 64_000;
 const CUSTOM_TYPE = "bash-job-notify";
+const PREVIEW_CHARS = 200;
+const LIST_LIMIT = 20;
+const COMMAND_PREVIEW_CHARS = 60;
 
 interface BashJobRecord {
 	id: string;
@@ -48,9 +38,7 @@ interface RunningJob {
 
 const running = new Map<string, RunningJob>();
 
-// Job records are scoped per session: ~/.pi/agent/bash-jobs/<session_id>/*.json.
-// The session id is resolved from ctx on every call (each tool has ctx; the
-// completion notify only uses the already-finalized record, no file I/O).
+
 const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "default";
 
 function sessionIdFor(ctx?: { sessionManager?: { getSessionId?: () => string } }): string {
@@ -58,7 +46,7 @@ function sessionIdFor(ctx?: { sessionManager?: { getSessionId?: () => string } }
 	try {
 		id = ctx?.sessionManager?.getSessionId?.() ?? "default";
 	} catch {
-		/* ignore */
+
 	}
 	return sanitizeId(id);
 }
@@ -94,7 +82,7 @@ function listRecords(ctx?: { sessionManager?: { getSessionId?: () => string } })
 			if (rec) records.push(rec);
 		}
 	} catch {
-		/* dir missing */
+
 	}
 	return records.sort((a, b) => b.startedAt - a.startedAt);
 }
@@ -105,14 +93,14 @@ const toolError = (error: unknown) => ({
 	isError: true,
 });
 
-/** Reconcile records from before a restart: dead "running" jobs are lost. */
+
 function reconcileOrphaned(): void {
-	// scan every session's record dir
+
 	let sessions: string[] = [];
 	try {
 		sessions = fs.readdirSync(JOBS_DIR);
 	} catch {
-		/* dir missing */
+
 	}
 	for (const session of sessions) {
 		const ctx = { sessionManager: { getSessionId: () => session } };
@@ -121,9 +109,9 @@ function reconcileOrphaned(): void {
 			if (rec.pid != null) {
 				try {
 					process.kill(rec.pid, 0);
-					continue; // still alive
+					continue;
 				} catch {
-					/* dead */
+
 				}
 			}
 			rec.status = "lost";
@@ -136,12 +124,12 @@ function reconcileOrphaned(): void {
 
 function notifyJobDone(pi: ExtensionAPI, rec: BashJobRecord): void {
 	const failed = rec.status !== "done";
-	const preview = rec.output.split("\n").find((l) => l.trim())?.slice(0, 200) ?? "(no output)";
+	const preview = rec.output.split("\n").find((l) => l.trim())?.slice(0, PREVIEW_CHARS) ?? "(no output)";
 	const label = rec.status === "done" ? "done" : rec.status;
 	const text =
 		`[bash job ${rec.id} ${label}] exit ${rec.exitCode ?? "?"} · ${preview}` +
 		(failed
-			? `\n\nGet the full output with bash_job_result { jobId: "${rec.id}" }${rec.status === "running" ? "" : ""}. You can rerun the command or adjust and retry.`
+			? `\n\nGet the full output with bash_job_result { jobId: "${rec.id}" }. You can rerun the command or adjust and retry.`
 			: "");
 	pi.sendMessage(
 		{
@@ -150,7 +138,7 @@ function notifyJobDone(pi: ExtensionAPI, rec: BashJobRecord): void {
 			display: true,
 			details: { jobId: rec.id, status: rec.status, exitCode: rec.exitCode, command: rec.command, output: rec.output },
 		},
-		// Realtime: idle -> immediate new turn; streaming -> queued into current turn.
+
 		{ deliverAs: "followUp", triggerTurn: true },
 	);
 }
@@ -220,13 +208,13 @@ export default function (pi: ExtensionAPI) {
 					try {
 						proc.kill("SIGTERM");
 					} catch {
-						/* ignore */
+
 					}
 					setTimeout(() => {
 						try {
 							proc.kill("SIGKILL");
 						} catch {
-							/* ignore */
+
 						}
 					}, 3000);
 				}, params.timeout * 1000);
@@ -298,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 			const deadline = params.timeoutMs ? Date.now() + params.timeoutMs : Infinity;
 
 			const entry = running.get(id);
-			if (entry) entry.notifyOnDone = false; // we're waiting; skip the push
+			if (entry) entry.notifyOnDone = false;
 
 			while (true) {
 				if (signal?.aborted) {
@@ -346,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "List bash jobs",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const records = listRecords(ctx).slice(0, 20);
+			const records = listRecords(ctx).slice(0, LIST_LIMIT);
 			if (records.length === 0) {
 				return {
 					content: [{ type: "text", text: "No bash jobs yet. Start one with bash_job_start." }],
@@ -357,7 +345,7 @@ export default function (pi: ExtensionAPI) {
 				`${records.length} bash job(s):`,
 				...records.map((r) => {
 					const dur = r.finishedAt ? `${((r.finishedAt - r.startedAt) / 1000).toFixed(1)}s` : "running";
-					return `- #${r.id} [${r.status}] ${dur} · ${r.command.slice(0, 60)}${r.note ? ` (${r.note})` : ""}`;
+					return `- #${r.id} [${r.status}] ${dur} · ${r.command.slice(0, COMMAND_PREVIEW_CHARS)}${r.note ? ` (${r.note})` : ""}`;
 				}),
 			].join("\n");
 			return { content: [{ type: "text", text }], details: { jobs: records.map((r) => ({ id: r.id, status: r.status, command: r.command })) } };
@@ -423,9 +411,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				entry.proc.kill("SIGTERM");
 			} catch {
-				/* ignore */
+
 			}
-			// mark cancelled — the done handler skips the notify
+
 			rec.status = "cancelled";
 			rec.note = "cancelled by the agent";
 			rec.finishedAt = Date.now();
@@ -435,14 +423,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- /bash-jobs command (for humans) ---------------- */
+
 	pi.registerCommand("bash-jobs", {
 		description: "List bash jobs: /bash-jobs",
 		handler: async (_args, ctx) => {
-			const records = listRecords(ctx).slice(0, 20);
+			const records = listRecords(ctx).slice(0, LIST_LIMIT);
 			ctx.ui.notify(
 				records.length
-					? records.map((r) => `#${r.id} [${r.status}] ${r.command.slice(0, 60)}`).join("\n")
+					? records.map((r) => `#${r.id} [${r.status}] ${r.command.slice(0, COMMAND_PREVIEW_CHARS)}`).join("\n")
 					: "No bash jobs yet.",
 				"info",
 			);

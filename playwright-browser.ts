@@ -1,20 +1,5 @@
-/**
- * Playwright Browser — lets the agent (and spawned subagents) drive a real
- * browser: navigate, click, type, extract text, evaluate JS, and screenshot.
- *
- * The browser lives in a detached daemon process (browser-server.mjs) so its
- * state survives pi restarts and one-shot subagent turns — a subagent can
- * navigate on turn 1, then continue clicking/extracting on turn 2 via
- * subagent_send, with the same page. Each client (main agent or subagent)
- * gets its own session/page, so parallel subagents don't collide.
- *
- * Setup (once):
- *   bun add -g playwright && playwright install chromium
- *
- * Overrides:
- *   PI_PLAYWRIGHT_IMPORT   – absolute path to a playwright entry file
- *   PI_BROWSER_DAEMON_FILE – absolute path to browser-server.mjs
- */
+
+
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -26,6 +11,11 @@ import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+const DAEMON_SPAWN_TIMEOUT_MS = 1500;
+const MAX_PAGE_TEXT_CHARS = 30_000;
+const SETUP_STATUS_LINE_CHARS = 90;
+const SETUP_NOTIFY_LINES = 12;
+const LAUNCH_PROBE_TIMEOUT_MS = 45_000;
 const BROWSER_DIR = path.join(homedir(), ".pi", "agent", "browser");
 const STATE_FILE = path.join(BROWSER_DIR, "daemon.json");
 const DAEMON_FILE =
@@ -34,15 +24,12 @@ const DAEMON_FILE =
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Stable session id: the subagent id inside a subagent process, else "main". */
+
 const SESSION = process.env.PI_SUBAGENT_ID ?? "main";
 
-/* ------------------------------------------------------------------ */
-/* Playwright resolution                                               */
-/* ------------------------------------------------------------------ */
 
 function resolvePlaywrightImport(): string | undefined {
-	// An explicit, existing path wins; a stale/nonexistent override is ignored.
+
 	const override = process.env.PI_PLAYWRIGHT_IMPORT;
 	if (override && fs.existsSync(override)) return override;
 	const tryResolve = (spec: string) => {
@@ -56,7 +43,7 @@ function resolvePlaywrightImport(): string | undefined {
 		const entry = tryResolve(spec);
 		if (entry) return entry;
 	}
-	// Scan known global node_modules dirs (bun + npm installs).
+
 	for (const nm of globalNodeModulesDirs()) {
 		for (const name of ["playwright", "playwright-core"]) {
 			const pkgDir = path.join(nm, name);
@@ -74,10 +61,10 @@ function resolvePlaywrightImport(): string | undefined {
 	return undefined;
 }
 
-/** Candidate global node_modules directories (bun and npm layouts). */
+
 function globalNodeModulesDirs(): string[] {
 	const dirs = new Set<string>();
-	// bun global: sibling of the pi package, or the well-known bun global dir.
+
 	try {
 		const req = createRequire(import.meta.url);
 		let piPkg: string;
@@ -92,20 +79,20 @@ function globalNodeModulesDirs(): string[] {
 				: path.dirname(path.dirname(path.dirname(path.dirname(piPkg)))),
 		);
 	} catch {
-		/* no pi package resolution */
+
 	}
 	dirs.add(path.join(homedir(), ".bun", "install", "global", "node_modules"));
-	// npm global layouts.
+
 	dirs.add(path.join(homedir(), "node_modules"));
 	dirs.add(path.join(homedir(), ".npm-global", "lib", "node_modules"));
 	dirs.add("/usr/local/lib/node_modules");
 	dirs.add("/usr/lib/node_modules");
-	// Custom extra dir (also handy for tests).
+
 	if (process.env.PI_PLAYWRIGHT_GLOBAL_DIR) dirs.add(process.env.PI_PLAYWRIGHT_GLOBAL_DIR);
 	return [...dirs];
 }
 
-/** Find an executable on PATH. */
+
 function findOnPath(name: string): string | undefined {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (!dir) continue;
@@ -114,13 +101,13 @@ function findOnPath(name: string): string | undefined {
 			fs.accessSync(candidate, fs.constants.X_OK);
 			return candidate;
 		} catch {
-			/* not here */
+
 		}
 	}
 	return undefined;
 }
 
-/** Package manager for global installs: bun preferred, npm fallback. */
+
 function resolvePackageInstaller(): { cmd: string; args: string[] } | undefined {
 	const bun = findOnPath("bun");
 	if (bun) return { cmd: bun, args: ["add", "-g", "playwright"] };
@@ -129,9 +116,6 @@ function resolvePackageInstaller(): { cmd: string; args: string[] } | undefined 
 	return undefined;
 }
 
-/* ------------------------------------------------------------------ */
-/* Daemon lifecycle                                                    */
-/* ------------------------------------------------------------------ */
 
 interface DaemonInfo {
 	port: number;
@@ -144,7 +128,7 @@ function readDaemon(): DaemonInfo | undefined {
 		const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
 		if (typeof data?.port === "number" && typeof data?.token === "string") return data;
 	} catch {
-		/* no state yet */
+
 	}
 	return undefined;
 }
@@ -152,7 +136,7 @@ function readDaemon(): DaemonInfo | undefined {
 async function ping(info: DaemonInfo): Promise<boolean> {
 	try {
 		const ctrl = new AbortController();
-		const timer = setTimeout(() => ctrl.abort(), 1500);
+		const timer = setTimeout(() => ctrl.abort(), DAEMON_SPAWN_TIMEOUT_MS);
 		const res = await fetch(`http://127.0.0.1:${info.port}/status`, {
 			headers: { "x-browser-token": info.token },
 			signal: ctrl.signal,
@@ -165,7 +149,7 @@ async function ping(info: DaemonInfo): Promise<boolean> {
 }
 
 async function ensureDaemon(): Promise<{ base: string; token: string }> {
-	// Reuse a live daemon (ours or someone else's).
+
 	const existing = readDaemon();
 	if (existing && (await ping(existing))) {
 		return { base: `http://127.0.0.1:${existing.port}`, token: existing.token };
@@ -174,7 +158,7 @@ async function ensureDaemon(): Promise<{ base: string; token: string }> {
 		try {
 			process.kill(existing.pid, "SIGTERM");
 		} catch {
-			/* already dead */
+
 		}
 	}
 	fs.rmSync(STATE_FILE, { force: true });
@@ -187,7 +171,7 @@ async function ensureDaemon(): Promise<{ base: string; token: string }> {
 	});
 	child.unref();
 
-	// Poll for the daemon's state file; adopt a foreign daemon if one raced us.
+
 	const deadline = Date.now() + 12000;
 	while (Date.now() < deadline) {
 		const info = readDaemon();
@@ -195,12 +179,12 @@ async function ensureDaemon(): Promise<{ base: string; token: string }> {
 			if (info.token === token && (await ping(info))) {
 				return { base: `http://127.0.0.1:${info.port}`, token };
 			}
-			// Another process won the race — use theirs and drop ours.
+
 			if (info.token !== token && (await ping(info))) {
 				try {
 					child.kill("SIGTERM");
 				} catch {
-					/* ignore */
+
 				}
 				return { base: `http://127.0.0.1:${info.port}`, token: info.token };
 			}
@@ -237,9 +221,6 @@ const toolError = (error: unknown) => ({
 	isError: true,
 });
 
-/* ------------------------------------------------------------------ */
-/* /playwright-setup — install playwright + chromium for the user      */
-/* ------------------------------------------------------------------ */
 
 const chromiumCacheDir = () => path.join(homedir(), ".cache", "ms-playwright");
 
@@ -252,13 +233,13 @@ function hasChromium(): boolean {
 	}
 }
 
-/** The playwright CLI script next to the resolved entry, if present. */
+
 function playwrightCliPath(entry: string): string | undefined {
 	const cli = path.join(path.dirname(entry), "cli.js");
 	return fs.existsSync(cli) ? cli : undefined;
 }
 
-/** Run a child process, streaming each output line to onLine. */
+
 function runStreamed(
 	command: string,
 	args: string[],
@@ -292,7 +273,7 @@ const tailOutput = (text: string, max = 1500) => {
 
 async function showSetupPanel(ctx: ExtensionCommandContext, text: string, ok: boolean) {
 	if (ctx.mode !== "tui") {
-		ctx.ui.notify(text.split("\n").slice(0, 12).join("\n"), ok ? "info" : "error");
+		ctx.ui.notify(text.split("\n").slice(0, SETUP_NOTIFY_LINES).join("\n"), ok ? "info" : "error");
 		return;
 	}
 	await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
@@ -343,7 +324,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		return;
 	}
 
-	// 1. install the playwright package
+
 	let entry = resolvePlaywrightImport();
 	if (!entry) {
 		const installer = resolvePackageInstaller();
@@ -358,7 +339,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		status(`Installing playwright package (${manager} add -g playwright)...`);
 		const r = await runStreamed(installer.cmd, installer.args, (line) => {
 			push(line);
-			status(line.slice(0, 90));
+			status(line.slice(0, SETUP_STATUS_LINE_CHARS));
 		});
 		if (r.code !== 0) {
 			await finish(
@@ -376,7 +357,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		return;
 	}
 
-	// 2. install the chromium browser
+
 	if (force || !hasChromium()) {
 		const cli = playwrightCliPath(entry);
 		if (!cli) {
@@ -386,7 +367,7 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		status("Installing chromium browser (playwright install chromium)...");
 		const r = await runStreamed(process.execPath, [cli, "install", "chromium"], (line) => {
 			push(line);
-			status(line.slice(0, 90));
+			status(line.slice(0, SETUP_STATUS_LINE_CHARS));
 		});
 		if (r.code !== 0) {
 			const hints =
@@ -400,10 +381,10 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 		push("chromium installed.");
 	}
 
-	// 3. verify with a real launch
+
 	status("Verifying browser launch...");
 	try {
-		const probe = await daemonRequest("/open", { url: "about:blank" }, 45000);
+		const probe = await daemonRequest("/open", { url: "about:blank" }, LAUNCH_PROBE_TIMEOUT_MS);
 		await daemonRequest("/close", {}, 5000).catch(() => {});
 		await finish(
 			true,
@@ -426,12 +407,9 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* Extension                                                           */
-/* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
-	/* ---------------- /playwright-setup ---------------- */
+
 	pi.registerCommand("playwright-setup", {
 		description:
 			"Install playwright + chromium for the browser tools. Usage: /playwright-setup [force] — force reinstalls even if already present.",
@@ -532,7 +510,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: data.text ? data.text.slice(0, 30000) : "(no text content)",
+							text: data.text ? data.text.slice(0, MAX_PAGE_TEXT_CHARS) : "(no text content)",
 						},
 					],
 					details: { length: String(data.text ?? "").length },
@@ -627,13 +605,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// Best-effort cleanup of this session's page when pi shuts down.
+
 	pi.on("session_shutdown", () => {
 		daemonRequest("/close", {}, 3000).catch(() => {});
 	});
 }
 
-/** Exposed for tests. */
+
 export const _browserSetupInternals = {
 	findOnPath,
 	resolvePackageInstaller,

@@ -1,30 +1,4 @@
-/**
- * Agent Memory Manager
- *
- * Lets the agent manage its own conversation memory — an alternative to
- * (and complement of) compaction.
- *
- *  - memory_index   – survey the whole conversation: for every turn, the first
- *                     few lines of the turn start (user message) and turn end
- *                     (last assistant message), plus size estimates.
- *  - memory_drop    – drop whole turns. Nothing is deleted from the session
- *                     file: on every subsequent LLM context build, the dropped
- *                     turn's messages are replaced by compact stubs holding the
- *                     first few lines of each message (roles and tool-call /
- *                     tool-result pairing are preserved), so the agent still
- *                     knows *something* about what happened there.
- *  - memory_restore – undo a drop and get the full detail back.
- *  - memory_status  – what is currently dropped + context usage.
- *
- * It also nudges the agent proactively: once context usage crosses 30% of the
- * model's context window (before a prompt is processed), it injects a message
- * the agent can see, telling it to drop memories it no longer needs. Re-nudges
- * at each escalation band: 30% → 50% → 70% (once per band).
- *
- * Drop state is persisted in the session as custom entries
- * (customType "agent-memory"), so it survives restarts, reloads, and
- * branching.
- */
+
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -34,40 +8,38 @@ import { Type } from "typebox";
 
 const MEMORY_CUSTOM_TYPE = "agent-memory";
 const DEFAULT_LINES = 4;
-const MAX_PREVIEW_LINES = 20; // upper bound for stored previews (index can slice further)
-const MAX_STUB_CHARS = 160; // max chars kept for tool-call arguments in stubs
+const MAX_PREVIEW_LINES = 20;
+const MAX_STUB_CHARS = 160;
 
-// Context-usage nudge: the agent is told (via a custom message it can see) to
-// drop memories it no longer needs, once per usage band. Bands are crossed at
-// these percentages of the model's context window, so it nudges at 30% → 50%
-// → 70% and never nags between bands.
+
 const NUDGE_THRESHOLDS_PERCENT = [30, 50, 70];
+const PUSH_COOLDOWN_MS = 5000;
+const NUDGE_INTERVAL_MS = 30_000;
+const TURN_END_NUDGE_DELAY_MS = 100;
+const SESSION_START_NUDGE_DELAY_MS = 200;
 
-/** Guards against racing nudge triggers (agent_end + idle timer) double-pushing. */
+
 let nudgeInFlight = false;
 
-/* ------------------------------------------------------------------ */
-/* Types                                                               */
-/* ------------------------------------------------------------------ */
 
 interface TurnInfo {
-	turnId: string; // entry id of the turn's first user message — stable
-	index: number; // 1-based, informational
+	turnId: string;
+	index: number;
 	startEntryId: string;
 	endEntryId: string;
-	entryIds: string[]; // ids of all message entries in the turn
-	startPreview: string; // first few lines of the user message
-	endPreview: string; // first few lines of the last assistant message
+	entryIds: string[];
+	startPreview: string;
+	endPreview: string;
 	messageCount: number;
 	approxTokens: number;
-	timestamp: string; // ISO of the turn start entry
+	timestamp: string;
 }
 
 interface DroppedTurn {
 	turnId: string;
 	index: number;
 	entryIds: string[];
-	hashes: string[]; // content hashes of each message in the turn (order matters)
+	hashes: string[];
 	startPreview: string;
 	endPreview: string;
 	lines: number;
@@ -81,14 +53,11 @@ interface MemoryState {
 	drops: DroppedTurn[];
 }
 
-/* ------------------------------------------------------------------ */
-/* Small helpers                                                       */
-/* ------------------------------------------------------------------ */
 
 function extractText(content: unknown): string {
 	if (typeof content === "string") return content;
-	// Defensive: a single content block object instead of an array
-	// (old or hand-edited sessions can contain these).
+
+
 	if (content && typeof content === "object" && !Array.isArray(content)) {
 		const block = content as { type?: string; text?: unknown };
 		if (block.type === "text" && typeof block.text === "string") return block.text;
@@ -151,11 +120,7 @@ function hashString(s: string): string {
 	return (h >>> 0).toString(36);
 }
 
-/**
- * Stable fingerprint of a message. The same message object is what gets sent
- * in the context event (session entries -> buildSessionContext -> context),
- * so hashes computed here match hashes computed in the context handler.
- */
+
 function hashMessage(msg: AgentMessage): string {
 	const m = msg as { content?: unknown; toolCallId?: unknown; toolName?: unknown; command?: unknown; output?: unknown };
 	const fields: unknown[] = [msg.role];
@@ -201,9 +166,6 @@ function indentPreview(text: string): string {
 		.join("\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Turn grouping & index                                               */
-/* ------------------------------------------------------------------ */
 
 function buildTurns(entries: SessionEntry[]): TurnInfo[] {
 	const turns: TurnInfo[] = [];
@@ -286,9 +248,6 @@ function resolveTurnIds(turns: TurnInfo[], ids: string[]): TurnInfo[] {
 	return resolved;
 }
 
-/* ------------------------------------------------------------------ */
-/* State (persisted as custom entries in the session)                  */
-/* ------------------------------------------------------------------ */
 
 function loadState(ctx: ExtensionContext): MemoryState {
 	let state: MemoryState | undefined;
@@ -323,11 +282,7 @@ function updateStatusWidget(ctx: ExtensionContext) {
 	ctx.ui.setStatus("agent-memory", `memory: ${state.drops.length} dropped (~${fmtTokens(saved)} saved)${pct}`);
 }
 
-/* ------------------------------------------------------------------ */
-/* Context-usage nudge (tells the agent to drop unneeded memory)       */
-/* ------------------------------------------------------------------ */
 
-/** Most recent nudge percent on the branch, parsed from pushed user messages. */
 function getLastNudge(ctx: ExtensionContext): { percentAtNudge: number } | undefined {
 	let last: { percentAtNudge: number } | undefined;
 	try {
@@ -342,7 +297,7 @@ function getLastNudge(ctx: ExtensionContext): { percentAtNudge: number } | undef
 			}
 		}
 	} catch {
-		/* ignore */
+
 	}
 	return last;
 }
@@ -366,12 +321,7 @@ function buildNudgeText(percent: number, tokens: number | null, contextWindow: n
 	return out.join("\n");
 }
 
-/**
- * Nudge the agent by pushing a REAL user steering message (sendUserMessage),
- * which always triggers a turn and is visible in the chat — unlike a hidden
- * custom message injected into the context. Fires at most once per usage band
- * (30%, 50%, 70%) and only when there are turns worth dropping.
- */
+
 function maybePushNudge(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
 	let usage;
 	try {
@@ -382,11 +332,11 @@ function maybePushNudge(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
 	if (!usage || usage.percent == null) return false;
 	const percent = usage.percent;
 
-	// Current band = highest threshold at or below the current usage.
+
 	const band = NUDGE_THRESHOLDS_PERCENT.filter((t) => percent >= t).pop();
 	if (!band) return false;
 
-	// Only nudge when there is something worth dropping (exclude the current turn).
+
 	const state = loadState(ctx);
 	const turns = buildTurns(ctx.sessionManager.getBranch());
 	const lastTurn = turns[turns.length - 1];
@@ -394,31 +344,28 @@ function maybePushNudge(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
 	const droppable = turns.filter((t) => !dropped.has(t.turnId) && (!lastTurn || t.turnId !== lastTurn.turnId));
 	if (droppable.length === 0) return false;
 
-	// Once per band: skip if the last nudge already happened at or above this band.
+
 	const lastNudge = getLastNudge(ctx);
 	if (lastNudge && lastNudge.percentAtNudge >= band) return false;
 
-	// Guard against racing triggers (agent_end + idle timer) pushing twice.
+
 	if (nudgeInFlight) return false;
 	nudgeInFlight = true;
 	try {
 		pi.sendUserMessage(buildNudgeText(usage.percent, usage.tokens, usage.contextWindow, dropped.size, droppable.length), {
-			// Queue into the current turn if the agent is mid-processing; starts a
-			// turn when idle. Without deliverAs, pi throws "Agent is already processing".
+
+
 			deliverAs: "followUp",
 		});
 	} catch {
-		/* delivery failed — try again later */
+
 	}
 	setTimeout(() => {
 		nudgeInFlight = false;
-	}, 5000);
+	}, PUSH_COOLDOWN_MS);
 	return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Stubbing (context rewriting)                                        */
-/* ------------------------------------------------------------------ */
 
 function stubMessage(msg: AgentMessage, turn: DroppedTurn, firstInTurn: boolean): AgentMessage {
 	const m = msg as unknown as Record<string, unknown>;
@@ -461,7 +408,7 @@ function stubMessage(msg: AgentMessage, turn: DroppedTurn, firstInTurn: boolean)
 			const preview = firstLines(extractText(m.content), Math.max(1, Math.min(lines, 2)));
 			const name = typeof m.toolName === "string" ? m.toolName : "tool";
 			clone.content = [{ type: "text", text: preview || `[${name}: no text output]` }];
-			delete clone.details; // tool details are usually the bulk — drop them too
+			delete clone.details;
 			break;
 		}
 		case "bashExecution": {
@@ -470,7 +417,7 @@ function stubMessage(msg: AgentMessage, turn: DroppedTurn, firstInTurn: boolean)
 			break;
 		}
 		default: {
-			// custom / other roles: keep role, keep only the first lines of text
+
 			const text = extractText(m.content);
 			if (text) clone.content = [{ type: "text", text: firstLines(text, lines) }];
 		}
@@ -482,10 +429,7 @@ function stubMessage(msg: AgentMessage, turn: DroppedTurn, firstInTurn: boolean)
 function applyDrops(messages: AgentMessage[], state: MemoryState): AgentMessage[] | undefined {
 	if (state.drops.length === 0) return undefined;
 
-	// Order drops by where their first message appears in the context so the
-	// greedy subsequence matching below walks turns in conversation order,
-	// even when they were dropped out of order. Drops whose messages are no
-	// longer present (e.g. already compacted away) sort last and never match.
+
 	const messageHashes = messages.map((m) => hashMessage(m));
 	const positioned = state.drops
 		.map((drop) => {
@@ -503,7 +447,7 @@ function applyDrops(messages: AgentMessage[], state: MemoryState): AgentMessage[
 		})
 		.sort((a, b) => (a.pos === -1 ? 1 : 0) - (b.pos === -1 ? 1 : 0) || a.pos - b.pos);
 
-	// Flatten all dropped turns into one ordered (turn, hash) sequence.
+
 	const sequence: Array<{ turn: DroppedTurn; hash: string; firstInTurn: boolean }> = [];
 	for (const { drop } of positioned) {
 		drop.hashes.forEach((hash, i) => {
@@ -526,9 +470,6 @@ function applyDrops(messages: AgentMessage[], state: MemoryState): AgentMessage[
 	return changed ? newMessages : undefined;
 }
 
-/* ------------------------------------------------------------------ */
-/* Tool param schemas                                                  */
-/* ------------------------------------------------------------------ */
 
 const IndexParams = Type.Object({
 	lines: Type.Optional(
@@ -563,50 +504,44 @@ const RestoreParams = Type.Object({
 
 const StatusParams = Type.Object({});
 
-/* ------------------------------------------------------------------ */
-/* Extension factory                                                   */
-/* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
-	/* ---------------- context rewriting ---------------- */
+
 	pi.on("context", (event, ctx) => {
 		const state = loadState(ctx);
 		const result = applyDrops(event.messages, state);
 		return result ? { messages: result } : undefined;
 	});
 
-	/* ---------------- lifecycle ---------------- */
+
 	let lastEventCtx: ExtensionContext | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastEventCtx = ctx;
 		updateStatusWidget(ctx);
-		// Check shortly after start (context may already be high from prior work).
-		setTimeout(() => maybePushNudge(pi, ctx), 200);
+
+		setTimeout(() => maybePushNudge(pi, ctx), SESSION_START_NUDGE_DELAY_MS);
 	});
 	pi.on("session_tree", async (_event, ctx) => updateStatusWidget(ctx));
 	pi.on("turn_end", async (_event, ctx) => updateStatusWidget(ctx));
 
-	/* ---------------- context-usage nudge ---------------- */
-	// Push a REAL user steering message (sendUserMessage) when context usage
-	// crosses 30/50/70% — after each turn settles, and from an idle timer so a
-	// long-running idle session still gets nudged.
+
 	pi.on("agent_end", async (_event, ctx) => {
 		lastEventCtx = ctx;
-		// Defer until the turn fully settles so the push triggers a fresh turn.
-		setTimeout(() => maybePushNudge(pi, ctx), 100);
+
+		setTimeout(() => maybePushNudge(pi, ctx), TURN_END_NUDGE_DELAY_MS);
 	});
 	const nudgeTimer = setInterval(() => {
 		if (!lastEventCtx) return;
 		try {
 			maybePushNudge(pi, lastEventCtx);
 		} catch {
-			/* ignore */
+
 		}
-	}, 30_000);
+	}, NUDGE_INTERVAL_MS);
 	pi.on("session_shutdown", () => clearInterval(nudgeTimer));
 
-	/* ---------------- memory_index ---------------- */
+
 	pi.registerTool({
 		name: "memory_index",
 		label: "Memory Index",
@@ -646,7 +581,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- memory_drop ---------------- */
+
 	pi.registerTool({
 		name: "memory_drop",
 		label: "Memory Drop",
@@ -690,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 						tokensBefore += estimateTokens(entry.message);
 					}
 				}
-				// rough stub size: each message keeps ~lines lines of text
+
 				const stubChars = turn.messageCount * lines * 40;
 				const saved = Math.max(0, tokensBefore - Math.ceil(stubChars / 4));
 
@@ -750,7 +685,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- memory_restore ---------------- */
+
 	pi.registerTool({
 		name: "memory_restore",
 		label: "Memory Restore",
@@ -795,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- memory_status ---------------- */
+
 	pi.registerTool({
 		name: "memory_status",
 		label: "Memory Status",
@@ -848,7 +783,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/* ---------------- /memory command (for humans) ---------------- */
+
 	pi.registerCommand("memory", {
 		description: "Inspect conversation memory: index | drop <ids> | restore [ids] | status",
 		handler: async (args, ctx) => {
@@ -927,9 +862,6 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-/* ------------------------------------------------------------------ */
-/* Index UI (interactive)                                              */
-/* ------------------------------------------------------------------ */
 
 async function showIndexUi(ctx: ExtensionCommandContext) {
 	const state = loadState(ctx);

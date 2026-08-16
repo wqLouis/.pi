@@ -1,20 +1,5 @@
-/**
- * Browser daemon for the pi browser extension.
- *
- * Owns a Playwright Chromium instance and exposes a tiny JSON HTTP API on
- * 127.0.0.1. It runs as a detached subprocess so it survives pi process
- * restarts and one-shot subagent turns — the extension proxies tool calls to
- * it, and browser state (URL, page) persists across turns.
- *
- * Sessions: each client (main agent, or each subagent) uses a stable session
- * id, so parallel clients get independent pages and don't collide.
- *
- * Usage:
- *   node browser-server.mjs --port 0 --token <token> --state <daemon.json>
- *
- * Playwright is imported via the PI_PLAYWRIGHT_IMPORT env var (absolute path
- * to the playwright entry file), falling back to bare specifiers.
- */
+
+
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -31,14 +16,14 @@ const statePath = getArg("--state") ?? path.join(process.env.HOME ?? ".", ".pi",
 const shotsDir = path.join(path.dirname(statePath), "shots");
 fs.mkdirSync(shotsDir, { recursive: true });
 
-/** sessions: sessionId -> { browser, context, page } */
+
 const sessions = new Map();
 let pw = null;
 
 async function getPlaywright() {
 	if (pw) return pw;
-	// An explicit import path is authoritative (the extension resolves it).
-	// Without one, fall back to bare specifiers (may resolve via global installs).
+
+
 	const explicitImport = process.env.PI_PLAYWRIGHT_IMPORT;
 	const specs = explicitImport ? [explicitImport] : ["playwright", "playwright-core"];
 	let lastErr;
@@ -79,7 +64,7 @@ async function closeSession(session) {
 		try {
 			await s.browser.close();
 		} catch {
-			/* ignore */
+
 		}
 		sessions.delete(session);
 	}
@@ -98,6 +83,8 @@ const readBody = (req) =>
 		req.on("end", () => resolve(data));
 		req.on("error", reject);
 	});
+
+const MAX_EVAL_RESULT_CHARS = 20_000;
 
 const send = (res, code, obj) => {
 	res.writeHead(code, { "content-type": "application/json" });
@@ -127,7 +114,7 @@ const server = http.createServer(async (req, res) => {
 						info.url = s.page.url();
 						info.title = await s.page.title();
 					} catch {
-						/* ignore */
+
 					}
 				}
 				return send(res, 200, info);
@@ -172,7 +159,7 @@ const server = http.createServer(async (req, res) => {
 				const page = await getPage(session);
 				const result = await page.evaluate(body.script);
 				const text = typeof result === "string" ? result : JSON.stringify(result ?? null);
-				return send(res, 200, { ok: true, result: text.slice(0, 20000) });
+				return send(res, 200, { ok: true, result: text.slice(0, MAX_EVAL_RESULT_CHARS) });
 			}
 			case "/close":
 				await closeSession(session);
@@ -200,7 +187,7 @@ process.on("SIGTERM", async () => {
 		try {
 			await s.browser.close();
 		} catch {
-			/* ignore */
+
 		}
 	}
 	process.exit(0);
