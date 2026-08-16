@@ -10,6 +10,7 @@ self-managing, multi-agent system. Four extensions, loaded from
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
 5. **agent-tasks** — a plain-markdown task board per session.
 6. **agent-schedule** — deferred reminders that fire in realtime.
+7. **agent-bash-jobs** — background bash commands with realtime completion.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -144,6 +145,26 @@ that came due while pi was closed are fired on the next startup.
 | `schedule_cancel { id }` | Cancel by id |
 
 Plus `/schedule list | cancel <id>`.
+
+## 7. agent-bash-jobs — run commands in the background
+
+Long commands no longer block the agent: `bash_job_start { command }` returns a
+job id immediately, the job runs in the background, and when it finishes a
+message is pushed to the agent in realtime (`followUp` + `triggerTurn`). The
+agent can do other work, or block with `bash_job_wait` (which streams progress
+and suppresses the duplicate push).
+
+| Tool | Purpose |
+|------|---------|
+| `bash_job_start { command, timeout?, cwd? }` | Start a background job, returns `jobId` immediately |
+| `bash_job_wait { jobId, timeoutMs? }` | Block until done, streaming output; suppresses the completion push |
+| `bash_job_list` | Running/finished jobs: status, duration, command |
+| `bash_job_result { jobId }` | Full output + exit code of a finished job |
+| `bash_job_cancel { jobId }` | Kill a running job (no completion push) |
+
+Job records persist in `~/.pi/agent/bash-jobs/` (survive restarts; jobs
+orphaned by a restart are marked `lost`). Optional `timeout` kills runaway
+commands. `/bash-jobs` lists them for humans.
 
 ## Setup
 
