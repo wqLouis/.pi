@@ -932,6 +932,8 @@ export default function (pi: ExtensionAPI) {
 	/* ---------------- edit-scope enforcement (subagent processes) ---------------- */
 	// The parent passes the scope via PI_SUBAGENT_SCOPE (JSON array of absolute
 	// paths). Writes outside it are blocked; reads are unrestricted.
+	// The subagent's own task board (PI_TASK_BASE/TASK.md) is always exempt so a
+	// scoped subagent can still maintain its task board.
 	const scopeEnv = process.env.PI_SUBAGENT_SCOPE;
 	if (scopeEnv) {
 		let scope: string[] = [];
@@ -941,12 +943,14 @@ export default function (pi: ExtensionAPI) {
 			/* ignore malformed */
 		}
 		if (Array.isArray(scope) && scope.length > 0) {
+			const taskBoardDir = process.env.PI_TASK_BASE ? path.dirname(path.join(process.env.PI_TASK_BASE, "TASK.md")) : undefined;
 			pi.on("tool_call", (event, _ctx) => {
 				if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
 				const target = (event.input as { path?: string }).path;
 				if (!target) return undefined;
 				const targetAbs = path.resolve(target);
 				if (isWithinScope(targetAbs, scope)) return undefined;
+				if (taskBoardDir && isWithinScope(targetAbs, [taskBoardDir])) return undefined;
 				return {
 					block: true,
 					reason:
