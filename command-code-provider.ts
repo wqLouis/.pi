@@ -1,14 +1,17 @@
 import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const PROVIDER_ID = "command-code";
 const PROVIDER_NAME = "Command Code";
 const BASE_URL = "https://api.commandcode.ai/provider/v1";
 const MODELS_URL = `${BASE_URL}/models`;
-const API_KEY = "$CMD_API_KEY";
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 const DEFAULT_MAX_TOKENS = 32_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const FETCH_TIMEOUT_MS = 15_000;
 
 const environment = (globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
 
@@ -49,6 +52,22 @@ function fromCatalog(entry: CommandCodeModel): ProviderModelConfig {
 	};
 }
 
+// The credential lives in ~/.pi/agent/auth.json (written by /login or the
+// command-code key setup), falling back to the CMD_API_KEY env var.
+function resolveApiKey(): string | undefined {
+	if (environment.CMD_API_KEY) return environment.CMD_API_KEY;
+	try {
+		const home = environment.HOME ?? os.homedir();
+		const authPath = path.join(home, ".pi", "agent", "auth.json");
+		const auth = JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<string, { type?: string; key?: string }>;
+		const entry = auth[PROVIDER_ID];
+		if (entry?.type === "api_key" && entry.key) return entry.key;
+	} catch {
+		// no auth file yet — provider will be unconfigured until /login
+	}
+	return undefined;
+}
+
 async function fetchCatalog(signal: AbortSignal, apiKey: string): Promise<ProviderModelConfig[]> {
 	const response = await fetch(MODELS_URL, {
 		headers: { Authorization: `Bearer ${apiKey}` },
@@ -63,27 +82,40 @@ async function fetchCatalog(signal: AbortSignal, apiKey: string): Promise<Provid
 	return payload.data.filter((entry) => typeof entry?.id === "string").map(fromCatalog);
 }
 
-async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[]> {
-	// pi already restores the persisted catalog (if any) into the synchronous model
-	// list before invoking this; we only need the live list when network is allowed.
-	if (!context.allowNetwork) return [];
+export default async function (pi: ExtensionAPI): Promise<void> {
+	// Fetch the live catalog during load so models are available synchronously
+	// (subagent CLI runs resolve models before any async catalog refresh).
+	let models: ProviderModelConfig[] = [];
+	const apiKey = resolveApiKey();
+	if (apiKey) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+		try {
+			models = await fetchCatalog(controller.signal, apiKey);
+		} catch {
+			// offline / no key — register empty; refreshModels will retry later
+		} finally {
+			clearTimeout(timer);
+		}
+	}
 
-	// Stored credential (from /login or auth.json) wins; CMD_API_KEY is the fallback.
-	const apiKey = context.credential?.type === "api_key" ? context.credential.key : environment.CMD_API_KEY;
-	if (!apiKey) return [];
-
-	return fetchCatalog(context.signal, apiKey);
-}
-
-export default function (pi: ExtensionAPI): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
 		baseUrl: BASE_URL,
-		apiKey: API_KEY,
+		apiKey: "placeholder",
 		authHeader: true,
 		api: "openai-completions",
-		models: [],
-		refreshModels,
+		models,
+		async refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
+			// IMPORTANT: return undefined (not []) when there is nothing new — the
+			// composer only replaces the synchronous model list when this returns a
+			// truthy array; returning [] would wipe the models registered at load.
+			if (!context.allowNetwork) return undefined;
+			// Stored credential (from /login or auth.json) wins; CMD_API_KEY is the fallback.
+			const key = context.credential?.type === "api_key" ? context.credential.key : environment.CMD_API_KEY;
+			if (!key) return undefined;
+			return fetchCatalog(context.signal, key);
+		},
 		headers: environment.CMD_ZDR === "1" ? { "x-cmd-zdr": "1" } : undefined,
 	});
 }
