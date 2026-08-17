@@ -187,8 +187,12 @@ and suppresses the duplicate push).
 | `bash_job_cancel { jobId }` | Kill a running job (no completion push) |
 
 Job records persist in `~/.pi/agent/bash-jobs/` (survive restarts; jobs
-orphaned by a restart are marked `lost`). Optional `timeout` kills runaway
-commands. `/bash-jobs` lists them for humans.
+orphaned by a restart are marked `lost`). Records are **auto-cleaned**: a job's
+record is deleted as soon as you read its result with `bash_job_result` or
+`bash_job_wait` (results are single-use); the completion push is only a preview
+notice. Cancelled jobs are deleted immediately, and stale finished records are
+swept after 24h. Optional `timeout` kills runaway commands. `/bash-jobs` lists
+them for humans.
 
 ## Command Code provider
 
