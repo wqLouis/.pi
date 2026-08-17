@@ -1,7 +1,7 @@
 # pi agent harness
 
 A set of extensions that turn the [pi coding agent](https://github.com/earendil-works/pi) into a
-self-managing, multi-agent system. Six extensions, loaded from
+self-managing, multi-agent system. Seven extensions, loaded from
 `~/.pi/agent/extensions/`:
 
 1. **agent-memory** — the agent manages its own conversation memory (not just compaction).
@@ -10,6 +10,7 @@ self-managing, multi-agent system. Six extensions, loaded from
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
 5. **agent-tasks** — a plain-markdown task board per session.
 6. **agent-bash-jobs** — background bash commands with realtime completion.
+7. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -179,15 +180,8 @@ commands. `/bash-jobs` lists them for humans.
 ## Setup
 
 ```bash
-# extensions auto-load from ~/.pi/agent/extensions/ — symlink or copy them there
-mkdir -p ~/.pi/agent/extensions
-ln -s "$(pwd)"/agent-memory.ts ~/.pi/agent/extensions/
-ln -s "$(pwd)"/subagent.ts ~/.pi/agent/extensions/
-ln -s "$(pwd)"/bash-timeout.ts ~/.pi/agent/extensions/
-ln -s "$(pwd)"/playwright-browser.ts ~/.pi/agent/extensions/
-ln -s "$(pwd)"/browser-server.mjs ~/.pi/agent/extensions/
-ln -s "$(pwd)"/agent-tasks.ts ~/.pi/agent/extensions/
-ln -s "$(pwd)"/agent-bash-jobs.ts ~/.pi/agent/extensions/
+# one-line install/update: clone all extensions straight into pi's extension dir
+git -C ~/.pi/agent/extensions pull 2>/dev/null || git clone --depth 1 https://github.com/wqLouis/.pi.git ~/.pi/agent/extensions
 
 # browser tools need playwright + chromium (or run /playwright-setup inside pi)
 bun add -g playwright && playwright install chromium
@@ -196,10 +190,25 @@ bun add -g playwright && playwright install chromium
 Then start pi (or `/reload`) and the tools are live. Commands run in pi's TUI:
 `/memory`, `/subagent`, `/playwright-setup`.
 
+## Command Code provider
+
+`command-code-provider.ts` registers Command Code as the `command-code` provider:
+
+- OpenAI-compatible models use `https://api.commandcode.ai/provider/v1/chat/completions`.
+- Claude models use the Anthropic-compatible `/messages` endpoint automatically.
+- The model catalog is refreshed from `https://api.commandcode.ai/provider/v1/models`.
+
+Set `CMD_API_KEY` before starting pi, then select a model such as
+`command-code/gpt-5.6-luna` with `/model`. The provider also honors
+`CMD_ZDR=1` by sending the `x-cmd-zdr: 1` request header. API keys are never
+stored in this repository.
+
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
+| `CMD_API_KEY` | Command Code Provider API key |
+| `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, nested task board) |
 | `PI_SUBAGENT_MAX_DEPTH` / `PI_SUBAGENT_MAX_SUBAGENTS` | Override nesting depth / concurrency limits |
