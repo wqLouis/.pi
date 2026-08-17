@@ -22,8 +22,7 @@ self-managing, multi-agent system. Seven extensions, loaded from
 3. **bash-timeout** — commands can't hang the agent forever.
 4. **playwright-browser** — the agent (and its subagents) drive a real browser.
 5. **agent-tasks** — a plain-markdown task board per session.
-6. **agent-bash-jobs** — background bash commands with realtime completion.
-7. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
+6. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -40,14 +39,12 @@ automatically:
   **auto-bubbles** as a real message.
 - `subagent_send` — steering is **always async**: push the message, keep
   working, get pinged when it finishes.
-- `bash_job_start` — run a long command in the background, get pinged when
-  it's done.
 - **Idle timers** re-deliver anything that was missed (reloads, busy turns)
   at session start / turn end / every 30s — no notification is ever lost.
-- Busy-safe pushes: every notification passes `deliverAs: "followUp"`, so it
-  queues into the current turn instead of throwing or interrupting.
+- Busy-safe pushes: every notification passes `deliverAs: "steer"`, so it
+  lands in the chat thread immediately.
 
-The agent *can* block (`subagent_wait`, `bash_job_wait`) when it genuinely
+The agent *can* block (`subagent_wait`) when it genuinely
 needs the result before continuing — but the default posture is: start it,
 forget it, get pinged. Subagents themselves run the same way, so the whole
 tree fans out into background work and results flow back to the top.
@@ -170,31 +167,7 @@ the agent where it lives via a system-prompt guideline.
 `/task` shows the board (or `/task init` recreates it). Override the root dir
 with `PI_TASK_DIR` (default `/tmp`).
 
-## 6. agent-bash-jobs — run commands in the background
-
-Long commands no longer block the agent: `bash_job_start { command }` returns a
-job id immediately, the job runs in the background, and when it finishes a
-message is pushed to the agent in realtime (`followUp` + `triggerTurn`). The
-agent can do other work, or block with `bash_job_wait` (which streams progress
-and suppresses the duplicate push).
-
-| Tool | Purpose |
-|------|---------|
-| `bash_job_start { command, timeout?, cwd? }` | Start a background job, returns `jobId` immediately |
-| `bash_job_wait { jobId, timeoutMs? }` | Block until done, streaming output; suppresses the completion push |
-| `bash_job_list` | Running/finished jobs: status, duration, command |
-| `bash_job_result { jobId }` | Full output + exit code of a finished job |
-| `bash_job_cancel { jobId }` | Kill a running job (no completion push) |
-
-Job records persist in `~/.pi/agent/bash-jobs/` (survive restarts; jobs
-orphaned by a restart are marked `lost`). Records are **auto-cleaned**: a job's
-record is deleted as soon as you read its result with `bash_job_result` or
-`bash_job_wait` (results are single-use); the completion push is only a preview
-notice. Cancelled jobs are deleted immediately, and stale finished records are
-swept after 24h. Optional `timeout` kills runaway commands. `/bash-jobs` lists
-them for humans.
-
-## Command Code provider
+## 6. command-code-provider — Command Code models
 
 `command-code-provider.ts` registers Command Code as the `command-code` provider:
 
@@ -224,17 +197,16 @@ stored in this repository.
 
 ## Architecture notes
 
-- **Async-first, never blocked** — spawns, steering, and long commands all
-  return immediately; completions auto-bubble as real messages (idle timers
-  guarantee delivery). Waiting is opt-in (`subagent_wait`, `bash_job_wait`).
+- **Async-first, never blocked** — spawns and steering
+  all return immediately; completions auto-bubble as real messages (idle timers
+  guarantee delivery). Waiting is opt-in (`subagent_wait`).
 - **Nothing destructive** — memory drops rewrite only the LLM context; the
   session files (main and subagent) always hold the full history.
-- **State survives** — memory drops, subagent records, and bash-job records
-  persist (per-session for jobs), so they survive restarts, `/reload`, and
-  branching.
+- **State survives** — memory drops and subagent records
+  persist, so they survive restarts, `/reload`, and branching.
 - **Isolated enforcement** — edit scope lives in the subagent process itself;
   the browser lives in its own daemon with per-client sessions.
 - **Realtime by design** — completion/bubble notifications and memory nudges
-  are pushed into the running agent (`sendUserMessage` + `followUp`, so they
-  queue when busy and trigger a turn when idle) — not queued behind the next
-  user input.
+  are pushed into the running agent (`sendUserMessage` + `steer`, so they
+  interrupt the current stream and trigger a turn when idle) — not queued
+  behind the next user input.
