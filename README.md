@@ -1,5 +1,18 @@
 # pi agent harness
 
+## Setup
+
+```bash
+# one-line install: clone all extensions straight into pi's extension dir
+git clone --depth 1 https://github.com/wqLouis/.pi.git ~/.pi/agent/extensions
+```
+
+Then start pi (or `/reload`) and the tools are live (playwright and chromium
+are installed automatically by `/playwright-setup` inside pi). Commands run in
+pi's TUI: `/memory`, `/subagent`, `/playwright-setup`.
+
+## Extensions
+
 A set of extensions that turn the [pi coding agent](https://github.com/earendil-works/pi) into a
 self-managing, multi-agent system. Seven extensions, loaded from
 `~/.pi/agent/extensions/`:
@@ -176,19 +189,6 @@ and suppresses the duplicate push).
 Job records persist in `~/.pi/agent/bash-jobs/` (survive restarts; jobs
 orphaned by a restart are marked `lost`). Optional `timeout` kills runaway
 commands. `/bash-jobs` lists them for humans.
-
-## Setup
-
-```bash
-# one-line install/update: clone all extensions straight into pi's extension dir
-git -C ~/.pi/agent/extensions pull 2>/dev/null || git clone --depth 1 https://github.com/wqLouis/.pi.git ~/.pi/agent/extensions
-
-# browser tools need playwright + chromium (or run /playwright-setup inside pi)
-bun add -g playwright && playwright install chromium
-```
-
-Then start pi (or `/reload`) and the tools are live. Commands run in pi's TUI:
-`/memory`, `/subagent`, `/playwright-setup`.
 
 ## Command Code provider
 
