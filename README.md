@@ -9,20 +9,19 @@ git clone --depth 1 https://github.com/wqLouis/.pi.git ~/.pi/agent/extensions
 
 Then start pi (or `/reload`) and the tools are live (playwright and chromium
 are installed automatically by `/playwright-setup` inside pi). Commands run in
-pi's TUI: `/memory`, `/subagent`, `/playwright-setup`.
+pi's TUI: `/subagent`, `/playwright-setup`.
 
 ## Extensions
 
 A set of extensions that turn the [pi coding agent](https://github.com/earendil-works/pi) into a
-self-managing, multi-agent system. Seven extensions, loaded from
+self-managing, multi-agent system. Five extensions, loaded from
 `~/.pi/agent/extensions/`:
 
-1. **agent-memory** — the agent manages its own conversation memory (not just compaction).
-2. **subagent** — the agent spawns, steers, waits on, and scopes subagents that work for it.
-3. **bash-timeout** — commands can't hang the agent forever.
-4. **playwright-browser** — the agent (and its subagents) drive a real browser.
-5. **agent-tasks** — a plain-markdown task board per session.
-6. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
+1. **subagent** — the agent spawns, steers, waits on, and scopes subagents that work for it.
+2. **bash-timeout** — commands can't hang the agent forever.
+3. **playwright-browser** — the agent (and its subagents) drive a real browser.
+4. **agent-tasks** — a plain-markdown task board per session.
+5. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -51,32 +50,7 @@ tree fans out into background work and results flow back to the top.
 
 ---
 
-## 1. agent-memory — self-managed conversation memory
-
-pi compacts context by summarizing everything. This harness lets the agent
-decide, turn by turn, what to keep in full detail and what to compress to a
-"first few lines" stub — **without deleting anything**. The session file stays
-intact; drops only rewrite what is sent to the model, so they can always be
-undone.
-
-| Tool | Purpose |
-|------|---------|
-| `memory_index` | List every turn: first lines of the turn start/end, message count, token estimate |
-| `memory_drop { turnIds, lines? }` | Compress chosen turns to first-N-line stubs (nothing is deleted) |
-| `memory_restore { turnIds? }` | Bring full detail back |
-| `memory_status` | What's dropped, token savings, live context usage |
-
-Plus a `/memory [index | status | drop <ids> | restore [ids]]` command for
-humans (renders the index as a scrollable panel in the TUI).
-
-The agent is **nudged proactively**: when live context usage crosses the
-30% / 50% / 70% bands ("context is at X% — consider calling memory_drop…"), a
-**real user steering message** is pushed (`sendUserMessage`, so it always
-triggers a turn and is visible in the chat) — once per band, only when
-droppable turns exist. It fires after each turn settles, at session start, and
-from an idle timer. Band state persists in the session, so it doesn't re-nag.
-
-## 2. subagent — spawn, steer, wait, scope
+## 1. subagent — spawn, steer, wait, scope
 
 One generic subagent type (model chosen by the user via `/subagent model`),
 each owning a private pi session file. Every turn runs a one-shot pi process
@@ -84,7 +58,8 @@ against that session, so steering truly continues its work with full history.
 
 | Tool | Purpose |
 |------|---------|
-| `subagent_spawn { task, model?, cwd?, tools?, scope?, await? }` | Spawn a subagent. `await: false` returns immediately (background) |
+| `subagent_dispatch { exploreScope, tasks, ... }` | Explore once, then fork one task agent per task from the shared exploration session; skips exploration for a single task |
+| `subagent_spawn { task, model?, cwd?, tools?, scope?, await? }` | Spawn one direct subagent. `await: false` returns immediately (background) |
 | `subagent_send { subagentId, message }` | Push a message / steer — **always async**: returns immediately, completion auto-bubbles |
 | `subagent_wait { subagentId \| all: true }` | Block until one (or all) finish, streaming live `done/total` progress |
 | `subagent_list` | Running/finished subagents: id, model, usage, latest output |
@@ -95,6 +70,7 @@ against that session, so steering truly continues its work with full history.
 
 Key behaviors:
 
+- **Shared exploration** — `subagent_dispatch` accepts one `exploreScope` and an array of implementation `tasks`. With multiple tasks it runs one read-only exploration pass, then uses Pi's session fork API to create each task agent from the explorer's complete session, preserving the shared context and cacheable prefix. With one task it uses a direct fast path and does not create an explorer.
 - **Edit scope** — `scope` limits a subagent's writes to a directory or file
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
   `tool_call` hook: `write`/`edit` targeting out-of-scope paths are blocked
@@ -113,10 +89,10 @@ Key behaviors:
   (and triggers one even when idle). If a push was missed (e.g. extension
   reloaded mid-run), a flusher re-delivers it at session start / turn end /
   every 30s.
-- **`/subagent` command** — spawn, `list`, `result <id>`, `send <id> <msg>`,
+- **`/subagent` command** — manage direct subagents with `list`, `result <id>`, `send <id> <msg>`,
   `forget <id>`, `model [provider/id]` (interactive model picker), `config`.
 
-## 3. bash-timeout — no more hung commands
+## 2. bash-timeout — no more hung commands
 
 pi's bash tool has no default timeout; when the agent forgets one, a command
 can hang forever. This extension:
@@ -128,7 +104,7 @@ can hang forever. This extension:
   system prompt ("always pass an explicit timeout… a default of 10s is applied
   when you omit it"), idempotently.
 
-## 4. playwright-browser — real browser automation
+## 3. playwright-browser — real browser automation
 
 The browser lives in a **detached daemon process** (`browser-server.mjs`), so
 browser state survives pi restarts and one-shot subagent turns — a subagent can
@@ -152,22 +128,19 @@ verified headless launch) and reports status, with a `force` flag.
 
 ---
 
-## 5. agent-tasks — a plain-markdown task board
+## 4. agent-tasks — a plain-markdown task board
 
-No tool-based task system — just a `TASK.md` file per session that the agent
-reads with `read` and updates directly with the `edit` tool (fully
-transparent, plain text). The extension only initializes the file and tells
-the agent where it lives via a system-prompt guideline.
+The task extension provides one plain-text `TASK.md` board per main session.
+Agents always use the logical path `TASK.md`; the extension wraps the built-in
+`read`, `write`, and `edit` tools and transparently redirects that path
+to the session's backing file, so session IDs and other metadata never enter
+the model context.
 
-- **Main agent:** `/tmp/<session_id>/TASK.md`
-- **Subagents:** nested under their parent — `/tmp/<session_id>/<subagent_id>/TASK.md`
-  (and deeper layers nest further). The parent session id and chain are passed
-  to subagent processes via `PI_TASK_BASE`.
+All subagents inherit the same board through `PI_TASK_BASE`; they do not get
+nested task files. `/task` shows the board (or `/task init` recreates it).
+Override the backing root with `PI_TASK_DIR` (default `/tmp`).
 
-`/task` shows the board (or `/task init` recreates it). Override the root dir
-with `PI_TASK_DIR` (default `/tmp`).
-
-## 6. command-code-provider — Command Code models
+## 5. command-code-provider — Command Code models
 
 `command-code-provider.ts` registers Command Code as the `command-code` provider:
 
@@ -187,7 +160,7 @@ stored in this repository.
 | `CMD_API_KEY` | Command Code Provider API key |
 | `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
-| `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, nested task board) |
+| `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
 | `PI_SUBAGENT_MAX_DEPTH` / `PI_SUBAGENT_MAX_SUBAGENTS` | Override nesting depth / concurrency limits |
 | `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
