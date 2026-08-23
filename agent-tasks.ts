@@ -78,7 +78,7 @@ function ensureTaskFile(file: string): void {
 }
 
 const guidelineFor = () =>
-	`${GUIDELINE_MARKER} (plain markdown). Use the logical path TASK.md with read, write, or edit; the task extension routes it to this session's shared board. Keep it current: add tasks, mark progress, move finished items to Done.`;
+	`${GUIDELINE_MARKER} (plain markdown). Use the logical path TASK.md with read, write, or edit; the task extension routes it to this session's shared board. Track only substantial, multi-step work that will take more than one or two turns. Do not add trivial actions such as routine commits, quick checks, or other work that can be completed in one or two turns. Keep substantial tasks current: add them, mark progress, and move finished items to Done.`;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", (event, ctx) => {

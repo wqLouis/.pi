@@ -23,7 +23,6 @@ import { Type } from "typebox";
 const DEFAULT_MAX_DEPTH = 3;
 const DEFAULT_MAX_SUBAGENTS = 4;
 const MAX_ERROR_CHARS = 500;
-const POLL_INTERVAL_MS = 500;
 const PREVIEW_CHARS = 200;
 const DETAIL_CHARS = 300;
 const KILL_GRACE_MS = 5000;
@@ -139,7 +138,6 @@ interface SubagentConfig {
 interface RunningEntry {
 	proc: ChildProcess;
 	done: Promise<RunResult>;
-	getPartial: () => string;
 }
 
 const EMPTY_USAGE = (): RunUsage => ({
@@ -303,8 +301,23 @@ function resolveSpawnOptions(
 }
 
 
-function subagentDir(): string {
-	const dir = path.join(getAgentDir(), "subagents");
+let activeSubagentDir: string | undefined;
+
+function sessionScopeKey(ctx: ExtensionContext): string {
+	let sessionId = "session";
+	try {
+		sessionId = ctx.sessionManager.getSessionId() || sessionId;
+	} catch {
+
+	}
+	return sessionId.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "session";
+}
+
+function subagentDir(ctx?: ExtensionContext): string {
+	const configured = process.env.PI_SUBAGENT_DIR;
+	const dir = configured
+		? path.resolve(configured)
+		: activeSubagentDir ?? path.join(getAgentDir(), "subagents", ctx ? sessionScopeKey(ctx) : "unscoped");
 	fs.mkdirSync(dir, { recursive: true });
 	return dir;
 }
@@ -459,6 +472,7 @@ async function spawnSubagentProcess(
 				...process.env,
 				PI_SUBAGENT_DEPTH: String(depth + 1),
 				PI_SUBAGENT_ID: rec.id,
+				PI_SUBAGENT_DIR: subagentDir(),
 			};
 			if (rec.scope && rec.scope.length > 0) {
 				env.PI_SUBAGENT_SCOPE = JSON.stringify(rec.scope);
@@ -630,23 +644,23 @@ const running = new Map<string, RunningEntry>();
 
 
 function buildCompletionText(rec: SubagentRecord): string {
-	const preview = firstLine(rec.lastOutput).slice(0, PREVIEW_CHARS);
+	const output = rec.lastOutput.trim() || "(no output)";
 	if (rec.status === "error") {
-		const detail = (rec.lastError || preview || "(no output)").slice(0, DETAIL_CHARS);
+		const detail = rec.lastError?.trim() || "(no error detail)";
 		return (
-			`[subagent ${rec.id} error] ${detail}\n\n` +
-			`The subagent's run failed. Resolve it:\n` +
-			`- Steer it to fix the error: subagent_send { subagentId: "${rec.id}", message: "<what to fix>" } — it resumes with its full context\n` +
-			`- Respawn a fresh subagent: subagent_spawn { task: "<retry the work>", ... }\n` +
-			`- Inspect the full transcript first: subagent_result { subagentId: "${rec.id}" }\n` +
-			`- Discard it: subagent_forget { subagentId: "${rec.id}" }`
+			`[subagent ${rec.id} error]\n\n` +
+			`Error: ${detail}\n\n` +
+			`Last output:\n${output}\n\n` +
+			`Resolve it with subagent_send { subagentId: "${rec.id}", message: "<what to fix>" }, ` +
+			`or inspect the full transcript with subagent_result { subagentId: "${rec.id}" }. ` +
+			`Use subagent_forget { subagentId: "${rec.id}" } to discard it.`
 		);
 	}
-	return `[subagent ${rec.id} done] ${preview || "(no output)"}`;
+	return `[subagent ${rec.id} done]\n\n${output}`;
 }
 
 
-function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord, run: RunResult) {
+function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord) {
 	const text = buildCompletionText(rec);
 	const brief = rec.status === "error" ? `Subagent ${rec.id} error` : `Subagent ${rec.id} done`;
 	if (ctx.hasUI) {
@@ -705,7 +719,6 @@ async function startBackground(
 	rec.status = "running";
 	saveRecord(rec);
 
-	let partial = "";
 	let proc: ChildProcess;
 	let done: Promise<RunResult>;
 	try {
@@ -714,9 +727,7 @@ async function startBackground(
 			userText,
 			depth,
 			undefined,
-			(text) => {
-				partial = text;
-			},
+			undefined,
 			(bubble) => {
 
 
@@ -750,7 +761,7 @@ async function startBackground(
 
 	rec.pid = proc.pid;
 	saveRecord(rec);
-	running.set(rec.id, { proc, done, getPartial: () => partial });
+	running.set(rec.id, { proc, done });
 
 	done.then(async (run) => {
 		running.delete(rec.id);
@@ -761,7 +772,7 @@ async function startBackground(
 			rec.lastError = `follow-up dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
 			saveRecord(rec);
 		}
-		notifyDone(api, ctx, rec, run);
+		notifyDone(api, ctx, rec);
 	}).catch((error) => {
 		running.delete(rec.id);
 		rec.status = "error";
@@ -774,74 +785,22 @@ async function startBackground(
 }
 
 
-async function waitForSubagent(
-	id: string,
-	deadline: number,
-	signal: AbortSignal | undefined,
-	onUpdate?: (text: string) => void,
-): Promise<{ status: "done" | "timeout" | "aborted"; output: string; note?: string }> {
-	while (true) {
-		if (signal?.aborted) return { status: "aborted", output: "" };
-		if (Date.now() > deadline) return { status: "timeout", output: "" };
-
-
-		const recNow = loadRecord(id);
-		if (recNow && recNow.status !== "running") {
-			return {
-				status: "done",
-				output: recNow.lastOutput ?? "",
-				note: recNow.status === "error" ? "subagent errored" : undefined,
-			};
-		}
-
-		const entry = running.get(id);
-		const partial = entry ? entry.getPartial() : "";
-		if (onUpdate) {
-			onUpdate(partial ? `Waiting for ${id}...\n\n${partial}` : `Waiting for ${id}...`);
-		}
-
-		if (entry) {
-
-
-			if (entry.proc.pid != null) {
-				try {
-					process.kill(entry.proc.pid, 0);
-				} catch {
-					const rec = loadRecord(id);
-					return { status: "done", output: partial || rec?.lastOutput || "", note: "process finished" };
-				}
-			}
-		} else {
-			const rec = loadRecord(id);
-			if (rec && rec.status === "running") {
-
-				if (rec.pid) {
-					try {
-						process.kill(rec.pid, 0);
-					} catch {
-						rec.status = "idle";
-						rec.pid = undefined;
-						rec.lastOutput =
-							rec.lastOutput || "(subagent process finished while the extension was reloaded — use subagent_result for the transcript)";
-						saveRecord(rec);
-						return { status: "done", output: rec.lastOutput, note: "process handle was lost (reload)" };
-					}
-				}
-			} else {
-				return { status: "done", output: rec?.lastOutput ?? "" };
-			}
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
-}
-
-
 interface DispatchDetails {
 	dispatchId: string;
 	explorerId?: string;
 	subagentIds: string[];
 	status: SubagentStatus | "planning";
 	usage: RunUsage;
+}
+
+interface TaskAssignment {
+	task: string;
+	scope: string | string[];
+}
+
+function hasEditScope(scope: unknown): scope is string | string[] {
+	if (typeof scope === "string") return scope.trim().length > 0;
+	return Array.isArray(scope) && scope.length > 0 && scope.every((entry) => typeof entry === "string" && entry.trim().length > 0);
 }
 
 function createSubagentRecord(
@@ -913,32 +872,29 @@ const DispatchParams = Type.Object({
 		description: "What the shared exploration agent should inspect: files, architecture, constraints, and relevant implementation scope.",
 	}),
 	tasks: Type.Array(
-		Type.String({ description: "An independent implementation task for one subagent." }),
-		{ minItems: 1 },
-	),
-	await: Type.Optional(
-		Type.Boolean({
-			description: "true (default): wait for exploration and all task agents. false: run the workflow in the background and receive completion notifications.",
-			default: true,
+		Type.Object({
+			task: Type.String({ description: "The implementation task for this subagent.", minLength: 1 }),
+			scope: Type.Union([
+				Type.String({ description: "Directory or file path this task agent may edit.", minLength: 1 }),
+				Type.Array(
+					Type.String({ description: "A directory or file path this task agent may edit.", minLength: 1 }),
+					{ minItems: 1 },
+				),
+			]),
 		}),
+		{ minItems: 1 },
 	),
 	model: Type.Optional(Type.String({ description: "Model override in provider/id form." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agents (default: current directory)." })),
 	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist." })),
 	systemPrompt: Type.Optional(Type.String({ description: "Override the subagent system prompt." })),
-	scope: Type.Optional(
-		Type.Union([
-			Type.String({ description: "Edit scope shared by the task agents." }),
-			Type.Array(Type.String({ description: "An allowed edit path." })),
-		]),
-	),
 });
 
 const SpawnParams = Type.Object({
 	task: Type.String({ description: "The task to delegate to the subagent" }),
 	await: Type.Optional(
 		Type.Boolean({
-			description: "true (default): wait for the subagent to finish and return its output. false: run in the background and return immediately — use subagent_wait to wait, and you will be notified when it finishes.",
+			description: "true (default): wait for the subagent to finish and return its output. false: run in the background and return immediately; completion is automatically notified to the main agent.",
 			default: true,
 		}),
 	),
@@ -965,19 +921,6 @@ const SpawnParams = Type.Object({
 				}),
 			),
 		]),
-	),
-});
-
-const WaitParams = Type.Object({
-	subagentId: Type.Optional(Type.String({ description: "Wait for this specific subagent (from subagent_spawn)" })),
-	all: Type.Optional(
-		Type.Boolean({
-			description: "Wait for all currently running subagents. Ignored if subagentId is provided.",
-			default: false,
-		}),
-	),
-	timeoutMs: Type.Optional(
-		Type.Integer({ description: "Maximum time to wait in milliseconds. 0 = wait indefinitely (default 0).", minimum: 0 }),
 	),
 });
 
@@ -1018,7 +961,14 @@ export default function (pi: ExtensionAPI) {
 		lastFlushCtx = ctx;
 		setTimeout(() => flushPendingNotifications(pi, ctx), delayMs);
 	};
-	pi.on("session_start", (_event, ctx) => scheduleFlush(ctx, SESSION_START_FLUSH_DELAY_MS));
+	pi.on("session_start", (_event, ctx) => {
+		const scopedDir = process.env.PI_SUBAGENT_DIR
+			? path.resolve(process.env.PI_SUBAGENT_DIR)
+			: path.join(getAgentDir(), "subagents", sessionScopeKey(ctx));
+		activeSubagentDir = scopedDir;
+		fs.mkdirSync(scopedDir, { recursive: true });
+		scheduleFlush(ctx, SESSION_START_FLUSH_DELAY_MS);
+	});
 	pi.on("agent_end", (_event, ctx) => scheduleFlush(ctx, FLUSH_DELAY_MS));
 	const flushTimer = setInterval(() => {
 		if (!lastFlushCtx) return;
@@ -1124,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Spawn an isolated subagent to delegate work to",
 		promptGuidelines: [
 			"Use subagent_dispatch for multiple implementation tasks that share repository context; it explores once and forks each task agent from the explorer session.",
-			"Use subagent_spawn for one direct task or when shared exploration is not useful; use await: false for background work, then subagent_wait.",
+			"Use subagent_spawn for one direct task or when shared exploration is not useful; use await: false for background work and rely on the automatic completion notification.",
 			"Use subagent_send to steer a subagent — it continues with its full previous context.",
 			"If a subagent errors, steer it to fix the error with subagent_send or respawn it with subagent_spawn — don't just give up.",
 			"Check subagent_config to see how many subagents are currently running and the limits (maxSubagents concurrent, maxDepth nesting layers). Spawn only as many as you actually need.",
@@ -1163,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
-								`Maximum concurrent subagents reached (${runningNow}/${maxSubagents} running). Wait for some to finish (subagent_wait) or forget them (subagent_forget) before spawning more. Raise maxSubagents in the settings (/subagent config maxSubagents N) if you need more.`,
+								`Maximum concurrent subagents reached (${runningNow}/${maxSubagents} running). Wait for completion notifications or forget agents (subagent_forget) before spawning more. Raise maxSubagents in the settings (/subagent config maxSubagents N) if you need more.`,
 						},
 					],
 					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
@@ -1221,7 +1171,7 @@ export default function (pi: ExtensionAPI) {
 							text:
 								`Spawned subagent ${record.id} in the background (model: ${record.model ?? "session model"}).\n` +
 								(scope ? `Edit scope: ${scope.join(", ")} — writes outside are blocked.\n` : "") +
-								`Wait for it with subagent_wait (subagentId "${record.id}"), read its transcript with subagent_result, steer it with subagent_send once it finishes. You will be notified when it is done.`,
+								`You will be notified when it finishes; read its transcript with subagent_result or steer it with subagent_send afterward.`,
 						},
 					],
 					details: {
@@ -1283,17 +1233,23 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_dispatch",
 		label: "Subagent Dispatch",
 		description:
-			"Dispatch implementation work through a shared exploration session. Provide exploreScope and an array of tasks. With multiple tasks, one explorer investigates the scope first, then each task agent is forked from the explorer session so all task agents reuse its full context and provider cache. With exactly one task, the explorer is skipped and the task agent runs directly.",
+			"Dispatch implementation work asynchronously through a shared exploration session. Provide exploreScope and an array of task assignments, each with task and edit scope. With multiple assignments, one explorer investigates the scope in the background, then each task agent is forked from the explorer session so all task agents reuse its full context and provider cache. With exactly one task, the explorer is skipped and the task agent runs directly in the background.",
 		promptSnippet: "Explore once, then fork task agents from the shared exploration context",
 		promptGuidelines: [
 			"Use subagent_dispatch instead of manually spawning multiple agents when tasks share repository context.",
-			"Give subagent_dispatch one focused exploreScope and an array of independent tasks; it explores once and forks each task agent from that session.",
-			"When subagent_dispatch has exactly one task, it uses the direct fast path and skips the exploration agent.",
+			"Give subagent_dispatch one focused exploreScope and an array of independent { task, scope } assignments; it explores once and forks each task agent from that session.",
+			"Assign every subagent_dispatch task a narrow edit scope so the harness can block writes outside that task's files or directories.",
+			"subagent_dispatch is always asynchronous; rely on its automatic completion notifications or inspect results with subagent_result.",
+			"When subagent_dispatch has exactly one task, it uses the direct fast path and skips the exploration agent."
 		],
 		parameters: DispatchParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const exploreScope = params.exploreScope?.trim();
-			const tasks = (params.tasks ?? []).map((task) => task.trim()).filter(Boolean);
+			const assignments: TaskAssignment[] = (params.tasks ?? []).map((assignment) => ({
+				task: assignment.task.trim(),
+				scope: assignment.scope,
+			}));
+			const tasks = assignments.map((assignment) => assignment.task).filter(Boolean);
 			if (!exploreScope) {
 				return {
 					content: [{ type: "text", text: "Error: exploreScope is required." }],
@@ -1304,6 +1260,14 @@ export default function (pi: ExtensionAPI) {
 			if (tasks.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: tasks must contain at least one non-empty task." }],
+					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
+					isError: true,
+				};
+			}
+			const missingScope = assignments.find((assignment) => !hasEditScope(assignment.scope));
+			if (missingScope) {
+				return {
+					content: [{ type: "text", text: "Error: every task must include a non-empty edit scope." }],
 					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
 					isError: true,
 				};
@@ -1341,50 +1305,25 @@ export default function (pi: ExtensionAPI) {
 				systemPrompt: params.systemPrompt,
 				cwd: params.cwd,
 				tools: params.tools,
-				scope: params.scope,
 			};
-			const notifyBubble = (record: SubagentRecord) => (bubble: { text: string; request: boolean }) => {
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						`[subagent ${record.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, PREVIEW_CHARS)}`,
-						bubble.request ? "warning" : "info",
-					);
-				}
-			};
-
 			// One task does not need a shared exploration pass.
 			if (tasks.length === 1) {
-				const record = createSubagentRecord(ctx, commonParams, "task", tasks[0]);
+				const record = createSubagentRecord(ctx, { ...commonParams, scope: assignments[0].scope }, "task", tasks[0]);
 				saveRecord(record);
-				const task = tasks[0];
-				if (params.await === false) {
-					const started = await startBackground(pi, ctx, record, task);
-					if (!started.started) {
-						record.status = "error";
-						record.lastError = started.error;
-						saveRecord(record);
-						return {
-							content: [{ type: "text", text: started.error ?? "Failed to start task agent." }],
-							details: dispatchDetails(dispatchId, undefined, [record.id], "error") as unknown as SubagentDetails,
-							isError: true,
-						};
-					}
+				const started = await startBackground(pi, ctx, record, tasks[0]);
+				if (!started.started) {
+					record.status = "error";
+					record.lastError = started.error;
+					saveRecord(record);
 					return {
-						content: [{ type: "text", text: `Single-task fast path: spawned ${record.id} in the background. No explorer was created.` }],
-						details: dispatchDetails(dispatchId, undefined, [record.id], "running") as unknown as SubagentDetails,
-					};
-				}
-				const result = await runAndRecord(record, task, signal, onUpdate, notifyBubble(record), childTaskBase(ctx, record.id));
-				if (!result.ok) {
-					return {
-						content: [{ type: "text", text: result.error ?? "Task agent failed." }],
-						details: dispatchDetails(dispatchId, undefined, [record.id], "error", result.usage) as unknown as SubagentDetails,
+						content: [{ type: "text", text: started.error ?? "Failed to start task agent." }],
+						details: dispatchDetails(dispatchId, undefined, [record.id], "error") as unknown as SubagentDetails,
 						isError: true,
 					};
 				}
 				return {
-					content: [{ type: "text", text: `[subagent ${record.id} done]\n\n${result.output}` }],
-					details: dispatchDetails(dispatchId, undefined, [record.id], "idle", result.usage) as unknown as SubagentDetails,
+					content: [{ type: "text", text: `Single-task fast path: spawned ${record.id} in the background. No explorer was created.` }],
+					details: dispatchDetails(dispatchId, undefined, [record.id], "running") as unknown as SubagentDetails,
 				};
 			}
 
@@ -1394,7 +1333,9 @@ export default function (pi: ExtensionAPI) {
 				"explorer",
 				buildExplorerPrompt(exploreScope, tasks),
 			);
-			const taskRecords = tasks.map((task) => createSubagentRecord(ctx, commonParams, "task", task, explorer.id));
+			const taskRecords = assignments.map((assignment) =>
+				createSubagentRecord(ctx, { ...commonParams, scope: assignment.scope }, "task", assignment.task, explorer.id),
+			);
 			saveRecord(explorer);
 			for (const record of taskRecords) saveRecord(record);
 			const taskIds = taskRecords.map((record) => record.id);
@@ -1423,270 +1364,33 @@ export default function (pi: ExtensionAPI) {
 				}
 			};
 
-			if (params.await === false) {
-				const started = await startBackground(pi, ctx, explorer, explorerTask, undefined, launchTasks);
-				if (!started.started) {
-					explorer.status = "error";
-					explorer.lastError = started.error;
-					saveRecord(explorer);
-					return {
-						content: [{ type: "text", text: started.error ?? "Failed to start exploration agent." }],
-						details: dispatchDetails(dispatchId, explorer.id, taskIds, "error") as unknown as SubagentDetails,
-						isError: true,
-					};
-				}
+			const started = await startBackground(pi, ctx, explorer, explorerTask, undefined, launchTasks);
+			if (!started.started) {
+				explorer.status = "error";
+				explorer.lastError = started.error;
+				saveRecord(explorer);
 				return {
-					content: [{ type: "text", text: `Dispatch ${dispatchId} started: explorer ${explorer.id} will inspect the scope, then ${taskRecords.length} task agent(s) will be forked from its session. Tasks: ${taskIds.join(", ")}` }],
-					details: dispatchDetails(dispatchId, explorer.id, taskIds, "running") as unknown as SubagentDetails,
-				};
-			}
-
-			const explored = await runAndRecord(explorer, explorerTask, signal, onUpdate, notifyBubble(explorer), childTaskBase(ctx, explorer.id));
-			if (!explored.ok) {
-				return {
-					content: [{ type: "text", text: explored.error ?? "Exploration agent failed; task agents were not forked." }],
-					details: dispatchDetails(dispatchId, explorer.id, taskIds, "error", explored.usage) as unknown as SubagentDetails,
+					content: [{ type: "text", text: started.error ?? "Failed to start exploration agent." }],
+					details: dispatchDetails(dispatchId, explorer.id, taskIds, "error") as unknown as SubagentDetails,
 					isError: true,
 				};
 			}
-			const sourcePath = sessionFileForRecord(explorer);
-			const results = await Promise.all(
-				taskRecords.map(async (record) => {
-					const result = await runAndRecord(
-						record,
-						buildTaskPrompt(record.task!),
-						signal,
-						onUpdate,
-						notifyBubble(record),
-						childTaskBase(ctx, record.id),
-						sourcePath,
-					);
-					return { record, result };
-				})
-			);
-			const failed = results.filter(({ result }) => !result.ok);
-			const body = results
-				.map(({ record, result }) => `### ${record.id} [${result.ok ? "done" : "error"}]\n\n${result.ok ? result.output : result.error ?? result.output}`)
-				.join("\n\n---\n\n");
 			return {
-				content: [{ type: "text", text: `Shared exploration ${explorer.id} completed; forked ${results.length} task agent(s).\n\n${body}` }],
-				details: dispatchDetails(
-					dispatchId,
-					explorer.id,
-					taskIds,
-					failed.length > 0 ? "error" : "idle",
-					addUsage(explored.usage, results.reduce((usage, item) => addUsage(usage, item.result.usage), EMPTY_USAGE())),
-				) as unknown as SubagentDetails,
-				isError: failed.length > 0,
+				content: [{ type: "text", text: `Dispatch ${dispatchId} started: explorer ${explorer.id} will inspect the scope in the background, then ${taskRecords.length} task agent(s) will be forked from its session. Tasks: ${taskIds.join(", ")}` }],
+				details: dispatchDetails(dispatchId, explorer.id, taskIds, "running") as unknown as SubagentDetails,
 			};
 		},
 	});
-
-	pi.registerTool({
-		name: "subagent_wait",
-		label: "Subagent Wait",
-		description:
-			"Wait until a spawned subagent (subagentId) or all currently running subagents (all: true) finish. Streams progress updates while waiting and returns the final output(s). Use after spawning with await: false. If the subagent already finished, returns its last output immediately.",
-		promptSnippet: "Wait for a background subagent (or all subagents) to finish",
-		promptGuidelines: [
-			"Use subagent_wait after subagent_spawn with await: false to block until the subagent finishes; you will get its output.",
-		],
-		parameters: WaitParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const subagentId = params.subagentId;
-			const all = params.all ?? false;
-
-			if (!subagentId && !all) {
-				return {
-					content: [{ type: "text", text: "Error: provide subagentId or set all: true." }],
-					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const deadline = params.timeoutMs ? Date.now() + params.timeoutMs : Infinity;
-
-			if (subagentId) {
-				const rec = loadRecord(subagentId);
-				if (!rec) {
-					return {
-						content: [{ type: "text", text: `Unknown subagent "${subagentId}". Spawn one with subagent_spawn.` }],
-						details: { subagentId, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
-						isError: true,
-					};
-				}
-				if (rec.status !== "running") {
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									`Subagent ${subagentId} is not running (status: ${rec.status}).` +
-									(rec.status === "planned" ? " It is queued behind its shared exploration agent." : `\n\nLast output:\n${rec.lastOutput}`),
-							},
-						],
-						details: {
-							subagentId,
-							model: rec.model,
-							output: rec.lastOutput,
-							status: rec.status,
-							usage: rec.totalUsage,
-						} as SubagentDetails,
-					};
-				}
-
-				const waited = await waitForSubagent(subagentId, deadline, signal, (text) => {
-					if (onUpdate) {
-						onUpdate({
-							content: [{ type: "text", text }],
-							details: { subagentId, output: text, status: "running", usage: rec.totalUsage } as SubagentDetails,
-						});
-					}
-				});
-
-				const finalRec = loadRecord(subagentId);
-				if (waited.status === "aborted") {
-					return {
-						content: [{ type: "text", text: `Wait for ${subagentId} aborted.` }],
-						details: { subagentId, output: "", status: "running", usage: rec.totalUsage } as SubagentDetails,
-						isError: true,
-					};
-				}
-				if (waited.status === "timeout") {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Timed out waiting for ${subagentId} — it is still running. Check subagent_list or wait longer.`,
-							},
-						],
-						details: {
-							subagentId,
-							model: rec.model,
-							output: finalRec?.lastOutput ?? "",
-							status: "running",
-							usage: rec.totalUsage,
-						} as SubagentDetails,
-					};
-				}
-				return {
-					content: [
-						{
-							type: "text",
-							text: `[subagent ${subagentId} done${waited.note ? ` (${waited.note})` : ""}]\n\n${finalRec?.lastOutput ?? waited.output}`,
-						},
-					],
-					details: {
-						subagentId,
-						model: finalRec?.model ?? rec.model,
-						output: finalRec?.lastOutput ?? waited.output,
-						status: finalRec?.status ?? "idle",
-						usage: finalRec?.totalUsage ?? rec.totalUsage,
-					} as SubagentDetails,
-				};
-			}
-
-
-			const targets = [...running.keys()];
-			if (targets.length === 0) {
-				return {
-					content: [{ type: "text", text: "No subagents currently running — nothing to wait for." }],
-					details: { subagentId: "", output: "", status: "idle", usage: EMPTY_USAGE() } as SubagentDetails,
-				};
-			}
-
-
-			const isDone = (tid: string): boolean => {
-				const rec = loadRecord(tid);
-				if (rec && rec.status !== "running") return true;
-				const entry = running.get(tid);
-				if (!entry) return true;
-				if (entry.proc.pid != null) {
-					try {
-						process.kill(entry.proc.pid, 0);
-						return false;
-					} catch {
-						return true;
-					}
-				}
-				return false;
-			};
-
-			const results: Array<{ subagentId: string; status: string; output: string }> = [];
-			for (const id of targets) {
-				const waited = await waitForSubagent(id, deadline, signal, (text) => {
-					if (onUpdate) {
-						const done = targets.filter(isDone).length;
-						onUpdate({
-							content: [{ type: "text", text: `Waiting for subagents: ${done}/${targets.length} done\n\n${id}: ${text}` }],
-							details: { subagentId: id, output: text, status: "running", usage: EMPTY_USAGE() } as SubagentDetails,
-						});
-					}
-				});
-				if (waited.status === "aborted") {
-					return {
-						content: [{ type: "text", text: `Wait aborted (${results.length}/${targets.length} done).` }],
-						details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
-						isError: true,
-					};
-				}
-				const finalRec = loadRecord(id);
-				results.push({
-					subagentId: id,
-					status:
-						waited.status === "timeout"
-							? "running"
-							: finalRec?.status && finalRec.status !== "running"
-								? finalRec.status
-								: "idle",
-					output: finalRec?.lastOutput ?? waited.output,
-				});
-				if (waited.status === "timeout") {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Timed out waiting for subagents — still running: ${results
-									.filter((r) => r.status === "running")
-									.map((r) => r.subagentId)
-									.join(", ")}`,
-							},
-						],
-						details: {
-							subagentId: "",
-							output: "",
-							status: "running",
-							usage: EMPTY_USAGE(),
-							results,
-						} as unknown as SubagentDetails,
-					};
-				}
-			}
-
-			const body = results.map((r) => `### ${r.subagentId} [${r.status}]\n\n${r.output}`).join("\n\n---\n\n");
-			return {
-				content: [{ type: "text", text: `All ${results.length} subagent(s) done.\n\n${body}` }],
-				details: {
-					subagentId: "",
-					output: "",
-					status: "idle",
-					usage: EMPTY_USAGE(),
-					results,
-				} as unknown as SubagentDetails,
-			};
-		},
-	});
-
 
 	pi.registerTool({
 		name: "subagent_send",
 		label: "Subagent Send",
 		description:
-			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: it returns immediately, the subagent runs the steering turn in the background, and you're notified (a message auto-bubbles) when it finishes — block with subagent_wait or inspect with subagent_result. Only works when the subagent is not currently running.",
+			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: it returns immediately, the subagent runs the steering turn in the background, and the complete result auto-bubbles when it finishes. Only works when the subagent is not currently running.",
 		promptSnippet: "Send a steering message to a subagent",
 		promptGuidelines: [
 			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_send (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
-			"subagent_send is async — it returns immediately and the completion auto-bubbles; you can keep working or wait with subagent_wait.",
+			"subagent_send is async — it returns immediately and the complete completion message auto-bubbles; keep working while it runs.",
 		],
 		parameters: SendParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1715,7 +1419,7 @@ export default function (pi: ExtensionAPI) {
 							text:
 								record.status === "planned"
 									? `Subagent ${params.subagentId} is queued behind its shared exploration agent. Wait until it starts before steering it.`
-									: `Subagent ${params.subagentId} is currently running. Wait for it with subagent_wait, then send the steering message.`,
+									: `Subagent ${params.subagentId} is currently running. Wait until it finishes, then send the steering message.`,
 						},
 					],
 					details: { subagentId: params.subagentId, output: "", status: record.status, usage: record.totalUsage } as SubagentDetails,
@@ -1742,7 +1446,7 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`Steering message sent to subagent ${params.subagentId} in the background — it will run its turn and you'll be notified when it finishes. Block with subagent_wait, or inspect the output with subagent_result.`,
+							`Steering message sent to subagent ${params.subagentId} in the background — the complete result will auto-bubble when it finishes. Inspect the output with subagent_result if needed.`,
 					},
 				],
 				details: {
@@ -2091,7 +1795,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (rec.status === "running") {
-					ctx.ui.notify(`Subagent ${id} is still running — use /subagent wait? (subagent_wait tool) or wait for it.`, "warning");
+					ctx.ui.notify(`Subagent ${id} is still running — wait for its completion notification.`, "warning");
 					return;
 				}
 				if (ctx.hasUI) ctx.ui.setStatus("subagent", `sending to ${id}...`);

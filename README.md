@@ -17,7 +17,7 @@ A set of extensions that turn the [pi coding agent](https://github.com/earendil-
 self-managing, multi-agent system. Five extensions, loaded from
 `~/.pi/agent/extensions/`:
 
-1. **subagent** — the agent spawns, steers, waits on, and scopes subagents that work for it.
+1. **subagent** — the agent spawns, steers, and scopes subagents that work for it.
 2. **bash-timeout** — commands can't hang the agent forever.
 3. **playwright-browser** — the agent (and its subagents) drive a real browser.
 4. **agent-tasks** — a plain-markdown task board per session.
@@ -34,8 +34,8 @@ should never idle waiting on something while it can still be doing work.
 Everything that takes time is pushed to the background and reports back
 automatically:
 
-- `subagent_spawn { await: false }` — delegate and move on; the completion
-  **auto-bubbles** as a real message.
+- `subagent_spawn { await: false }` / `subagent_dispatch` — delegate and move on; the completion
+  **auto-bubbles** as a real message with the subagent's full final response.
 - `subagent_send` — steering is **always async**: push the message, keep
   working, get pinged when it finishes.
 - **Idle timers** re-deliver anything that was missed (reloads, busy turns)
@@ -43,14 +43,13 @@ automatically:
 - Busy-safe pushes: every notification passes `deliverAs: "steer"`, so it
   lands in the chat thread immediately.
 
-The agent *can* block (`subagent_wait`) when it genuinely
-needs the result before continuing — but the default posture is: start it,
-forget it, get pinged. Subagents themselves run the same way, so the whole
-tree fans out into background work and results flow back to the top.
+The default posture is: start it, forget it, get pinged. Subagents themselves
+run the same way, so the whole tree fans out into background work and results
+flow back to the top.
 
 ---
 
-## 1. subagent — spawn, steer, wait, scope
+## 1. subagent — spawn, steer, scope
 
 One generic subagent type (model chosen by the user via `/subagent model`),
 each owning a private pi session file. Every turn runs a one-shot pi process
@@ -58,10 +57,9 @@ against that session, so steering truly continues its work with full history.
 
 | Tool | Purpose |
 |------|---------|
-| `subagent_dispatch { exploreScope, tasks, ... }` | Explore once, then fork one task agent per task from the shared exploration session; skips exploration for a single task |
+| `subagent_dispatch { exploreScope, tasks: [{ task, scope }], ... }` | Always runs asynchronously: explore once, then fork scoped task agents from the shared exploration session; skips exploration for a single task |
 | `subagent_spawn { task, model?, cwd?, tools?, scope?, await? }` | Spawn one direct subagent. `await: false` returns immediately (background) |
-| `subagent_send { subagentId, message }` | Push a message / steer — **always async**: returns immediately, completion auto-bubbles |
-| `subagent_wait { subagentId \| all: true }` | Block until one (or all) finish, streaming live `done/total` progress |
+| `subagent_send { subagentId, message }` | Push a message / steer — **always async**: returns immediately, the complete completion auto-bubbles |
 | `subagent_list` | Running/finished subagents: id, model, usage, latest output |
 | `subagent_result { subagentId }` | Full transcript: task, steering messages, tool activity, outputs |
 | `subagent_forget { subagentId }` | Delete a subagent and its session |
@@ -70,7 +68,9 @@ against that session, so steering truly continues its work with full history.
 
 Key behaviors:
 
-- **Shared exploration** — `subagent_dispatch` accepts one `exploreScope` and an array of implementation `tasks`. With multiple tasks it runs one read-only exploration pass, then uses Pi's session fork API to create each task agent from the explorer's complete session, preserving the shared context and cacheable prefix. With one task it uses a direct fast path and does not create an explorer.
+- **Shared exploration** — `subagent_dispatch` accepts one `exploreScope` and an array of `{ task, scope }` assignments and always returns immediately. With multiple tasks it runs one read-only exploration pass in the background, then uses Pi's session fork API to create each scoped task agent from the explorer's complete session, preserving the shared context and cacheable prefix. With one task it uses a direct fast path and does not create an explorer.
+- **Per-task edit scope** — Every dispatched task supplies its own file or directory scope. The harness blocks that task agent's `write` and `edit` calls outside the assigned scope, preventing parallel tasks from colliding.
+- **Session-scoped listing** — Subagent records and `subagent_list` are isolated to the current main session; one session cannot see another session's agents.
 - **Edit scope** — `scope` limits a subagent's writes to a directory or file
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
   `tool_call` hook: `write`/`edit` targeting out-of-scope paths are blocked
@@ -137,8 +137,10 @@ to the session's backing file, so session IDs and other metadata never enter
 the model context.
 
 All subagents inherit the same board through `PI_TASK_BASE`; they do not get
-nested task files. `/task` shows the board (or `/task init` recreates it).
-Override the backing root with `PI_TASK_DIR` (default `/tmp`).
+nested task files. Keep only substantial, multi-step work on the board—do not
+add routine commits, quick checks, or tasks that fit in one or two turns.
+`/task` shows the board (or `/task init` recreates it). Override the backing root
+with `PI_TASK_DIR` (default `/tmp`).
 
 ## 5. command-code-provider — Command Code models
 
@@ -172,7 +174,7 @@ stored in this repository.
 
 - **Async-first, never blocked** — spawns and steering
   all return immediately; completions auto-bubble as real messages (idle timers
-  guarantee delivery). Waiting is opt-in (`subagent_wait`).
+  guarantee delivery). Completion messages contain the subagent's full final response.
 - **Nothing destructive** — memory drops rewrite only the LLM context; the
   session files (main and subagent) always hold the full history.
 - **State survives** — memory drops and subagent records
