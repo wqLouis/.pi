@@ -90,7 +90,7 @@ Key behaviors:
   reloaded mid-run), a flusher re-delivers it at session start / turn end /
   every 30s.
 - **`/subagent` command** — manage direct subagents with `list`, `result <id>`, `send <id> <msg>`,
-  `forget <id>`, `model [provider/id]` (interactive model picker), `config`.
+  `forget <id>`, `model [provider/id]` (pi's built-in model selector), `config`.
 
 ## 2. bash-timeout — no more hung commands
 

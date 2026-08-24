@@ -10,14 +10,16 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-	type Theme,
+	ModelSelectorComponent,
+	type ModelRuntime,
 	SessionManager,
+	type SettingsManager,
 	getAgentDir,
 	getSettingsListTheme,
 	withFileMutationQueue,
 	DynamicBorder,
 } from "@earendil-works/pi-coding-agent";
-import { Container, decodeKittyPrintable, matchesKey, SettingsList, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { Container, matchesKey, SettingsList, Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DEFAULT_MAX_DEPTH = 3;
@@ -30,7 +32,6 @@ const FLUSH_DELAY_MS = 50;
 const SESSION_START_FLUSH_DELAY_MS = 200;
 const FLUSH_INTERVAL_MS = 30_000;
 const SETTINGS_MAX_VISIBLE = 10;
-const FILTER_MAX_CHARS = 40;
 
 const DEFAULT_SUBAGENT_PROMPT = [
 	"You are a subagent working for a main agent. You run in an isolated context, so the main agent's conversation is not visible to you — only the task you receive and any follow-up instructions.",
@@ -1845,37 +1846,16 @@ export default function (pi: ExtensionAPI) {
 }
 
 
-interface PickerModel {
-	provider: string;
-	id: string;
-	label: string;
-	name: string;
-}
-
-
-function collectModels(ctx: ExtensionCommandContext): PickerModel[] {
-	const map = new Map<string, PickerModel>();
-	const add = (provider: string, id: string, name: string) => {
-		const label = `${provider}/${id}`;
-		if (!map.has(label)) map.set(label, { provider, id, label, name });
-	};
+function findExactModel(ctx: ExtensionCommandContext, arg: string): string | undefined {
+	const q = arg.trim().toLowerCase();
 	try {
-		const scoped = ctx.scopedModels;
-		if (scoped && scoped.length > 0) {
-			for (const s of scoped) add(s.model.provider, s.model.id, s.model.name);
-		} else {
-			for (const m of ctx.modelRegistry.getAvailable()) add(m.provider, m.id, m.name);
+		for (const m of ctx.modelRegistry.getAll()) {
+			if (`${m.provider}/${m.id}`.toLowerCase() === q) return `${m.provider}/${m.id}`;
 		}
 	} catch {
 
 	}
-	return [...map.values()].sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
-}
-
-
-function findExactModel(ctx: ExtensionCommandContext, arg: string): string | undefined {
-	const q = arg.trim().toLowerCase();
-	return collectModels(ctx).find((m) => m.label.toLowerCase() === q)?.label;
+	return undefined;
 }
 
 
@@ -1883,6 +1863,35 @@ function sessionModelLabel(ctx: ExtensionCommandContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
+
+/**
+ * Open pi's built-in model selector (the same UI /model uses) as a component.
+ * The session's real ModelRuntime is reached through the ModelRegistry facade
+ * so extension-registered providers are listed too; the built-in component's
+ * default-model write is stubbed out because this picks the subagent model,
+ * not pi's session default.
+ */
+function makeModelSelector(
+	ctx: ExtensionCommandContext,
+	tui: TUI,
+	initialFilter: string,
+	currentLabel: string | undefined,
+	onDone: (model: string | undefined) => void,
+): ModelSelectorComponent {
+	const runtime = (ctx.modelRegistry as unknown as { runtime: ModelRuntime }).runtime;
+	const [provider, ...rest] = (currentLabel ?? "").split("/");
+	const currentModel = currentLabel ? ctx.modelRegistry.find(provider, rest.join("/")) : ctx.model;
+	return new ModelSelectorComponent(
+		tui,
+		currentModel,
+		{ setDefaultModelAndProvider: () => {} } as unknown as SettingsManager,
+		runtime,
+		ctx.scopedModels,
+		(model) => onDone(`${model.provider}/${model.id}`),
+		() => onDone(undefined),
+		initialFilter,
+	);
+}
 
 async function showModelPicker(
 	ctx: ExtensionCommandContext,
@@ -1893,17 +1902,10 @@ async function showModelPicker(
 		ctx.ui.notify("Model picker requires interactive mode. Use: /subagent model <provider/id>", "info");
 		return undefined;
 	}
-	const models = collectModels(ctx);
-	if (models.length === 0) {
-		ctx.ui.notify("No models available.", "warning");
-		return undefined;
-	}
-	return await ctx.ui.custom<string | undefined>((_tui, theme, _kb, done) => {
-		return new SubagentModelPicker(models, initialFilter, currentLabel, theme, (model) => done(model));
+	return await ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
+		return makeModelSelector(ctx, tui, initialFilter, currentLabel, done);
 	});
 }
-
-const PICKER_ROW_CAP = 40;
 
 
 async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void> {
@@ -1922,7 +1924,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		return;
 	}
 
-	await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 
 		const draft: SubagentConfig = { ...loadConfig() };
 		let dirty = false;
@@ -1983,7 +1985,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			},
 		];
 		items[0].submenu = (_cur, selectDone) =>
-			new SubagentModelPicker(collectModels(ctx), "", draft.model ?? sessionModel, theme, (label) => {
+			makeModelSelector(ctx, tui, "", draft.model ?? sessionModelLabel(ctx), (label) => {
 				if (label) {
 					draft.model = label;
 					dirty = true;
@@ -1991,7 +1993,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				}
 				updateFooter();
 				container.invalidate();
-				selectDone(label);
+				selectDone(label ?? undefined);
 			}) as unknown as Component;
 
 		const numericIds = new Set(["maxDepth", "maxSubagents"]);
@@ -2097,136 +2099,4 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			},
 		};
 	});
-}
-
-class SubagentModelPicker {
-	private models: PickerModel[];
-	private filterText: string;
-	private currentLabel?: string;
-	private selected = 0;
-	private theme: Theme;
-	private onClose: (model?: string) => void;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-
-	constructor(
-		models: PickerModel[],
-		initialFilter: string,
-		currentLabel: string | undefined,
-		theme: Theme,
-		onClose: (model?: string) => void,
-	) {
-		this.models = models;
-		this.filterText = initialFilter;
-		this.currentLabel = currentLabel;
-		this.theme = theme;
-		this.onClose = onClose;
-	}
-
-	private filtered(): PickerModel[] {
-		const q = this.filterText.trim().toLowerCase();
-		if (!q) return this.models;
-		return this.models.filter(
-			(m) => m.label.toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q),
-		);
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.onClose(undefined);
-			return;
-		}
-		if (matchesKey(data, "enter")) {
-			const f = this.filtered();
-			if (f.length === 0) return;
-			this.onClose(f[Math.min(this.selected, f.length - 1)].label);
-			return;
-		}
-		if (matchesKey(data, "up")) {
-			this.selected = Math.max(0, this.selected - 1);
-			this.invalidate();
-			return;
-		}
-		if (matchesKey(data, "down")) {
-			this.selected = Math.min(Math.max(0, this.filtered().length - 1), this.selected + 1);
-			this.invalidate();
-			return;
-		}
-		if (matchesKey(data, "home")) {
-			this.selected = 0;
-			this.invalidate();
-			return;
-		}
-		if (matchesKey(data, "end")) {
-			this.selected = Math.max(0, this.filtered().length - 1);
-			this.invalidate();
-			return;
-		}
-		if (matchesKey(data, "backspace")) {
-			this.filterText = this.filterText.slice(0, -1);
-			this.selected = 0;
-			this.invalidate();
-			return;
-		}
-		const ch = decodeKittyPrintable(data) ?? (data.length === 1 ? data : undefined);
-		if (ch && ch.length === 1 && ch >= " ") {
-			this.filterText = (this.filterText + ch).slice(0, FILTER_MAX_CHARS);
-			this.selected = 0;
-			this.invalidate();
-		}
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const th = this.theme;
-		const lines: string[] = [];
-
-		const title = th.fg("accent", " Subagent model ");
-		const header =
-			th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(2, width - 3 - title.length - 2)));
-		lines.push(truncateToWidth(header, width));
-		lines.push("");
-		lines.push(truncateToWidth(`  ${th.fg("muted", "Filter:")} ${this.filterText}${th.fg("accent", "▏")}`, width));
-		lines.push("");
-
-		const filtered = this.filtered();
-		const sel = Math.min(this.selected, Math.max(0, filtered.length - 1));
-		let lastProvider = "";
-		let shown = 0;
-
-		for (let i = 0; i < filtered.length && shown < PICKER_ROW_CAP; i++) {
-			const m = filtered[i];
-			if (m.provider !== lastProvider) {
-				lines.push(truncateToWidth(`  ${th.fg("dim", `── ${m.provider}`)}`, width));
-				lastProvider = m.provider;
-				shown++;
-			}
-			const isSelected = i === sel;
-			const cursor = isSelected ? th.fg("accent", "›") : " ";
-			const current = this.currentLabel && m.label === this.currentLabel ? th.fg("success", " ●") : "";
-			const name = m.name ? th.fg("dim", `  ${m.name}`) : "";
-			const label = th.fg(isSelected ? "accent" : "text", m.label);
-			lines.push(truncateToWidth(`  ${cursor} ${label}${name}${current}`, width));
-			shown++;
-		}
-		if (filtered.length === 0) {
-			lines.push(`  ${th.fg("dim", "No models match the filter.")}`);
-		} else if (filtered.length > PICKER_ROW_CAP) {
-			lines.push(
-				truncateToWidth(`  ${th.fg("dim", `... ${filtered.length - PICKER_ROW_CAP} more — refine the filter`)}`, width),
-			);
-		}
-
-		lines.push("");
-		lines.push(truncateToWidth(`  ${th.fg("dim", "↑/↓ navigate · type to filter · Enter select · Esc cancel")}`, width));
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
 }
