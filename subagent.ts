@@ -12,8 +12,6 @@ import {
 	type ExtensionContext,
 	ModelSelectorComponent,
 	type ModelRuntime,
-	SessionManager,
-	type SettingsManager,
 	getAgentDir,
 	getSettingsListTheme,
 	withFileMutationQueue,
@@ -22,7 +20,6 @@ import {
 import { Container, matchesKey, SettingsList, Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const DEFAULT_MAX_DEPTH = 3;
 const DEFAULT_MAX_SUBAGENTS = 4;
 const MAX_ERROR_CHARS = 500;
 const PREVIEW_CHARS = 200;
@@ -41,7 +38,6 @@ const DEFAULT_SUBAGENT_PROMPT = [
 	"- The main agent may send follow-up messages to steer or redirect you. Treat them as updated instructions and adapt your work accordingly.",
 	"- When done, report concisely with concrete details (file paths, findings, decisions) that the main agent can act on without re-reading the code.",
 	"- If something is blocked or impossible, say so clearly instead of guessing.",
-	"- You may delegate to your own sub-subagents up to the configured layer limit (see subagent_config), but prefer doing the work yourself unless nesting is clearly useful.",
 ].join("\n");
 
 
@@ -63,7 +59,7 @@ function normalizeScope(baseCwd: string, scope: string | string[] | undefined): 
 	return abs.length > 0 ? [...new Set(abs)] : undefined;
 }
 
-type SubagentStatus = "running" | "idle" | "error" | "planned";
+type SubagentStatus = "running" | "idle" | "error";
 
 interface RunUsage {
 	input: number;
@@ -90,10 +86,10 @@ interface RunResult {
 interface SubagentRecord {
 	id: string;
 	model?: string;
-	role?: "task" | "explorer";
-	parentSubagentId?: string;
 	task?: string;
 	sessionPath?: string;
+	/** Steering messages queued while the subagent was running; delivered as its next turn when the current run finishes. */
+	pendingMessages?: string[];
 	systemPrompt: string;
 	cwd: string;
 	tools?: string;
@@ -126,8 +122,6 @@ interface SubagentConfig {
 	systemPrompt?: string;
 	cwd?: string;
 	tools?: string;
-
-	maxDepth?: number;
 
 	maxSubagents?: number;
 
@@ -240,15 +234,6 @@ function saveConfig(cfg: SubagentConfig): void {
 }
 
 
-function getMaxDepth(): number {
-	const cfg = loadConfig();
-	if (typeof cfg.maxDepth === "number" && Number.isFinite(cfg.maxDepth) && cfg.maxDepth >= 1) return Math.floor(cfg.maxDepth);
-	const env = Number(process.env.PI_SUBAGENT_MAX_DEPTH);
-	if (Number.isFinite(env) && env >= 1) return Math.floor(env);
-	return DEFAULT_MAX_DEPTH;
-}
-
-
 function getMaxSubagents(): number {
 	const cfg = loadConfig();
 	if (typeof cfg.maxSubagents === "number" && Number.isFinite(cfg.maxSubagents) && cfg.maxSubagents >= 1)
@@ -333,15 +318,6 @@ function sessionFile(id: string): string {
 
 function sessionFileForRecord(rec: Pick<SubagentRecord, "id" | "sessionPath">): string {
 	return rec.sessionPath ?? sessionFile(rec.id);
-}
-
-function forkSessionForRecord(rec: SubagentRecord, sourcePath: string): string {
-	const forked = SessionManager.forkFrom(sourcePath, rec.cwd, subagentDir(), { id: rec.id });
-	const forkedPath = forked.getSessionFile();
-	if (!forkedPath) throw new Error(`Forked session for ${rec.id} has no session file`);
-	rec.sessionPath = forkedPath;
-	saveRecord(rec);
-	return forkedPath;
 }
 
 function newSubagentId(): string {
@@ -447,9 +423,7 @@ async function spawnSubagentProcess(
 	onUpdate?: (text: string) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
 	taskBase?: string,
-	forkFrom?: string,
 ): Promise<{ proc: ChildProcess; done: Promise<RunResult> }> {
-	if (forkFrom) forkSessionForRecord(rec, forkFrom);
 	const args: string[] = ["--mode", "json", "-p", "--session", sessionFileForRecord(rec)];
 	if (rec.model) args.push("--model", rec.model);
 
@@ -580,9 +554,8 @@ async function runSubagentTurn(
 	onUpdate?: (text: string) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
 	taskBase?: string,
-	forkFrom?: string,
 ): Promise<RunResult> {
-	const { done } = await spawnSubagentProcess(rec, userText, depth, signal, onUpdate, onBubble, taskBase, forkFrom);
+	const { done } = await spawnSubagentProcess(rec, userText, depth, signal, onUpdate, onBubble, taskBase);
 	return done;
 }
 
@@ -610,7 +583,6 @@ async function runAndRecord(
 	onUpdate?: (partial: AgentToolResult<SubagentDetails>) => void,
 	onBubble?: (bubble: { text: string; request: boolean }) => void,
 	taskBase?: string,
-	forkFrom?: string,
 ): Promise<{ ok: boolean; error?: string; output: string; usage: RunUsage; bubbles: Array<{ text: string; request: boolean }> }> {
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	rec.status = "running";
@@ -629,7 +601,7 @@ async function runAndRecord(
 				},
 			});
 		}
-	}, onBubble, taskBase, forkFrom);
+	}, onBubble, taskBase);
 
 	const { output, failed } = finalizeRecord(rec, run);
 	if (failed) {
@@ -682,7 +654,7 @@ function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): voi
 		for (const file of fs.readdirSync(subagentDir())) {
 			if (!file.endsWith(".json")) continue;
 			const rec = loadRecord(file.slice(0, -5));
-			if (!rec || rec.status === "running" || rec.status === "planned" || rec.donePushedAt) continue;
+			if (!rec || rec.status === "running" || rec.donePushedAt) continue;
 			pi.sendUserMessage(buildCompletionText(rec), { deliverAs: "steer" });
 			rec.donePushedAt = Date.now();
 			saveRecord(rec);
@@ -698,15 +670,11 @@ async function startBackground(
 	ctx: ExtensionContext,
 	rec: SubagentRecord,
 	userText: string,
-	forkFrom?: string,
-	onDone?: (run: RunResult) => Promise<void> | void,
 ): Promise<{ started: boolean; error?: string }> {
-	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-	const maxDepth = getMaxDepth();
-	if (depth >= maxDepth) {
+	if (isSubagentProcess) {
 		return {
 			started: false,
-			error: `Maximum subagent depth (${maxDepth}) reached — refusing to nest further. Raise maxDepth in the settings (/subagent config maxDepth N) to allow deeper layers.`,
+			error: "Nested subagents are not supported.",
 		};
 	}
 
@@ -726,7 +694,7 @@ async function startBackground(
 		const spawned = await spawnSubagentProcess(
 			rec,
 			userText,
-			depth,
+			0,
 			undefined,
 			undefined,
 			(bubble) => {
@@ -750,7 +718,6 @@ async function startBackground(
 				);
 			},
 			childTaskBase(ctx, rec.id),
-			forkFrom,
 		);
 		proc = spawned.proc;
 		done = spawned.done;
@@ -767,13 +734,8 @@ async function startBackground(
 	done.then(async (run) => {
 		running.delete(rec.id);
 		finalizeRecord(rec, run);
-		try {
-			await onDone?.(run);
-		} catch (error) {
-			rec.lastError = `follow-up dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
-			saveRecord(rec);
-		}
 		notifyDone(api, ctx, rec);
+		await deliverQueuedMessages(api, ctx, rec);
 	}).catch((error) => {
 		running.delete(rec.id);
 		rec.status = "error";
@@ -785,111 +747,24 @@ async function startBackground(
 	return { started: true };
 }
 
-
-interface DispatchDetails {
-	dispatchId: string;
-	explorerId?: string;
-	subagentIds: string[];
-	status: SubagentStatus | "planning";
-	usage: RunUsage;
+/**
+ * Deliver steering messages that were queued while the subagent was running.
+ * Each queued message is started as a background turn on the subagent's session.
+ */
+async function deliverQueuedMessages(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord): Promise<void> {
+	const queue = rec.pendingMessages ?? [];
+	if (queue.length === 0) return;
+	const next = queue.shift();
+	rec.pendingMessages = queue;
+	saveRecord(rec);
+	const started = await startBackground(api, ctx, rec, next!);
+	if (!started.started) {
+		rec.pendingMessages = [next!, ...(rec.pendingMessages ?? [])];
+		rec.lastError = started.error;
+		saveRecord(rec);
+	}
 }
 
-interface TaskAssignment {
-	task: string;
-	scope: string | string[];
-}
-
-function hasEditScope(scope: unknown): scope is string | string[] {
-	if (typeof scope === "string") return scope.trim().length > 0;
-	return Array.isArray(scope) && scope.length > 0 && scope.every((entry) => typeof entry === "string" && entry.trim().length > 0);
-}
-
-function createSubagentRecord(
-	ctx: ExtensionContext,
-	params: { model?: string; systemPrompt?: string; cwd?: string; tools?: string; scope?: string | string[] },
-	role: "task" | "explorer",
-	task: string,
-	parentSubagentId?: string,
-): SubagentRecord {
-	const opts = resolveSpawnOptions(ctx, params);
-	const cfg = loadConfig();
-	return {
-		id: newSubagentId(),
-		model: opts.model,
-		systemPrompt: opts.systemPrompt,
-		cwd: opts.cwd,
-		tools: opts.tools,
-		scope: normalizeScope(opts.cwd, params.scope ?? cfg.scope),
-		allowTmp: cfg.allowTmp ?? true,
-		role,
-		parentSubagentId,
-		task,
-		status: parentSubagentId ? "planned" : "idle",
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		lastOutput: "",
-		totalUsage: EMPTY_USAGE(),
-	};
-}
-
-function buildExplorerPrompt(scope: string, tasks: string[]): string {
-	return [
-		"You are the shared exploration agent for a group of implementation subagents.",
-		"",
-		`Explore this scope thoroughly: ${scope}`,
-		"",
-		"Inspect the relevant files, architecture, conventions, dependencies, tests, and likely implementation points.",
-		"Do not implement or modify files. Produce an implementation-ready report in your final response.",
-		"Be concrete: include file paths, symbols, data flow, constraints, risks, and commands/tests the task agents should run.",
-		"The task agents will receive this session by fork, so avoid repeating generic background and focus on reusable findings.",
-		"",
-		"Planned task assignments:",
-		...tasks.map((task, index) => `${index + 1}. ${task}`),
-	].join("\n");
-}
-
-function buildTaskPrompt(task: string): string {
-	return [
-		"You are an implementation subagent working from a shared exploration session.",
-		"The preceding conversation is the explorer's full context and findings. Reuse it; do not repeat broad repository exploration unless you need to verify a specific detail.",
-		"Implement and verify the assigned task below. Work autonomously, respect your edit scope, and report concrete changes and validation results.",
-		"",
-		`Assigned task: ${task}`,
-	].join("\n");
-}
-
-function dispatchDetails(
-	dispatchId: string,
-	explorerId: string | undefined,
-	subagentIds: string[],
-	status: SubagentStatus | "planning",
-	usage: RunUsage = EMPTY_USAGE(),
-): DispatchDetails {
-	return { dispatchId, explorerId, subagentIds, status, usage };
-}
-
-const DispatchParams = Type.Object({
-	exploreScope: Type.String({
-		description: "What the shared exploration agent should inspect: files, architecture, constraints, and relevant implementation scope.",
-	}),
-	tasks: Type.Array(
-		Type.Object({
-			task: Type.String({ description: "The implementation task for this subagent.", minLength: 1 }),
-			scope: Type.Union([
-				Type.String({ description: "Directory or file path this task agent may edit.", minLength: 1 }),
-				Type.Array(
-					Type.String({ description: "A directory or file path this task agent may edit.", minLength: 1 }),
-					{ minItems: 1 },
-				),
-			]),
-		}),
-		{ minItems: 1 },
-	),
-	model: Type.Optional(Type.String({ description: "Model override in provider/id form." })),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agents (default: current directory)." })),
-	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist." })),
-	systemPrompt: Type.Optional(Type.String({ description: "Override the subagent system prompt." })),
-});
 
 const SpawnParams = Type.Object({
 	task: Type.String({ description: "The task to delegate to the subagent" }),
@@ -898,6 +773,23 @@ const SpawnParams = Type.Object({
 			description: "true (default): wait for the subagent to finish and return its output. false: run in the background and return immediately; completion is automatically notified to the main agent.",
 			default: true,
 		}),
+	),
+	tasks: Type.Optional(
+		Type.Array(
+			Type.Object({
+				task: Type.String({ description: "The implementation task for this subagent.", minLength: 1 }),
+				scope: Type.Optional(
+					Type.Union([
+						Type.String({ description: "Directory or file path this task agent may edit. Reads are unrestricted." }),
+						Type.Array(
+							Type.String({ description: "A directory or file path this task agent may edit. Reads are unrestricted." }),
+							{ minItems: 1 },
+						),
+					]),
+				),
+			}),
+			{ minItems: 1 },
+		),
 	),
 	systemPrompt: Type.Optional(Type.String({ description: "Override the subagent system prompt (advanced)" })),
 	model: Type.Optional(
@@ -1071,34 +963,36 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
 		description:
-			"Spawn one direct subagent to work in an isolated context (its own session). For multiple related tasks, prefer subagent_dispatch, which explores once and forks task agents from the shared exploration session. With await: true (default) this blocks until the direct subagent finishes; with await: false it runs in the background.",
-		promptSnippet: "Spawn an isolated subagent to delegate work to",
+			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task for one direct subagent — with await: true (default) this blocks until it finishes; with await: false it runs in the background. Pass tasks (array of { task, scope? }) to spawn one background subagent per task; each task may carry its own edit scope (optional — defaults to the config's default scope). Multi-task spawns are always asynchronous.",
+		promptSnippet: "Spawn isolated subagent(s) to delegate work to",
 		promptGuidelines: [
-			"Use subagent_dispatch for multiple implementation tasks that share repository context; it explores once and forks each task agent from the explorer session.",
-			"Use subagent_spawn for one direct task or when shared exploration is not useful; use await: false for background work and rely on the automatic completion notification.",
-			"Use subagent_send to steer a subagent — it continues with its full previous context.",
+			"Pass tasks (array of { task, scope? }) to run several independent subagents in parallel; each runs in the background with automatic completion notifications.",
+			"Use a single task with await: false for background work, or await: true (default) to block until it finishes.",
+			"Give each task a narrow edit scope so the harness can block writes outside those files or directories — use this to keep parallel subagents from colliding on the same files.",
+			"Use subagent_send to steer a subagent — it continues with its full previous context; messages sent while it is running are queued and delivered as its next turn.",
 			"If a subagent errors, steer it to fix the error with subagent_send or respawn it with subagent_spawn — don't just give up.",
-			"Check subagent_config to see how many subagents are currently running and the limits (maxSubagents concurrent, maxDepth nesting layers). Spawn only as many as you actually need.",
+			"Check subagent_config to see how many subagents are currently running vs the maxSubagents limit. Spawn only as many as you actually need.",
 		],
 		parameters: SpawnParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const task = params.task?.trim();
-			if (!task) {
+			const assignments = (params.tasks ?? [])
+				.map((t) => ({ task: t.task?.trim() ?? "", scope: t.scope }))
+				.filter((t) => t.task.length > 0);
+			if (!task && assignments.length === 0) {
 				return {
-					content: [{ type: "text", text: "Error: task is required." }],
+					content: [{ type: "text", text: "Error: task is required (or pass tasks for multiple subagents)." }],
 					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
 					isError: true,
 				};
 			}
 
-			const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-			const maxDepth = getMaxDepth();
-			if (depth >= maxDepth) {
+			if (isSubagentProcess) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Maximum subagent depth (${maxDepth}) reached — refusing to nest further. Raise maxDepth in the settings (/subagent config maxDepth N) to allow deeper layers.`,
+							text: "Nested subagents are not supported.",
 						},
 					],
 					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
@@ -1119,6 +1013,72 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
 					isError: true,
+				};
+			}
+
+			// Multi-task path: one independent background subagent per task, no shared exploration.
+			if (assignments.length > 0) {
+				if (runningNow + assignments.length > maxSubagents) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `This spawn has ${assignments.length} task(s) but only ${maxSubagents - runningNow} of ${maxSubagents} subagent slots are free. Spawn fewer tasks or raise maxSubagents (/subagent config maxSubagents N).`,
+							},
+						],
+						details: { subagentId: "", output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
+						isError: true,
+					};
+				}
+				const opts2 = resolveSpawnOptions(ctx, {
+					model: params.model,
+					systemPrompt: params.systemPrompt,
+					cwd: params.cwd,
+					tools: params.tools,
+				});
+				const cfg2 = loadConfig();
+				const allowTmp2 = cfg2.allowTmp ?? true;
+				const lines: string[] = [];
+				for (const assignment of assignments) {
+					const record: SubagentRecord = {
+						id: newSubagentId(),
+						model: opts2.model,
+						systemPrompt: opts2.systemPrompt,
+						cwd: opts2.cwd,
+						tools: opts2.tools,
+						scope: normalizeScope(opts2.cwd, assignment.scope ?? cfg2.scope),
+						allowTmp: allowTmp2,
+						task: assignment.task,
+						status: "idle",
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+						lastOutput: "",
+						totalUsage: EMPTY_USAGE(),
+					};
+					saveRecord(record);
+					const bg = await startBackground(pi, ctx, record, assignment.task);
+					if (!bg.started) {
+						record.status = "error";
+						record.lastError = bg.error;
+						saveRecord(record);
+						lines.push(`- ${record.id} [error] failed to start: ${bg.error ?? "unknown error"}`);
+					} else {
+						lines.push(
+							`- ${record.id} [running]${record.scope ? ` · scope: ${record.scope.join(", ")}` : ""} · ${firstLine(assignment.task)}`,
+						);
+					}
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Spawned ${assignments.length} subagent(s) in the background; each will notify you when it finishes.\n` +
+								lines.join("\n") +
+								`\nSteer with subagent_send, inspect with subagent_result, forget with subagent_forget.`,
+						},
+					],
+					details: { subagentIds: lines.map((l) => l.slice(2, l.indexOf(" "))) } as unknown as SubagentDetails,
 				};
 			}
 
@@ -1193,6 +1153,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			}, childTaskBase(ctx, record.id));
+			await deliverQueuedMessages(pi, ctx, record);
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: result.error ?? "Subagent failed." }],
@@ -1230,168 +1191,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 
-	pi.registerTool({
-		name: "subagent_dispatch",
-		label: "Subagent Dispatch",
-		description:
-			"Dispatch implementation work asynchronously through a shared exploration session. Provide exploreScope and an array of task assignments, each with task and edit scope. With multiple assignments, one explorer investigates the scope in the background, then each task agent is forked from the explorer session so all task agents reuse its full context and provider cache. With exactly one task, the explorer is skipped and the task agent runs directly in the background.",
-		promptSnippet: "Explore once, then fork task agents from the shared exploration context",
-		promptGuidelines: [
-			"Use subagent_dispatch instead of manually spawning multiple agents when tasks share repository context.",
-			"Give subagent_dispatch one focused exploreScope and an array of independent { task, scope } assignments; it explores once and forks each task agent from that session.",
-			"Assign every subagent_dispatch task a narrow edit scope so the harness can block writes outside that task's files or directories.",
-			"subagent_dispatch is always asynchronous; rely on its automatic completion notifications or inspect results with subagent_result.",
-			"When subagent_dispatch has exactly one task, it uses the direct fast path and skips the exploration agent."
-		],
-		parameters: DispatchParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const exploreScope = params.exploreScope?.trim();
-			const assignments: TaskAssignment[] = (params.tasks ?? []).map((assignment) => ({
-				task: assignment.task.trim(),
-				scope: assignment.scope,
-			}));
-			const tasks = assignments.map((assignment) => assignment.task).filter(Boolean);
-			if (!exploreScope) {
-				return {
-					content: [{ type: "text", text: "Error: exploreScope is required." }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-			if (tasks.length === 0) {
-				return {
-					content: [{ type: "text", text: "Error: tasks must contain at least one non-empty task." }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-			const missingScope = assignments.find((assignment) => !hasEditScope(assignment.scope));
-			if (missingScope) {
-				return {
-					content: [{ type: "text", text: "Error: every task must include a non-empty edit scope." }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-			const maxDepth = getMaxDepth();
-			if (depth >= maxDepth) {
-				return {
-					content: [{ type: "text", text: `Maximum subagent depth (${maxDepth}) reached — refusing to dispatch.` }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const maxSubagents = getMaxSubagents();
-			if (tasks.length > maxSubagents) {
-				return {
-					content: [{ type: "text", text: `This dispatch has ${tasks.length} tasks, but maxSubagents is ${maxSubagents}. Split the tasks into smaller dispatches or raise the limit.` }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-			if (countRunningSubagents() >= maxSubagents) {
-				return {
-					content: [{ type: "text", text: `Maximum concurrent subagents reached (${countRunningSubagents()}/${maxSubagents}). Wait for an agent to finish before dispatching.` }],
-					details: dispatchDetails("", undefined, [], "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const dispatchId = newSubagentId();
-			const commonParams = {
-				model: params.model,
-				systemPrompt: params.systemPrompt,
-				cwd: params.cwd,
-				tools: params.tools,
-			};
-			// One task does not need a shared exploration pass.
-			if (tasks.length === 1) {
-				const record = createSubagentRecord(ctx, { ...commonParams, scope: assignments[0].scope }, "task", tasks[0]);
-				saveRecord(record);
-				const started = await startBackground(pi, ctx, record, tasks[0]);
-				if (!started.started) {
-					record.status = "error";
-					record.lastError = started.error;
-					saveRecord(record);
-					return {
-						content: [{ type: "text", text: started.error ?? "Failed to start task agent." }],
-						details: dispatchDetails(dispatchId, undefined, [record.id], "error") as unknown as SubagentDetails,
-						isError: true,
-					};
-				}
-				return {
-					content: [{ type: "text", text: `Single-task fast path: spawned ${record.id} in the background. No explorer was created.` }],
-					details: dispatchDetails(dispatchId, undefined, [record.id], "running") as unknown as SubagentDetails,
-				};
-			}
-
-			const explorer = createSubagentRecord(
-				ctx,
-				commonParams,
-				"explorer",
-				buildExplorerPrompt(exploreScope, tasks),
-			);
-			const taskRecords = assignments.map((assignment) =>
-				createSubagentRecord(ctx, { ...commonParams, scope: assignment.scope }, "task", assignment.task, explorer.id),
-			);
-			saveRecord(explorer);
-			for (const record of taskRecords) saveRecord(record);
-			const taskIds = taskRecords.map((record) => record.id);
-			const explorerTask = explorer.task!;
-			const launchTasks = async () => {
-				if (explorer.status === "error") return;
-				const sourcePath = sessionFileForRecord(explorer);
-				for (const record of taskRecords) {
-					const started = await startBackground(
-						pi,
-						ctx,
-						record,
-						buildTaskPrompt(record.task!),
-						sourcePath,
-					);
-					if (!started.started) {
-						record.status = "error";
-						record.lastError = started.error;
-						saveRecord(record);
-						try {
-							pi.sendUserMessage(`[subagent dispatch ${dispatchId}] Could not start task ${record.id}: ${started.error ?? "unknown error"}`, { deliverAs: "steer" });
-						} catch {
-
-						}
-					}
-				}
-			};
-
-			const started = await startBackground(pi, ctx, explorer, explorerTask, undefined, launchTasks);
-			if (!started.started) {
-				explorer.status = "error";
-				explorer.lastError = started.error;
-				saveRecord(explorer);
-				return {
-					content: [{ type: "text", text: started.error ?? "Failed to start exploration agent." }],
-					details: dispatchDetails(dispatchId, explorer.id, taskIds, "error") as unknown as SubagentDetails,
-					isError: true,
-				};
-			}
-			return {
-				content: [{ type: "text", text: `Dispatch ${dispatchId} started: explorer ${explorer.id} will inspect the scope in the background, then ${taskRecords.length} task agent(s) will be forked from its session. Tasks: ${taskIds.join(", ")}` }],
-				details: dispatchDetails(dispatchId, explorer.id, taskIds, "running") as unknown as SubagentDetails,
-			};
-		},
-	});
 
 	pi.registerTool({
 		name: "subagent_send",
 		label: "Subagent Send",
 		description:
-			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: it returns immediately, the subagent runs the steering turn in the background, and the complete result auto-bubbles when it finishes. Only works when the subagent is not currently running.",
+			"Push a follow-up message to a spawned subagent (subagentId from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: if the subagent is idle/error it starts a background steering turn immediately; if it is currently running, the message is queued and delivered as its next turn when the current run finishes. The complete result auto-bubbles when it finishes.",
 		promptSnippet: "Send a steering message to a subagent",
 		promptGuidelines: [
 			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_send (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
-			"subagent_send is async — it returns immediately and the complete completion message auto-bubbles; keep working while it runs.",
+			"subagent_send is async — it returns immediately; if the subagent is running, the message is queued for its next turn, otherwise a background turn starts now. The completion message auto-bubbles; keep working while it runs.",
 		],
 		parameters: SendParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1412,18 +1221,18 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			if (record.status === "running" || record.status === "planned") {
+			if (record.status === "running") {
+				record.pendingMessages = [...(record.pendingMessages ?? []), message];
+				saveRecord(record);
 				return {
 					content: [
 						{
 							type: "text",
 							text:
-								record.status === "planned"
-									? `Subagent ${params.subagentId} is queued behind its shared exploration agent. Wait until it starts before steering it.`
-									: `Subagent ${params.subagentId} is currently running. Wait until it finishes, then send the steering message.`,
+								`Subagent ${params.subagentId} is currently running — message queued. It will be delivered as the subagent's next turn when the current run finishes (with its full session context).`,
 						},
 					],
-					details: { subagentId: params.subagentId, output: "", status: record.status, usage: record.totalUsage } as SubagentDetails,
+					details: { subagentId: params.subagentId, output: "", status: "running", usage: record.totalUsage } as SubagentDetails,
 				};
 			}
 
@@ -1485,7 +1294,7 @@ export default function (pi: ExtensionAPI) {
 			const out: string[] = [];
 			const runningNow = records.filter((r) => r.status === "running").length;
 			const maxSubagents = getMaxSubagents();
-			out.push(`Running: ${runningNow}/${maxSubagents} subagents · total spawned: ${records.length} · maxDepth: ${getMaxDepth()} layers`);
+			out.push(`Running: ${runningNow}/${maxSubagents} subagents · total spawned: ${records.length}`);
 			if (records.length === 0) {
 				out.push("No subagents spawned yet. Use subagent_spawn to delegate work.");
 			} else {
@@ -1493,8 +1302,8 @@ export default function (pi: ExtensionAPI) {
 				for (const rec of records) {
 					const usage = formatUsage(rec.totalUsage, rec.model);
 					out.push(
-						`- ${rec.id} [${rec.status}] · role: ${rec.role ?? "task"} · model: ${rec.model ?? "session"} · created: ${new Date(rec.createdAt).toLocaleString()}` +
-							(rec.parentSubagentId ? `\n  parent/explorer: ${rec.parentSubagentId}` : "") +
+						`- ${rec.id} [${rec.status}] · model: ${rec.model ?? "session"} · created: ${new Date(rec.createdAt).toLocaleString()}` +
+							(rec.pendingMessages?.length ? `\n  queued messages: ${rec.pendingMessages.length}` : "") +
 							`\n  last output: ${firstLine(rec.lastOutput).slice(0, 120) || "(none)"}` +
 							(usage ? `\n  usage: ${usage}` : ""),
 					);
@@ -1611,7 +1420,6 @@ export default function (pi: ExtensionAPI) {
 			const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const runningNow = countRunningSubagents();
 			const maxSubagents = getMaxSubagents();
-			const maxDepth = getMaxDepth();
 			const out: string[] = [];
 			out.push(`Config file: ${configFile()}`);
 			out.push(`User-configured model: ${cfg.model ?? "(not set — inherits session model)"}`);
@@ -1621,12 +1429,11 @@ export default function (pi: ExtensionAPI) {
 			out.push(`Working directory: ${cfg.cwd ?? "(current directory)"}`);
 			out.push(`Tool allowlist: ${cfg.tools ?? "(all tools)"}`);
 			out.push(`Subagents running: ${runningNow}/${maxSubagents} (maxSubagents)`);
-			out.push(`Nesting layers allowed: ${maxDepth} (maxDepth — 1 = no sub-subagents)`);
 			out.push(
 				`Default edit scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none — full access)"}`,
 			);
 			out.push(`Allow temp writes: ${cfg.allowTmp === false ? "no" : "yes"}`);
-			out.push("Set the model with `/subagent model <provider/id>`; set limits with `/subagent config maxDepth N` / `/subagent config maxSubagents N`.");
+			out.push("Set the model with `/subagent model <provider/id>`; set the limit with `/subagent config maxSubagents N`.");
 			return {
 				content: [{ type: "text", text: out.join("\n") }],
 				details: {
@@ -1635,7 +1442,6 @@ export default function (pi: ExtensionAPI) {
 					effectiveModel: cfg.model ?? sessionModel,
 					runningSubagents: runningNow,
 					maxSubagents,
-					maxDepth,
 					defaultScope: cfg.scope,
 					allowTmp: cfg.allowTmp !== false,
 				},
@@ -1683,7 +1489,7 @@ export default function (pi: ExtensionAPI) {
 			if (first === "config") {
 				const cfg = loadConfig();
 				const key = parts[1];
-				if (key === "maxDepth" || key === "maxSubagents") {
+				if (key === "maxSubagents") {
 					const val = Number(parts[2]);
 					if (!Number.isFinite(val) || val < 1) {
 						ctx.ui.notify(`Usage: /subagent config ${key} <positive integer>`, "info");
@@ -1718,7 +1524,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (key) {
 					ctx.ui.notify(
-						"Usage: /subagent config [maxDepth <n> | maxSubagents <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
+						"Usage: /subagent config [maxSubagents <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
 						"info",
 					);
 					return;
@@ -1796,11 +1602,14 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (rec.status === "running") {
-					ctx.ui.notify(`Subagent ${id} is still running — wait for its completion notification.`, "warning");
+					rec.pendingMessages = [...(rec.pendingMessages ?? []), message];
+					saveRecord(rec);
+					ctx.ui.notify(`Subagent ${id} is running — message queued; it will run as its next turn when the current run finishes.`, "info");
 					return;
 				}
 				if (ctx.hasUI) ctx.ui.setStatus("subagent", `sending to ${id}...`);
 				const result = await runAndRecord(rec, message, ctx.signal, undefined, undefined, childTaskBase(ctx, rec.id));
+				await deliverQueuedMessages(pi, ctx, rec);
 				if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
 				if (!result.ok) {
 					ctx.ui.notify(result.error ?? "Failed", "error");
@@ -1835,6 +1644,7 @@ export default function (pi: ExtensionAPI) {
 			saveRecord(record);
 			if (ctx.hasUI) ctx.ui.setStatus("subagent", "spawning subagent...");
 			const result = await runAndRecord(record, task, ctx.signal, undefined, undefined, childTaskBase(ctx, record.id));
+			await deliverQueuedMessages(pi, ctx, record);
 			if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
 			if (!result.ok) {
 				ctx.ui.notify(result.error ?? "Subagent failed", "error");
@@ -1867,9 +1677,9 @@ function sessionModelLabel(ctx: ExtensionCommandContext): string | undefined {
 /**
  * Open pi's built-in model selector (the same UI /model uses) as a component.
  * The session's real ModelRuntime is reached through the ModelRegistry facade
- * so extension-registered providers are listed too; the built-in component's
- * default-model write is stubbed out because this picks the subagent model,
- * not pi's session default.
+ * so extension-registered providers are listed too. No onSelectAsDefault
+ * callback is passed, so Ctrl+S (set as pi's session default) is unavailable —
+ * this picks the subagent model, not pi's session default.
  */
 function makeModelSelector(
 	ctx: ExtensionCommandContext,
@@ -1884,7 +1694,6 @@ function makeModelSelector(
 	return new ModelSelectorComponent(
 		tui,
 		currentModel,
-		{ setDefaultModelAndProvider: () => {} } as unknown as SettingsManager,
 		runtime,
 		ctx.scopedModels,
 		(model) => onDone(`${model.provider}/${model.id}`),
@@ -1915,7 +1724,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 		ctx.ui.notify(
 			`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
-				`maxDepth (layers): ${getMaxDepth()} · maxSubagents: ${getMaxSubagents()} (running ${countRunningSubagents()})\n` +
+				`maxSubagents: ${getMaxSubagents()} (running ${countRunningSubagents()})\n` +
 				`scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none)"} · allowTmp: ${cfg.allowTmp === false ? "no" : "yes"}\n` +
 				`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
 				`file: ${configFile()}`,
@@ -1931,8 +1740,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		let savedAt = 0;
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 		const effectiveModel = draft.model ?? sessionModel ?? "(none)";
-		const rowValue = (id: string) =>
-			id === "maxDepth" ? String(draft.maxDepth ?? getMaxDepth()) : String(draft.maxSubagents ?? getMaxSubagents());
+		const rowValue = (id: string) => String(draft.maxSubagents ?? getMaxSubagents());
 
 
 		const items: Array<{
@@ -1950,15 +1758,9 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				currentValue: effectiveModel,
 			},
 			{
-				id: "maxDepth",
-				label: "Nesting layers",
-				description: "How many subagent generations deep nesting may go (1 = no sub-subagents). Type a number directly to set it.",
-				currentValue: String(getMaxDepth()),
-			},
-			{
 				id: "maxSubagents",
 				label: "Concurrent subagents",
-				description: "Maximum subagents running at once, across all layers. Type a number directly to set it.",
+				description: "Maximum subagents running at once. Type a number directly to set it.",
 				currentValue: String(getMaxSubagents()),
 			},
 			{
@@ -1996,7 +1798,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				selectDone(label ?? undefined);
 			}) as unknown as Component;
 
-		const numericIds = new Set(["maxDepth", "maxSubagents"]);
+		const numericIds = new Set(["maxSubagents"]);
 		let selectedRowIndex = 0;
 		let digitInput = "";
 
@@ -2006,8 +1808,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			const id = items[selectedRowIndex].id;
 			const n = Number(digitInput);
 			if (numericIds.has(id) && Number.isInteger(n) && n >= 1) {
-				if (id === "maxDepth") draft.maxDepth = n;
-				else draft.maxSubagents = n;
+				draft.maxSubagents = n;
 				dirty = true;
 			}
 			digitInput = "";
