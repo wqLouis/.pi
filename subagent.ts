@@ -372,6 +372,49 @@ function readTranscript(id: string): string {
 }
 
 
+/**
+ * Build a shared context-prefill block from file paths. The block is identical
+ * for every subagent spawned by the same call, so their conversation prefixes
+ * (system prompt + this block) match exactly and provider prompt caches hit
+ * across the batch — the subagents don't each have to issue their own reads.
+ */
+const PREFILL_MAX_FILE_CHARS = 100_000;
+const PREFILL_MAX_TOTAL_CHARS = 400_000;
+
+function buildPrefillBlock(paths: string[] | undefined, cwd: string): string | undefined {
+	if (!paths || paths.length === 0) return undefined;
+	const parts: string[] = [];
+	let total = 0;
+	for (const p of paths) {
+		const abs = path.resolve(cwd, p);
+		let entry: string;
+		try {
+			const stat = fs.statSync(abs);
+			if (!stat.isFile()) throw new Error("not a regular file");
+			let content = fs.readFileSync(abs, "utf-8");
+			if (content.length > PREFILL_MAX_FILE_CHARS) {
+				content = content.slice(0, PREFILL_MAX_FILE_CHARS) + "\n… [truncated]";
+			}
+			entry = `<file path="${abs}">\n${content}\n</file>`;
+		} catch (error) {
+			entry = `<file path="${abs}">[could not be read: ${error instanceof Error ? error.message : String(error)}]</file>`;
+		}
+		if (total + entry.length > PREFILL_MAX_TOTAL_CHARS) {
+			parts.push(`<file path="${abs}">[skipped: prefill size limit reached]</file>`);
+			continue;
+		}
+		total += entry.length;
+		parts.push(entry);
+	}
+	return [
+		"<shared-context-prefill>",
+		"The files below were read once by the main agent before you were spawned and are injected here verbatim, identical for every subagent spawned in this batch. Treat them as current as of spawn time; re-read a file only if you need fresher content or it was truncated/skipped.",
+		"",
+		...parts,
+		"</shared-context-prefill>",
+	].join("\n");
+}
+
 async function writePromptToTempFile(prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const filePath = path.join(tmpDir, "system-prompt.md");
@@ -791,6 +834,15 @@ const SpawnParams = Type.Object({
 			{ minItems: 1 },
 		),
 	),
+	prefillReads: Type.Optional(
+		Type.Array(
+			Type.String({
+				description:
+					"File paths to read once now and inject verbatim into every spawned subagent's context (before the task), so subagents don't each issue their own reads. The identical prefix maximizes provider prompt-cache hits across parallel subagents.",
+			}),
+			{ minItems: 1 },
+		),
+	),
 	systemPrompt: Type.Optional(Type.String({ description: "Override the subagent system prompt (advanced)" })),
 	model: Type.Optional(
 		Type.String({
@@ -967,6 +1019,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Spawn isolated subagent(s) to delegate work to",
 		promptGuidelines: [
 			"Pass tasks (array of { task, scope? }) to run several independent subagents in parallel; each runs in the background with automatic completion notifications.",
+			"When multiple subagents need the same files, pass prefillReads (file paths): the files are read once and injected verbatim, identically, into every spawned subagent's context before the task — the subagents share that prompt-cache prefix instead of each issuing their own reads (better cache hits, fewer read calls).",
 			"Use a single task with await: false for background work, or await: true (default) to block until it finishes.",
 			"Give each task a narrow edit scope so the harness can block writes outside those files or directories — use this to keep parallel subagents from colliding on the same files.",
 			"Use subagent_send to steer a subagent — it continues with its full previous context; messages sent while it is running are queued and delivered as its next turn.",
@@ -1038,6 +1091,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				const cfg2 = loadConfig();
 				const allowTmp2 = cfg2.allowTmp ?? true;
+				const prefillBlock = buildPrefillBlock(params.prefillReads, opts2.cwd);
 				const lines: string[] = [];
 				for (const assignment of assignments) {
 					const record: SubagentRecord = {
@@ -1056,7 +1110,8 @@ export default function (pi: ExtensionAPI) {
 						totalUsage: EMPTY_USAGE(),
 					};
 					saveRecord(record);
-					const bg = await startBackground(pi, ctx, record, assignment.task);
+					const userText = prefillBlock ? `${prefillBlock}\n\n${assignment.task}` : assignment.task;
+					const bg = await startBackground(pi, ctx, record, userText);
 					if (!bg.started) {
 						record.status = "error";
 						record.lastError = bg.error;
@@ -1091,6 +1146,7 @@ export default function (pi: ExtensionAPI) {
 			const cfg = loadConfig();
 			const scope = normalizeScope(opts.cwd, params.scope ?? cfg.scope);
 			const allowTmp = cfg.allowTmp ?? true;
+			const prefillBlock = buildPrefillBlock(params.prefillReads, opts.cwd);
 
 			const record: SubagentRecord = {
 				id: newSubagentId(),
@@ -1108,8 +1164,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			saveRecord(record);
 
+			const userText = prefillBlock ? `${prefillBlock}\n\n${task}` : task;
 			if (params.await === false) {
-				const bg = await startBackground(pi, ctx, record, task);
+				const bg = await startBackground(pi, ctx, record, userText);
 				if (!bg.started) {
 					record.status = "error";
 					saveRecord(record);
@@ -1145,7 +1202,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await runAndRecord(record, task, signal, onUpdate, (bubble) => {
+			const result = await runAndRecord(record, userText, signal, onUpdate, (bubble) => {
 				if (ctx.hasUI) {
 					ctx.ui.notify(
 						`[subagent ${record.id} ${bubble.request ? "request" : "message"}] ${firstLine(bubble.text).slice(0, PREVIEW_CHARS)}`,
