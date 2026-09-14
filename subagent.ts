@@ -17,7 +17,16 @@ import {
 	withFileMutationQueue,
 	DynamicBorder,
 } from "@earendil-works/pi-coding-agent";
-import { Container, matchesKey, SettingsList, Text, type Component, type TUI } from "@earendil-works/pi-tui";
+import {
+	Container,
+	matchesKey,
+	SettingsList,
+	Text,
+	truncateToWidth,
+	wrapTextWithAnsi,
+	type Component,
+	type TUI,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DEFAULT_MAX_SUBAGENTS = 4;
@@ -25,6 +34,8 @@ const MAX_ERROR_CHARS = 500;
 const PREVIEW_CHARS = 200;
 const DETAIL_CHARS = 300;
 const KILL_GRACE_MS = 5000;
+const RESUME_WAIT_MS = 3000;
+const DEFAULT_MAX_AUTO_RESUMES = 3;
 const FLUSH_DELAY_MS = 50;
 const SESSION_START_FLUSH_DELAY_MS = 200;
 const FLUSH_INTERVAL_MS = 30_000;
@@ -100,6 +111,15 @@ interface SubagentRecord {
 	status: SubagentStatus;
 	pid?: number;
 
+	/** Main session file that owns this subagent, so it can be found and resumed across sessions. */
+	mainSessionFile?: string;
+	/** Set while the run was intentionally stopped by a session switch/quit; suppresses finalize/notify so it stays resumable. */
+	suspended?: boolean;
+	/** Number of automatic resumes performed after interruptions (bounds retry loops). */
+	resumeCount?: number;
+	/** The userText of the turn currently in flight (diagnostics and resume fallback). */
+	activeTask?: string;
+
 	lastError?: string;
 
 	donePushedAt?: number;
@@ -124,6 +144,10 @@ interface SubagentConfig {
 	tools?: string;
 
 	maxSubagents?: number;
+	/** Automatically resume interrupted subagents when a session is resumed/reloaded. Default true. */
+	autoResume?: boolean;
+	/** Maximum automatic resumes per subagent before it is marked as errored. Default 3. */
+	maxAutoResumes?: number;
 
 	scope?: string | string[];
 
@@ -133,6 +157,7 @@ interface SubagentConfig {
 interface RunningEntry {
 	proc: ChildProcess;
 	done: Promise<RunResult>;
+	rec: SubagentRecord;
 }
 
 const EMPTY_USAGE = (): RunUsage => ({
@@ -243,6 +268,17 @@ function getMaxSubagents(): number {
 	return DEFAULT_MAX_SUBAGENTS;
 }
 
+function getAutoResume(): boolean {
+	return loadConfig().autoResume !== false;
+}
+
+function getMaxAutoResumes(): number {
+	const cfg = loadConfig();
+	if (typeof cfg.maxAutoResumes === "number" && Number.isFinite(cfg.maxAutoResumes) && cfg.maxAutoResumes >= 0)
+		return Math.floor(cfg.maxAutoResumes);
+	return DEFAULT_MAX_AUTO_RESUMES;
+}
+
 
 function countRunningSubagents(): number {
 	let count = 0;
@@ -252,12 +288,12 @@ function countRunningSubagents(): number {
 			try {
 				const rec = JSON.parse(fs.readFileSync(path.join(subagentDir(), file), "utf-8")) as SubagentRecord;
 				if (rec?.status !== "running") continue;
-				if (rec.pid != null) {
-					try {
-						process.kill(rec.pid, 0);
-					} catch {
-						continue;
-					}
+				// A run with no live pid (killed/quit/suspended) is not actually consuming a slot.
+				if (rec.suspended || rec.pid == null) continue;
+				try {
+					process.kill(rec.pid, 0);
+				} catch {
+					continue;
 				}
 				count++;
 			} catch {
@@ -288,6 +324,10 @@ function resolveSpawnOptions(
 
 
 let activeSubagentDir: string | undefined;
+/** Absolute path of the main session that owns the subagents in the active scope. */
+let currentMainSessionFile: string | undefined;
+/** True after this extension instance has been torn down; blocks late deferred work. */
+let extensionDisposed = false;
 
 function sessionScopeKey(ctx: ExtensionContext): string {
 	let sessionId = "session";
@@ -340,7 +380,54 @@ function loadRecord(id: string): SubagentRecord | undefined {
 
 function saveRecord(rec: SubagentRecord): void {
 	rec.updatedAt = Date.now();
+	if (!rec.sessionPath) rec.sessionPath = sessionFile(rec.id);
+	if (!rec.mainSessionFile && currentMainSessionFile) rec.mainSessionFile = currentMainSessionFile;
 	fs.writeFileSync(recordFile(rec.id), JSON.stringify(rec, null, 2), { encoding: "utf-8", mode: 0o600 });
+}
+
+function listRecords(): SubagentRecord[] {
+	const records: SubagentRecord[] = [];
+	try {
+		for (const file of fs.readdirSync(subagentDir())) {
+			if (!file.endsWith(".json")) continue;
+			const rec = loadRecord(file.slice(0, -5));
+			if (rec) records.push(rec);
+		}
+	} catch {
+
+	}
+	return records;
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+	if (!pid) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as { code?: string })?.code === "EPERM";
+	}
+}
+
+async function waitForPidExit(pid: number | undefined, timeoutMs: number): Promise<void> {
+	if (!pid) return;
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && isPidAlive(pid)) await sleep(50);
+	if (isPidAlive(pid)) {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+
+		}
+	}
+}
+
+function sessionFileOf(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionFile() ?? undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 
@@ -614,6 +701,8 @@ function finalizeRecord(rec: SubagentRecord, run: RunResult): { output: string; 
 	rec.status = isFailedRun(run) ? "error" : "idle";
 	rec.lastError = isFailedRun(run) ? (run.errorMessage || run.stderr || firstLine(output).slice(0, DETAIL_CHARS)) : undefined;
 	rec.pid = undefined;
+	rec.suspended = false;
+	rec.activeTask = undefined;
 	saveRecord(rec);
 	return { output, failed: isFailedRun(run) };
 }
@@ -629,6 +718,8 @@ async function runAndRecord(
 ): Promise<{ ok: boolean; error?: string; output: string; usage: RunUsage; bubbles: Array<{ text: string; request: boolean }> }> {
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	rec.status = "running";
+	rec.suspended = false;
+	rec.activeTask = userText;
 	saveRecord(rec);
 
 	const run = await runSubagentTurn(rec, userText, depth, signal, (text) => {
@@ -693,6 +784,7 @@ function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord
 
 
 function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	if (extensionDisposed) return;
 	try {
 		for (const file of fs.readdirSync(subagentDir())) {
 			if (!file.endsWith(".json")) continue;
@@ -707,6 +799,131 @@ function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): voi
 	}
 }
 
+
+function buildResumePrompt(rec: SubagentRecord): string {
+	const sessionPath = rec.sessionPath ?? sessionFileForRecord(rec);
+	let hasSession = false;
+	try {
+		hasSession = !!sessionPath && fs.existsSync(sessionPath);
+	} catch {
+
+	}
+	if (!hasSession && (rec.task || rec.activeTask)) {
+		return `[auto-resume] ${rec.task ?? rec.activeTask}`;
+	}
+	return (
+		"[auto-resume] The pi process was stopped before your previous turn finished, so you were interrupted. " +
+		"Your conversation context above is intact. Review it and continue the task from where you left off. " +
+		"Do not repeat work that is already complete. When finished, report your final result."
+	);
+}
+
+async function resumeInterrupted(api: ExtensionAPI, ctx: ExtensionContext, rec: SubagentRecord): Promise<boolean> {
+	rec.status = "running";
+	rec.suspended = false;
+	rec.resumeCount = (rec.resumeCount ?? 0) + 1;
+	rec.donePushedAt = undefined;
+	saveRecord(rec);
+	const started = await startBackground(api, ctx, rec, buildResumePrompt(rec));
+	if (!started.started) {
+		rec.status = "error";
+		rec.pid = undefined;
+		rec.lastError = `Auto-resume failed: ${started.error ?? "unknown error"}`;
+		saveRecord(rec);
+		return false;
+	}
+	return true;
+}
+
+async function reconcileAndAutoResume(api: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	if (isSubagentProcess || !getAutoResume()) return;
+	const candidates = listRecords().filter((r) => r.status === "running");
+	if (candidates.length === 0) return;
+
+	const maxResumes = getMaxAutoResumes();
+	const maxConcurrent = getMaxSubagents();
+	let live = countRunningSubagents();
+	const resumed: string[] = [];
+	const skipped: string[] = [];
+
+	for (const rec of candidates) {
+		// A live pid means a previous pi process was hard-killed and left an orphan we
+		// cannot reattach to. Stop it, then resume from its persisted session file.
+		if (isPidAlive(rec.pid)) {
+			try {
+				process.kill(rec.pid!, "SIGTERM");
+			} catch {
+
+			}
+			await waitForPidExit(rec.pid, RESUME_WAIT_MS);
+		}
+		rec.pid = undefined;
+
+		if ((rec.resumeCount ?? 0) >= maxResumes) {
+			rec.status = "error";
+			rec.suspended = false;
+			rec.lastError = `Not auto-resumed: reached the auto-resume limit (${maxResumes}).`;
+			saveRecord(rec);
+			skipped.push(rec.id);
+			continue;
+		}
+		if (live >= maxConcurrent) {
+			skipped.push(rec.id);
+			continue;
+		}
+		if (await resumeInterrupted(api, ctx, rec)) {
+			live++;
+			resumed.push(rec.id);
+		} else {
+			skipped.push(rec.id);
+		}
+	}
+
+	if (resumed.length > 0) {
+		try {
+			ctx.ui.notify(`Auto-resumed ${resumed.length} interrupted subagent(s) after session resume.`, "info");
+		} catch {
+
+		}
+		try {
+			api.sendMessage(
+				{
+					customType: "subagent-resume",
+					content:
+						`[subagents] Auto-resumed ${resumed.length} interrupted subagent(s) after session resume: ${resumed.join(", ")}.` +
+						(skipped.length ? ` Not resumed (resume limit or concurrency): ${skipped.join(", ")}.` : ""),
+					display: true,
+				},
+				{ deliverAs: "followUp", triggerTurn: false },
+			);
+		} catch {
+
+		}
+	} else if (skipped.length > 0) {
+		try {
+			ctx.ui.notify(`Found ${skipped.length} interrupted subagent(s) but did not resume them (limit or concurrency).`, "warning");
+		} catch {
+
+		}
+	}
+}
+
+/** Stop every in-flight child process without finalizing it, so it can be resumed later. */
+function suspendAllRunning(): void {
+	for (const entry of running.values()) {
+		// Mutate the same record object the completion handler closes over, so its
+		// suspended check sees the flag and skips finalize/notify.
+		entry.rec.suspended = true;
+		entry.rec.pid = undefined;
+		saveRecord(entry.rec);
+		try {
+			entry.proc.kill("SIGTERM");
+		} catch {
+
+		}
+	}
+	running.clear();
+}
 
 async function startBackground(
 	api: ExtensionAPI,
@@ -729,6 +946,8 @@ async function startBackground(
 	}
 
 	rec.status = "running";
+	rec.suspended = false;
+	rec.activeTask = userText;
 	saveRecord(rec);
 
 	let proc: ChildProcess;
@@ -772,10 +991,17 @@ async function startBackground(
 
 	rec.pid = proc.pid;
 	saveRecord(rec);
-	running.set(rec.id, { proc, done });
+	running.set(rec.id, { proc, done, rec });
 
 	done.then(async (run) => {
 		running.delete(rec.id);
+		if (rec.suspended) {
+			// Intentionally stopped (session switch/quit): keep it resumable rather
+			// than finalizing it as an error or a completion.
+			rec.pid = undefined;
+			saveRecord(rec);
+			return;
+		}
 		finalizeRecord(rec, run);
 		notifyDone(api, ctx, rec);
 		await deliverQueuedMessages(api, ctx, rec);
@@ -888,35 +1114,40 @@ const ConfigParams = Type.Object({});
 
 
 export default function (pi: ExtensionAPI) {
+	extensionDisposed = false;
 
 	pi.on("session_shutdown", () => {
-		for (const { proc } of running.values()) {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-
-			}
-		}
-		running.clear();
+		// A session replacement (switch/reload/new/fork) or a quit tears this extension
+		// instance down. Mark in-flight runs suspended so their close handlers don't
+		// finalize them, then stop the children. Interrupted runs are resumed by
+		// reconcileAndAutoResume on the next session_start.
+		extensionDisposed = true;
+		suspendAllRunning();
 	});
 
 
 	let lastFlushCtx: ExtensionContext | undefined;
 	const scheduleFlush = (ctx: ExtensionContext, delayMs: number) => {
 		lastFlushCtx = ctx;
-		setTimeout(() => flushPendingNotifications(pi, ctx), delayMs);
+		setTimeout(() => {
+			if (extensionDisposed) return;
+			flushPendingNotifications(pi, ctx);
+		}, delayMs);
 	};
-	pi.on("session_start", (_event, ctx) => {
-		const scopedDir = process.env.PI_SUBAGENT_DIR
+	pi.on("session_start", async (_event, ctx) => {
+		activeSubagentDir = process.env.PI_SUBAGENT_DIR
 			? path.resolve(process.env.PI_SUBAGENT_DIR)
 			: path.join(getAgentDir(), "subagents", sessionScopeKey(ctx));
-		activeSubagentDir = scopedDir;
-		fs.mkdirSync(scopedDir, { recursive: true });
+		currentMainSessionFile = sessionFileOf(ctx);
+		fs.mkdirSync(activeSubagentDir, { recursive: true });
 		scheduleFlush(ctx, SESSION_START_FLUSH_DELAY_MS);
+		if (!isSubagentProcess) {
+			await reconcileAndAutoResume(pi, ctx);
+		}
 	});
 	pi.on("agent_end", (_event, ctx) => scheduleFlush(ctx, FLUSH_DELAY_MS));
 	const flushTimer = setInterval(() => {
-		if (!lastFlushCtx) return;
+		if (!lastFlushCtx || extensionDisposed) return;
 		try {
 			flushPendingNotifications(pi, lastFlushCtx);
 		} catch {
@@ -1490,6 +1721,7 @@ export default function (pi: ExtensionAPI) {
 				`Default edit scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none — full access)"}`,
 			);
 			out.push(`Allow temp writes: ${cfg.allowTmp === false ? "no" : "yes"}`);
+			out.push(`Auto-resume on session resume: ${cfg.autoResume === false ? "no" : "yes"} (limit ${getMaxAutoResumes()})`);
 			out.push("Set the model with `/subagent model <provider/id>`; set the limit with `/subagent config maxSubagents N`.");
 			return {
 				content: [{ type: "text", text: out.join("\n") }],
@@ -1509,7 +1741,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("subagent", {
 		description:
-			"Spawn or manage subagents: /subagent <task> | list | result <id> | send <id> <msg> | forget <id> | model [provider/id] | config",
+			"Spawn or manage subagents: /subagent <task> | list | result <id> | send <id> <msg> | switch <id> | forget <id> | model [provider/id] | config",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const first = parts[0];
@@ -1579,9 +1811,31 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`allowTmp set to ${cfg.allowTmp ? "yes" : "no"}.`, "info");
 					return;
 				}
+				if (key === "autoResume") {
+					const v = parts[2]?.toLowerCase();
+					if (v !== "yes" && v !== "no") {
+						ctx.ui.notify("Usage: /subagent config autoResume yes|no", "info");
+						return;
+					}
+					cfg.autoResume = v === "yes";
+					saveConfig(cfg);
+					ctx.ui.notify(`autoResume set to ${cfg.autoResume ? "yes" : "no"}.`, "info");
+					return;
+				}
+				if (key === "maxAutoResumes") {
+					const val = Number(parts[2]);
+					if (!Number.isFinite(val) || val < 0) {
+						ctx.ui.notify(`Usage: /subagent config ${key} <non-negative integer>`, "info");
+						return;
+					}
+					cfg.maxAutoResumes = Math.floor(val);
+					saveConfig(cfg);
+					ctx.ui.notify(`maxAutoResumes set to ${cfg.maxAutoResumes}.`, "info");
+					return;
+				}
 				if (key) {
 					ctx.ui.notify(
-						"Usage: /subagent config [maxSubagents <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
+						"Usage: /subagent config [maxSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
 						"info",
 					);
 					return;
@@ -1676,10 +1930,37 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (first === "switch" || first === "view") {
+				let id = parts[1];
+				if (!id) {
+					const records = listRecords().sort((a, b) => b.createdAt - a.createdAt);
+					if (records.length === 0) {
+						ctx.ui.notify("No subagents to view.", "info");
+						return;
+					}
+					if (!ctx.hasUI || ctx.mode !== "tui") {
+						ctx.ui.notify("Usage: /subagent switch <subagentId>", "info");
+						return;
+					}
+					const labels = records.map(
+						(r) => `${r.id} [${r.status}] ${firstLine(r.lastOutput).slice(0, 60) || "(no output)"}`,
+					);
+					const choice = await ctx.ui.select("View subagent:", labels);
+					if (!choice) return;
+					id = choice.split(" ")[0];
+				}
+				if (!loadRecord(id)) {
+					ctx.ui.notify(`Unknown subagent "${id}".`, "error");
+					return;
+				}
+				await showSubagentViewer(ctx, id);
+				return;
+			}
+
 
 			if (!first) {
 				ctx.ui.notify(
-					"Usage: /subagent <task> | list | result <id> | send <id> <msg> | forget <id> | model [provider/id] | config",
+					"Usage: /subagent <task> | list | result <id> | send <id> <msg> | switch <id> | forget <id> | model [provider/id] | config",
 					"info",
 				);
 				return;
@@ -1774,6 +2055,163 @@ async function showModelPicker(
 }
 
 
+/**
+ * Read-only live viewer for a subagent's private session.
+ *
+ * It only READS the subagent's transcript file and record — it never switches the
+ * session, never writes the session file, and never signals the subagent. The main
+ * agent and every subagent keep running completely unaffected while the user watches.
+ */
+async function showSubagentViewer(ctx: ExtensionCommandContext, id: string): Promise<void> {
+	if (!ctx.hasUI || ctx.mode !== "tui") {
+		const rec = loadRecord(id);
+		const transcript = (readTranscript(id) || rec?.lastOutput || "(no transcript yet)").trim();
+		ctx.ui.notify(transcript.slice(-2000), "info");
+		return;
+	}
+
+	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+		let body: string[] = [];
+		let wrappedWidth = 0;
+		let offset = 0;
+		let follow = true;
+		let dirty = true;
+		let lastSig = "";
+		let header = "";
+		let subHeader = "";
+
+		const transcriptFile = (): string | undefined => {
+			const rec = loadRecord(id);
+			return rec ? rec.sessionPath ?? sessionFileForRecord(rec) : undefined;
+		};
+
+		const statSig = (file: string | undefined): string => {
+			if (!file) return "-";
+			try {
+				const st = fs.statSync(file);
+				return `${st.size}:${st.mtimeMs}`;
+			} catch {
+				return "0";
+			}
+		};
+
+		// Watch both the transcript and the record so status/usage updates show up too.
+		const signature = (): string => `${statSig(transcriptFile())}|${statSig(recordFile(id))}`;
+
+		const rebuild = (width: number): void => {
+			const rec = loadRecord(id);
+			header =
+				theme.fg("accent", theme.bold(` subagent ${id} `)) +
+				theme.fg(rec?.status === "error" ? "error" : "dim", ` [${rec?.status ?? "unknown"}] ${rec?.model ?? "session model"}`);
+			const usage = rec ? formatUsage(rec.totalUsage) : "";
+			const preview = firstLine(rec?.lastOutput ?? "").slice(0, 140);
+			subHeader = theme.fg("dim", `${usage}${usage && preview ? " · " : ""}${preview}`);
+
+			const lines: string[] = [];
+			const file = rec ? rec.sessionPath ?? sessionFileForRecord(rec) : undefined;
+			let raw = "";
+			try {
+				raw = file ? fs.readFileSync(file, "utf-8") : "";
+			} catch {
+
+			}
+			for (const line of raw.split("\n")) {
+				if (!line.trim()) continue;
+				let entry: { type?: string; message?: { role?: string; content?: unknown; toolName?: string } };
+				try {
+					entry = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				if (entry.type !== "message" || !entry.message) continue;
+				const msg = entry.message;
+				const text = extractText(msg.content).trim();
+				if (msg.role === "user") {
+					lines.push(`${theme.fg("accent", "▌ you")}\n${text}`);
+				} else if (msg.role === "assistant") {
+					if (text) lines.push(`${theme.fg("success", "▌ assistant")}\n${text}`);
+				} else if (msg.role === "toolResult") {
+					const short = text.length > 400 ? `${text.slice(0, 400)}…` : text;
+					lines.push(theme.fg("dim", `  ⚙ ${msg.toolName ?? "tool"}: ${short}`));
+				}
+			}
+			if (lines.length === 0) lines.push(theme.fg("dim", "(no messages yet — the subagent is starting up)"));
+			const wrapped: string[] = [];
+			for (const block of lines) {
+				for (const l of wrapTextWithAnsi(block, Math.max(20, width - 1))) wrapped.push(l);
+			}
+			body = wrapped;
+			wrappedWidth = width;
+			dirty = false;
+		};
+
+		// Poll the transcript file for changes; only re-render when it actually grows.
+		const timer = setInterval(() => {
+			const sig = signature();
+			if (sig !== lastSig) {
+				lastSig = sig;
+				dirty = true;
+				tui.requestRender();
+			}
+		}, 600);
+
+		return {
+			render(width: number) {
+				if (width !== wrappedWidth || dirty) rebuild(width);
+				// Use ~70% of the terminal so the chat and pi's chrome stay visible.
+				const viewport = Math.max(8, Math.floor(tui.terminal.rows * 0.7));
+				const bodyHeight = Math.max(1, viewport - 3);
+				const maxOffset = Math.max(0, body.length - bodyHeight);
+				if (follow) offset = maxOffset;
+				else offset = Math.min(offset, maxOffset);
+				const slice = body.slice(offset, offset + bodyHeight);
+				while (slice.length < bodyHeight) slice.push("");
+				const range =
+					body.length === 0 ? "0/0" : `${offset + 1}-${Math.min(offset + bodyHeight, body.length)}/${body.length}`;
+				const footer = theme.fg(
+					"dim",
+					truncateToWidth(`↑/↓ scroll · PgUp/PgDn · End=follow · Esc close · ${range}${follow ? " (live)" : ""}`, width),
+				);
+				return [truncateToWidth(header, width), truncateToWidth(subHeader, width), ...slice, footer];
+			},
+			invalidate() {
+				wrappedWidth = 0;
+				dirty = true;
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, "escape") || matchesKey(data, "esc") || data === "q" || matchesKey(data, "ctrl+c")) {
+					done();
+					return;
+				}
+				const page = Math.max(1, Math.floor(tui.terminal.rows * 0.7) - 4);
+				if (matchesKey(data, "up")) {
+					offset = Math.max(0, offset - 1);
+					follow = false;
+				} else if (matchesKey(data, "down")) {
+					offset = Math.min(body.length, offset + 1);
+					follow = false;
+				} else if (matchesKey(data, "pageUp")) {
+					offset = Math.max(0, offset - page);
+					follow = false;
+				} else if (matchesKey(data, "pageDown")) {
+					offset = Math.min(body.length, offset + page);
+					follow = false;
+				} else if (matchesKey(data, "end")) {
+					follow = true;
+				} else if (matchesKey(data, "home")) {
+					offset = 0;
+					follow = false;
+				}
+				tui.requestRender();
+			},
+			dispose() {
+				clearInterval(timer);
+			},
+		};
+	});
+}
+
+
 async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") {
 
@@ -1783,6 +2221,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			`model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
 				`maxSubagents: ${getMaxSubagents()} (running ${countRunningSubagents()})\n` +
 				`scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none)"} · allowTmp: ${cfg.allowTmp === false ? "no" : "yes"}\n` +
+				`autoResume: ${cfg.autoResume === false ? "no" : "yes"} (limit ${getMaxAutoResumes()})\n` +
 				`cwd: ${cfg.cwd ?? "(inherit)"}\ntools: ${cfg.tools ?? "(all)"}\n` +
 				`file: ${configFile()}`,
 			"info",
@@ -1797,7 +2236,10 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		let savedAt = 0;
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 		const effectiveModel = draft.model ?? sessionModel ?? "(none)";
-		const rowValue = (id: string) => String(draft.maxSubagents ?? getMaxSubagents());
+		const rowValue = (id: string) => {
+			if (id === "maxAutoResumes") return String(draft.maxAutoResumes ?? getMaxAutoResumes());
+			return String(draft.maxSubagents ?? getMaxSubagents());
+		};
 
 
 		const items: Array<{
@@ -1842,6 +2284,19 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				currentValue: draft.allowTmp === false ? "no" : "yes",
 				values: ["yes", "no"],
 			},
+			{
+				id: "autoResume",
+				label: "Auto-resume subagents",
+				description: "Resume subagents interrupted by a quit or session switch when the session is resumed. Enter to toggle.",
+				currentValue: draft.autoResume === false ? "no" : "yes",
+				values: ["yes", "no"],
+			},
+			{
+				id: "maxAutoResumes",
+				label: "Auto-resume limit",
+				description: "Maximum automatic resumes per subagent before it is marked as errored. Type a number directly.",
+				currentValue: String(getMaxAutoResumes()),
+			},
 		];
 		items[0].submenu = (_cur, selectDone) =>
 			makeModelSelector(ctx, tui, "", draft.model ?? sessionModelLabel(ctx), (label) => {
@@ -1855,7 +2310,7 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 				selectDone(label ?? undefined);
 			}) as unknown as Component;
 
-		const numericIds = new Set(["maxSubagents"]);
+		const numericIds = new Set(["maxSubagents", "maxAutoResumes"]);
 		let selectedRowIndex = 0;
 		let digitInput = "";
 
@@ -1864,8 +2319,9 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 		const commitNumber = () => {
 			const id = items[selectedRowIndex].id;
 			const n = Number(digitInput);
-			if (numericIds.has(id) && Number.isInteger(n) && n >= 1) {
-				draft.maxSubagents = n;
+			if (numericIds.has(id) && Number.isInteger(n) && n >= (id === "maxAutoResumes" ? 0 : 1)) {
+				if (id === "maxAutoResumes") draft.maxAutoResumes = n;
+				else draft.maxSubagents = n;
 				dirty = true;
 			}
 			digitInput = "";
@@ -1881,6 +2337,11 @@ async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void>
 			(id, newValue) => {
 				if (id === "allowTmp") {
 					draft.allowTmp = newValue === "yes";
+					dirty = true;
+					updateFooter();
+					container.invalidate();
+				} else if (id === "autoResume") {
+					draft.autoResume = newValue === "yes";
 					dirty = true;
 					updateFooter();
 					container.invalidate();

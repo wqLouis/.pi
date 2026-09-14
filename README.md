@@ -90,7 +90,22 @@ Key behaviors:
   reloaded mid-run), a flusher re-delivers it at session start / turn end /
   every 30s.
 - **`/subagent` command** — manage direct subagents with `list`, `result <id>`, `send <id> <msg>`,
-  `forget <id>`, `model [provider/id]` (pi's built-in model selector), `config`.
+  `switch <id>` (read-only live viewer), `forget <id>`, `model [provider/id]` (pi's built-in
+  model selector), `config`.
+- **Session-based context + auto-resume** — each subagent's private pi session file is
+  the durable store of its context. Records are scoped to the owning main session and
+  record that session's file, so when the main session is resumed (`--continue`/`--resume`
+  or `/reload`) every subagent that was interrupted by a quit is **automatically resumed**
+  from its session file with a "continue where you left off" prompt. Bounded by
+  `maxAutoResumes` (default `3`); disable with `/subagent config autoResume no`. If pi was
+  hard-killed and left an orphan child, the live pid is detected, stopped, and replaced on
+  resume.
+- **Watch a subagent live (read-only)** — `/subagent switch [id]` (alias `/subagent view`)
+  opens a live, auto-refreshing view of that subagent's transcript and status in the TUI
+  (↑/↓, PgUp/PgDn scroll; End follows the tail; Esc closes). With no id it opens a picker.
+  It is purely observational: it only **reads** the subagent's transcript file and record,
+  so the main agent and every subagent — including the one you are watching — keep running
+  completely unaffected. Nothing is paused, stopped, or steered.
 
 ## 2. bash-timeout — no more hung commands
 
