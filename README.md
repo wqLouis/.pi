@@ -58,13 +58,13 @@ against that session, so steering truly continues its work with full history.
 | Tool | Purpose |
 |------|---------|
 | `subagent_dispatch { exploreScope, tasks: [{ task, scope }], ... }` | Always runs asynchronously: explore once, then fork scoped task agents from the shared exploration session; skips exploration for a single task |
-| `subagent_spawn { task, model?, cwd?, tools?, scope?, await? }` | Spawn one direct subagent. `await: false` returns immediately (background) |
-| `subagent_send { subagentId, message }` | Push a message / steer — **always async**: returns immediately, the complete completion auto-bubbles |
-| `subagent_list` | Running/finished subagents: id, model, usage, latest output |
-| `subagent_result { subagentId }` | Full transcript: task, steering messages, tool activity, outputs |
-| `subagent_forget { subagentId }` | Delete a subagent and its session |
+| `subagent_spawn { task, name, model?, cwd?, tools?, scope?, await? }` | Spawn one direct subagent (`await: false` = background). Or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent |
+| `subagent_send { name, message }` | Push a message / steer — **always async**: returns immediately, the complete completion auto-bubbles |
+| `subagent_list` | Running/finished subagents: name, model, usage, latest output |
+| `subagent_result { name }` | Full transcript: task, steering messages, tool activity, outputs |
+| `subagent_forget { name }` | Delete a subagent and its session |
 | `subagent_config` | Effective config: model, system prompt, cwd, tools |
-| `subagent_message` / `subagent_request` | Bubble-up tools (only inside subagents): send progress/requests to the main agent |
+| `subagent_message { message }` | Bubble-up tool (only inside subagents): send progress, findings, questions, or blockers to the main agent |
 
 Key behaviors:
 
@@ -84,6 +84,13 @@ Key behaviors:
   report how many subagents are running right now vs the `maxSubagents` limit,
   and the nesting depth; `subagent_spawn` refuses to exceed either limit with
   a clear reason.
+- **Named subagents** — every spawn requires a short, unique `name` (single `name` or `tasks[].name`); it is the only handle used by users and agents, in listings, completion notifications, and `subagent_send` / `subagent_result` / `subagent_forget` (exact name or unique prefix). The internal id is never shown and exists only for session-file management.
+- **Bubble channel** — `subagent_message` inside a child is
+  emitted as `{"type":"subagent_bubble",...}` JSON lines on the child's
+  **stderr**. Pi takes over `process.stdout` in non-interactive modes (`json`,
+  `print`, `rpc`) and redirects extension writes to stderr, so writes to stdout
+  never reach the parent. The parent parses both stdout and stderr; keep the
+  child bubble write on stderr.
 - **Auto-bubbled completions** — when a background subagent finishes, a **real
   user message** (`sendUserMessage`) auto-bubbles into the agent's final turn
   (and triggers one even when idle). If a push was missed (e.g. extension
