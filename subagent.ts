@@ -37,6 +37,11 @@ const SESSION_START_FLUSH_DELAY_MS = 200;
 const FLUSH_INTERVAL_MS = 30_000;
 const SETTINGS_MAX_VISIBLE = 10;
 
+/** Default model used for opencode-backed subagents (one of OpenCode's free models). */
+const DEFAULT_OPENCODE_MODEL = "opencode/big-pickle";
+/** Override with PI_OPENCODE_BIN when the opencode CLI is not on PATH. */
+const OPENCODE_BIN = process.env.PI_OPENCODE_BIN || "opencode";
+
 const DEFAULT_SUBAGENT_PROMPT = [
 	"You are a subagent working for a main agent. You run in an isolated context, so the main agent's conversation is not visible to you — only the task you receive and any follow-up instructions.",
 	"",
@@ -131,6 +136,13 @@ interface SubagentRecord {
 	cwd: string;
 	tools?: string;
 
+	/** Which runtime executes this subagent: the pi CLI (default) or the opencode CLI. */
+	backend?: "pi" | "opencode";
+	/** Persistent opencode ACP session id, so a later turn resumes the same conversation. */
+	opencodeSessionId?: string;
+	/** opencode turns started so far; the subagent preamble is injected on the first one only. */
+	opencodeTurns?: number;
+
 	scope?: string[];
 
 	allowTmp?: boolean;
@@ -167,6 +179,10 @@ interface SubagentDetails {
 
 interface SubagentConfig {
 	model?: string;
+	/** Default runtime for new subagents: the pi CLI (default) or the opencode CLI. */
+	backend?: "pi" | "opencode";
+	/** OpenCode model id used when the backend is opencode (default: a free model). */
+	opencodeModel?: string;
 	systemPrompt?: string;
 	cwd?: string;
 	tools?: string;
@@ -348,15 +364,82 @@ function countRunningSubagents(): number {
 }
 
 
+type SubagentBackend = "pi" | "opencode";
+
+/** Any model in the OpenCode CLI's namespace (free models and OpenCode Go). */
+function isOpencodeModel(model: string | undefined | null): boolean {
+	return !!model && /^opencode(-go)?\//.test(model);
+}
+
+/** Models that belong to the OpenCode CLI's own `opencode/` namespace. */
+function isOpencodeCliModel(model: string | undefined | null): boolean {
+	return !!model && /^opencode\//.test(model);
+}
+
+/**
+ * True when pi has its own provider entry for a model. This keeps models from
+ * pi's `opencode-go` provider (a paid subscription) on the pi backend instead of
+ * routing them through the OpenCode CLI.
+ */
+function modelKnownToPi(ctx: ExtensionContext | undefined, model: string | undefined): boolean {
+	if (!model || !model.includes("/")) return false;
+	try {
+		const [provider, ...rest] = model.split("/");
+		return !!ctx?.modelRegistry?.find(provider, rest.join("/"));
+	} catch {
+		return false;
+	}
+}
+
+/** The runtime a record uses, inferring it from the model for records written before backends existed. */
+function backendOf(rec: Pick<SubagentRecord, "backend" | "model">): SubagentBackend {
+	if (rec.backend) return rec.backend;
+	return isOpencodeCliModel(rec.model) ? "opencode" : "pi";
+}
+
+
 function resolveSpawnOptions(
 	ctx: ExtensionContext,
-	params: { model?: string; systemPrompt?: string; cwd?: string; tools?: string },
-): { model?: string; systemPrompt: string; cwd: string; tools?: string } {
+	params: { model?: string; systemPrompt?: string; cwd?: string; tools?: string; backend?: SubagentBackend },
+): { model?: string; backend: SubagentBackend; systemPrompt: string; cwd: string; tools?: string } {
 	const cfg = loadConfig();
 	const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	const systemPrompt = (params.systemPrompt ?? cfg.systemPrompt ?? "").trim();
+	// A model means the OpenCode CLI backend only when it lives in the opencode/
+	// namespace *and* pi has no provider entry for it (opencode-go/... is pi's own).
+	const opencodeCliModel = (m?: string) => isOpencodeCliModel(m) && !modelKnownToPi(ctx, m);
+
+	// Precedence: an explicit backend (param or config) wins; otherwise an
+	// opencode/-namespaced model selects the opencode backend; otherwise pi.
+	let backend: SubagentBackend;
+	let model: string | undefined;
+	const explicitBackend = params.backend ?? cfg.backend;
+	if (explicitBackend) {
+		backend = explicitBackend;
+		model =
+			params.model ??
+			(backend === "opencode"
+				? isOpencodeModel(cfg.model)
+					? cfg.model
+					: (cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL)
+				: (cfg.model ?? sessionModel));
+	} else if (opencodeCliModel(params.model)) {
+		backend = "opencode";
+		model = params.model;
+	} else if (params.model) {
+		backend = "pi";
+		model = params.model;
+	} else if (opencodeCliModel(cfg.model)) {
+		backend = "opencode";
+		model = cfg.model;
+	} else {
+		backend = "pi";
+		model = cfg.model ?? sessionModel;
+	}
+
 	return {
-		model: params.model ?? cfg.model ?? sessionModel,
+		model,
+		backend,
 		systemPrompt: systemPrompt || DEFAULT_SUBAGENT_PROMPT,
 		cwd: params.cwd ?? cfg.cwd ?? ctx.cwd,
 		tools: params.tools ?? cfg.tools,
@@ -930,6 +1013,360 @@ async function spawnSubagentProcess(
 }
 
 
+/**
+ * First-turn preamble for an opencode subagent. opencode keeps its own system
+ * prompt and the ACP protocol has no "append system prompt" hook, so the
+ * subagent framing, working directory, and edit scope are prepended to the
+ * first user message instead. Later turns reuse the same opencode session, so
+ * the preamble stays in its history and is not repeated.
+ */
+function buildOpencodeFirstPrompt(rec: SubagentRecord, userText: string): string {
+	const sections: string[] = [rec.systemPrompt];
+	const context: string[] = [`Working directory: ${rec.cwd}`];
+	if (rec.scope && rec.scope.length > 0) {
+		context.push(
+			`Edit scope: only create or modify files under ${rec.scope.join(", ")}. Reads are unrestricted. ` +
+				`If the task seems to require writing elsewhere, say so instead of doing it.`,
+		);
+	}
+	if (rec.tools) {
+		context.push(`Prefer these tools when possible: ${rec.tools}.`);
+	}
+	sections.push(`[subagent context]\n${context.join("\n")}`);
+	sections.push(userText);
+	return sections.filter((s) => s && s.trim()).join("\n\n");
+}
+
+
+/**
+ * Spawn a subagent backed by the OpenCode CLI (`opencode acp`), driven over the
+ * Agent Client Protocol (newline-delimited JSON-RPC on stdio).
+ *
+ * This is how pi can use OpenCode's models — including its free models that are
+ * rejected when called directly — because the model request originates inside
+ * the opencode process. opencode runs its own agent loop and tools; pi receives
+ * the final assistant text.
+ *
+ * The returned shape matches {@link spawnSubagentProcess} so the completion
+ * handler, budget checks, interrupt path, and notifications are shared:
+ *   - `control.sendCommand({ type: "abort" })` cancels the in-flight turn.
+ *   - `control.sendCommand({ type: "prompt", message })` starts the next turn on
+ *     the same opencode session (used by subagent_interrupt to steer in place).
+ *
+ * The opencode session id is persisted on the record so a later turn or an
+ * auto-resume loads the same conversation via `session/load`.
+ */
+async function spawnOpencodeProcess(
+	rec: SubagentRecord,
+	userText: string,
+	_depth: number,
+	signal: AbortSignal | undefined,
+	onUpdate?: (text: string) => void,
+	_onBubble?: (bubble: { text: string }) => void,
+	_taskBase?: string,
+): Promise<{ proc: ChildProcess; done: Promise<RunResult>; control: RpcControl }> {
+	const result: RunResult = {
+		exitCode: 0,
+		messages: [],
+		stderr: "",
+		usage: EMPTY_USAGE(),
+		bubbles: [],
+	};
+
+	let proc: ChildProcess | undefined;
+	let stdinClosed = false;
+	let seq = 0;
+	let sessionId: string | undefined;
+	let currentText = "";
+	let turnInFlight: Promise<unknown> | undefined;
+	const pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+
+	const write = (message: Record<string, unknown>) => {
+		try {
+			if (!stdinClosed && proc?.stdin?.writable) proc.stdin.write(`${JSON.stringify(message)}\n`);
+		} catch {
+
+		}
+	};
+	const notify = (method: string, params: Record<string, unknown>) => write({ jsonrpc: "2.0", method, params });
+	const request = (method: string, params: Record<string, unknown>) => {
+		const id = `oc-${++seq}`;
+		return new Promise<any>((resolve, reject) => {
+			pending.set(id, { resolve, reject });
+			write({ jsonrpc: "2.0", id, method, params });
+		});
+	};
+	const closeStdin = () => {
+		if (stdinClosed) return;
+		stdinClosed = true;
+		control.closed = true;
+		try {
+			proc?.stdin?.end();
+		} catch {
+
+		}
+	};
+
+	const finishTurn = (text: string, response: any) => {
+		result.usage.turns += 1;
+		const usage = response?.usage;
+		if (usage) {
+			result.usage.input += usage.inputTokens || 0;
+			result.usage.output += usage.outputTokens || 0;
+			result.usage.cacheRead += usage.cachedReadTokens || 0;
+			result.usage.contextTokens = usage.totalTokens || result.usage.contextTokens;
+		}
+		if (!result.model && rec.model) result.model = rec.model;
+		const stopReason = typeof response?.stopReason === "string" ? response.stopReason : undefined;
+		if (stopReason) result.stopReason = stopReason;
+		result.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: text || "(no output)" }],
+			model: rec.model,
+			stopReason,
+		} as unknown as Message);
+		if (onUpdate) onUpdate(text || "(working...)");
+		// A settle consumes one reserved continuation (an interrupt that aborted a
+		// turn and queued a follow-up); otherwise the process is done for this turn.
+		if (control.pendingContinuations > 0) control.pendingContinuations -= 1;
+		else closeStdin();
+	};
+
+	const startTurn = (message: string) => {
+		currentText = "";
+		const turn = request("session/prompt", { sessionId, prompt: [{ type: "text", text: message }] })
+			.then((response) => finishTurn(currentText, response))
+			.catch((error) => {
+				if (result.exitCode === 0) result.exitCode = 1;
+				result.errorMessage =
+					result.errorMessage || `opencode turn failed: ${error instanceof Error ? error.message : String(error)}`;
+				closeStdin();
+			});
+		turnInFlight = turn;
+		turn.finally(() => {
+			if (turnInFlight === turn) turnInFlight = undefined;
+		});
+		return turn;
+	};
+
+	const control: RpcControl = {
+		pendingContinuations: 0,
+		closed: false,
+		sendCommand: async (cmd) => {
+			try {
+				if (cmd.type === "abort") {
+					if (!sessionId || stdinClosed) return { success: false, error: "opencode session is not running" };
+					notify("session/cancel", { sessionId });
+					if (turnInFlight) {
+						try {
+							await turnInFlight;
+						} catch {
+
+						}
+					}
+					return { success: true };
+				}
+				if (cmd.type === "prompt") {
+					if (!sessionId || stdinClosed) return { success: false, error: "opencode session is not running" };
+					startTurn(String(cmd.message ?? ""));
+					return { success: true };
+				}
+				return { success: false, error: `unsupported command: ${String(cmd.type)}` };
+			} catch (error) {
+				return { success: false, error: error instanceof Error ? error.message : String(error) };
+			}
+		},
+	};
+
+	const handleUpdate = (update: any) => {
+		if (!update) return;
+		if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
+			const text = String(update.content.text ?? "");
+			if (text) {
+				currentText += text;
+				if (onUpdate) onUpdate(currentText);
+			}
+		}
+	};
+
+	const handleClientRequest = (message: any) => {
+		try {
+			switch (message.method) {
+				case "session/request_permission": {
+					const options: any[] = Array.isArray(message.params?.options) ? message.params.options : [];
+					const pick =
+						options.find((o) => o.kind === "allow_always") ?? options.find((o) => o.kind === "allow_once") ?? options[0];
+					write({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: pick
+							? { outcome: { outcome: "selected", optionId: pick.optionId } }
+							: { outcome: { outcome: "cancelled" } },
+					});
+					return;
+				}
+				case "fs/read_text_file": {
+					write({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: { content: fs.readFileSync(String(message.params?.path), "utf-8") },
+					});
+					return;
+				}
+				case "fs/write_text_file": {
+					fs.writeFileSync(String(message.params?.path), String(message.params?.content ?? ""));
+					write({ jsonrpc: "2.0", id: message.id, result: {} });
+					return;
+				}
+				case "elicitation/create": {
+					write({ jsonrpc: "2.0", id: message.id, result: { action: "cancel" } });
+					return;
+				}
+				default:
+					write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `unsupported client method: ${message.method}` } });
+			}
+		} catch (error) {
+			write({
+				jsonrpc: "2.0",
+				id: message.id,
+				error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+			});
+		}
+	};
+
+	const done = new Promise<RunResult>((resolve) => {
+		proc = spawn(OPENCODE_BIN, ["acp"], {
+			cwd: rec.cwd,
+			shell: false,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: { ...process.env },
+		});
+		let buffer = "";
+		let stderrBuffer = "";
+
+		const handleMessage = (message: any) => {
+			if (message.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
+				const entry = pending.get(message.id);
+				if (entry) {
+					pending.delete(message.id);
+					if (message.error) entry.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
+					else entry.resolve(message.result);
+				}
+				return;
+			}
+			if (message.method && message.id !== undefined) {
+				handleClientRequest(message);
+				return;
+			}
+			if (message.method === "session/update") handleUpdate(message.params?.update);
+		};
+
+		proc.stdout!.on("data", (data) => {
+			buffer += data.toString();
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				let message: any;
+				try {
+					message = JSON.parse(line);
+				} catch {
+					result.stderr += line + "\n";
+					continue;
+				}
+				handleMessage(message);
+			}
+		});
+		proc.stderr!.on("data", (data) => {
+			stderrBuffer += data.toString();
+			const lines = stderrBuffer.split("\n");
+			stderrBuffer = lines.pop() || "";
+			for (const line of lines) if (line.trim()) result.stderr += line + "\n";
+		});
+		proc.on("close", (code) => {
+			if (buffer.trim()) {
+				try {
+					handleMessage(JSON.parse(buffer));
+				} catch {
+
+				}
+			}
+			if (stderrBuffer.trim()) result.stderr += stderrBuffer + "\n";
+			result.exitCode = result.exitCode || (code ?? 0);
+			resolve(result);
+		});
+		proc.on("error", (error) => {
+			result.exitCode = 1;
+			result.errorMessage =
+				result.errorMessage || `Failed to launch ${OPENCODE_BIN}: ${error instanceof Error ? error.message : String(error)}`;
+			resolve(result);
+		});
+		if (signal) {
+			const killProc = () => {
+				proc!.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc!.killed) proc!.kill("SIGKILL");
+				}, KILL_GRACE_MS);
+			};
+			if (signal.aborted) killProc();
+			else signal.addEventListener("abort", killProc, { once: true });
+		}
+
+		void (async () => {
+			try {
+				await request("initialize", {
+					protocolVersion: 1,
+					clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+				});
+
+				let createdNew = false;
+				if (rec.opencodeSessionId) {
+					try {
+						await request("session/load", { sessionId: rec.opencodeSessionId, cwd: rec.cwd, mcpServers: [] });
+						sessionId = rec.opencodeSessionId;
+					} catch {
+						rec.opencodeSessionId = undefined;
+					}
+				}
+				if (!sessionId) {
+					const created = await request("session/new", { cwd: rec.cwd, mcpServers: [] });
+					sessionId = String(created?.sessionId ?? "");
+					if (!sessionId) throw new Error("opencode did not return a session id");
+					rec.opencodeSessionId = sessionId;
+					createdNew = true;
+					saveRecord(rec);
+				}
+
+				if (rec.model) {
+					try {
+						await request("session/set_config_option", { sessionId, configId: "model", value: rec.model });
+					} catch {
+						// Unknown/unavailable model id: keep opencode's default rather than failing the turn.
+					}
+				}
+				// Ensure edits are allowed; a restored session could have been left in plan mode.
+				try {
+					await request("session/set_config_option", { sessionId, configId: "mode", value: "build" });
+				} catch {
+
+				}
+
+				const isFirstTurn = createdNew || !rec.opencodeTurns;
+				rec.opencodeTurns = (rec.opencodeTurns ?? 0) + 1;
+				saveRecord(rec);
+				startTurn(isFirstTurn ? buildOpencodeFirstPrompt(rec, userText) : userText);
+			} catch (error) {
+				result.exitCode = 1;
+				result.errorMessage = error instanceof Error ? error.message : String(error);
+				closeStdin();
+			}
+		})();
+	});
+
+	return { proc: proc!, done, control };
+}
+
+
 function isFailedRun(run: RunResult): boolean {
 	return run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
 }
@@ -1005,10 +1442,15 @@ function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): voi
 function buildResumePrompt(rec: SubagentRecord): string {
 	const sessionPath = rec.sessionPath ?? sessionFileForRecord(rec);
 	let hasSession = false;
-	try {
-		hasSession = !!sessionPath && fs.existsSync(sessionPath);
-	} catch {
+	if (backendOf(rec) === "opencode") {
+		// The opencode session lives in opencode's own store and is reloaded by id.
+		hasSession = !!rec.opencodeSessionId;
+	} else {
+		try {
+			hasSession = !!sessionPath && fs.existsSync(sessionPath);
+		} catch {
 
+		}
 	}
 	if (!hasSession && (rec.task || rec.activeTask)) {
 		return `[auto-resume] ${rec.task ?? rec.activeTask}`;
@@ -1156,7 +1598,8 @@ async function startBackground(
 	let done: Promise<RunResult>;
 	let control: RpcControl | undefined;
 	try {
-		const spawned = await spawnSubagentProcess(
+		const spawnFn = backendOf(rec) === "opencode" ? spawnOpencodeProcess : spawnSubagentProcess;
+		const spawned = await spawnFn(
 			rec,
 			userText,
 			0,
@@ -1353,7 +1796,13 @@ const SpawnParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Model override in provider/id form. Defaults to the user-configured model (/subagent model), falling back to the session model.",
+				"Model override in provider/id form. Defaults to the user-configured model (/subagent model), falling back to the session model. An `opencode/...` id (e.g. opencode/big-pickle) selects the opencode backend automatically.",
+		}),
+	),
+	backend: Type.Optional(
+		Type.Union([Type.Literal("pi"), Type.Literal("opencode")], {
+			description:
+				"Which runtime executes the subagent. 'pi' (default) runs a pi subagent; 'opencode' drives the OpenCode CLI over ACP, using OpenCode's models — including its free models. Takes precedence over the configured backend and model.",
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent (default: current directory)" })),
@@ -1524,7 +1973,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
 		description:
-			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one background subagent. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). All spawns are asynchronous: the tool returns immediately and you are notified when each subagent finishes.",
+			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one background subagent. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). All spawns are asynchronous: the tool returns immediately and you are notified when each subagent finishes. Subagents run on pi by default; pass backend: \"opencode\" (or an opencode/... model) to run them on the OpenCode CLI instead.",
 		promptSnippet: "Spawn isolated subagent(s) to delegate work to",
 		promptGuidelines: [
 			"Always give every subagent a short unique name via name (single) or tasks[].name. The name is its handle in listings and notifications, and is what subagent_interrupt/subagent_result/subagent_forget use.",
@@ -1532,6 +1981,7 @@ export default function (pi: ExtensionAPI) {
 			"When multiple subagents need the same files, pass prefillReads (file paths): the files are read once and injected verbatim, identically, into every spawned subagent's context before the task — the subagents share that prompt-cache prefix instead of each issuing their own reads (better cache hits, fewer read calls).",
 			"Spawns are always asynchronous: the tool returns immediately and the completion auto-bubbles. Keep working while subagents run.",
 			"Give each task a narrow edit scope so the harness can block writes outside those files or directories — use this to keep parallel subagents from colliding on the same files.",
+			"To run a subagent on OpenCode instead of pi, pass backend: \"opencode\" (or a model id like \"opencode/big-pickle\"). OpenCode runs as a separate agent with its own tools, including OpenCode's free models; give it a self-contained task since its transcript is not pi's.",
 			"Use subagent_interrupt to steer a running subagent urgently — it kills the current turn and restarts it immediately with your message, keeping the subagent's full previous context.",
 			"Change a subagent's edit scope after spawning with subagent_scope (it takes effect live, even mid-run).",
 			"If a subagent errors, steer it to fix the error with subagent_interrupt or respawn it with subagent_spawn — don't just give up.",
@@ -1617,6 +2067,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const opts2 = resolveSpawnOptions(ctx, {
 					model: params.model,
+					backend: params.backend,
 					systemPrompt: params.systemPrompt,
 					cwd: params.cwd,
 					tools: params.tools,
@@ -1632,6 +2083,7 @@ export default function (pi: ExtensionAPI) {
 						id: newSubagentId(),
 						name: uniqueName(assignment.name, taken),
 						model: opts2.model,
+						backend: opts2.backend,
 						systemPrompt: opts2.systemPrompt,
 						cwd: opts2.cwd,
 						tools: opts2.tools,
@@ -1682,6 +2134,7 @@ export default function (pi: ExtensionAPI) {
 
 			const opts = resolveSpawnOptions(ctx, {
 				model: params.model,
+				backend: params.backend,
 				systemPrompt: params.systemPrompt,
 				cwd: params.cwd,
 				tools: params.tools,
@@ -1695,6 +2148,7 @@ export default function (pi: ExtensionAPI) {
 				id: newSubagentId(),
 				name: uniqueName(sanitizeName(params.name), existingNames()),
 				model: opts.model,
+				backend: opts.backend,
 				systemPrompt: opts.systemPrompt,
 				cwd: opts.cwd,
 				tools: opts.tools,
@@ -2054,6 +2508,15 @@ export default function (pi: ExtensionAPI) {
 			out.push(`User-configured model: ${cfg.model ?? "(not set — inherits session model)"}`);
 			out.push(`Current session model: ${sessionModel ?? "(none)"}`);
 			out.push(`Effective model for new subagents: ${cfg.model ?? sessionModel ?? "(none)"}`);
+			out.push(
+				`Subagent backend: ${
+					cfg.backend ??
+					(isOpencodeCliModel(cfg.model) && !modelKnownToPi(ctx, cfg.model)
+						? "opencode (inferred from model)"
+						: "pi")
+				}`,
+			);
+			out.push(`OpenCode model (opencode backend): ${cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL}`);
 			out.push(`Custom system prompt: ${cfg.systemPrompt ? `set (${cfg.systemPrompt.length} chars)` : "(default)"}`);
 			out.push(`Working directory: ${cfg.cwd ?? "(current directory)"}`);
 			out.push(`Tool allowlist: ${cfg.tools ?? "(all tools)"}`);
@@ -2063,7 +2526,10 @@ export default function (pi: ExtensionAPI) {
 			);
 			out.push(`Allow temp writes: ${cfg.allowTmp === false ? "no" : "yes"}`);
 			out.push(`Auto-resume on session resume: ${cfg.autoResume === false ? "no" : "yes"} (limit ${getMaxAutoResumes()})`);
-			out.push("Set the model with `/subagent model <provider/id>`; set the limit with `/subagent config maxSubagents N`.");
+			out.push(
+				"Set the model with `/subagent model <provider/id>` (or `opencode/<id>` for the opencode backend); " +
+					"set the runtime with `/subagent config backend pi|opencode`; set the limit with `/subagent config maxSubagents N`.",
+			);
 			return {
 				content: [{ type: "text", text: out.join("\n") }],
 				details: {
@@ -2174,9 +2640,36 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`maxAutoResumes set to ${cfg.maxAutoResumes}.`, "info");
 					return;
 				}
+				if (key === "backend") {
+					const v = parts[2]?.toLowerCase();
+					if (v !== "pi" && v !== "opencode") {
+						ctx.ui.notify("Usage: /subagent config backend pi|opencode", "info");
+						return;
+					}
+					cfg.backend = v;
+					saveConfig(cfg);
+					ctx.ui.notify(
+						v === "opencode"
+							? `Subagent backend set to opencode (model: ${cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL}). Needs the opencode CLI on PATH.`
+							: "Subagent backend set to pi.",
+						"info",
+					);
+					return;
+				}
+				if (key === "opencodeModel") {
+					const v = parts.slice(2).join(" ").trim();
+					if (!v) {
+						ctx.ui.notify("Usage: /subagent config opencodeModel <opencode/provider-model>", "info");
+						return;
+					}
+					cfg.opencodeModel = v;
+					saveConfig(cfg);
+					ctx.ui.notify(`OpenCode model set to ${v}.`, "info");
+					return;
+				}
 				if (key) {
 					ctx.ui.notify(
-						"Usage: /subagent config [maxSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no] — no args opens the settings panel.",
+						"Usage: /subagent config [maxSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode | opencodeModel <id>] — no args opens the settings panel.",
 						"info",
 					);
 					return;
@@ -2317,6 +2810,8 @@ export default function (pi: ExtensionAPI) {
 
 function findExactModel(ctx: ExtensionCommandContext, arg: string): string | undefined {
 	const q = arg.trim().toLowerCase();
+	// OpenCode model ids are not in pi's registry, so accept them verbatim.
+	if (isOpencodeModel(q)) return arg.trim();
 	try {
 		for (const m of ctx.modelRegistry.getAll()) {
 			if (`${m.provider}/${m.id}`.toLowerCase() === q) return `${m.provider}/${m.id}`;
