@@ -34,10 +34,10 @@ should never idle waiting on something while it can still be doing work.
 Everything that takes time is pushed to the background and reports back
 automatically:
 
-- `subagent_spawn { await: false }` / `subagent_dispatch` — delegate and move on; the completion
-  **auto-bubbles** as a real message with the subagent's full final response.
-- `subagent_send` — steering is **always async**: push the message, keep
-  working, get pinged when it finishes.
+- `subagent_spawn` — delegate and move on; **every spawn is asynchronous** and the
+  completion **auto-bubbles** as a real message with the subagent's full final response.
+- `subagent_interrupt` — steering is immediate: it kills the subagent's in-flight turn
+  and restarts it with your message; keep working and get pinged when it finishes.
 - **Idle timers** re-deliver anything that was missed (reloads, busy turns)
   at session start / turn end / every 30s — no notification is ever lost.
 - Busy-safe pushes: every notification passes `deliverAs: "steer"`, so it
@@ -58,8 +58,9 @@ against that session, so steering truly continues its work with full history.
 | Tool | Purpose |
 |------|---------|
 | `subagent_dispatch { exploreScope, tasks: [{ task, scope }], ... }` | Always runs asynchronously: explore once, then fork scoped task agents from the shared exploration session; skips exploration for a single task |
-| `subagent_spawn { task, name, model?, cwd?, tools?, scope?, await? }` | Spawn one direct subagent (`await: false` = background). Or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent |
-| `subagent_send { name, message }` | Push a message / steer — **always async**: returns immediately, the complete completion auto-bubbles |
+| `subagent_spawn { task, name, model?, cwd?, tools?, scope? }` | Spawn one background subagent (always async). Or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent |
+| `subagent_interrupt { name, message }` | Steer a subagent now: kills its in-flight turn (or starts a fresh turn if idle) and immediately restarts it with the message (full context preserved) |
+| `subagent_scope { name, scope?, clear?, allowTmp? }` | Change a subagent's edit scope — **live**, even while it is running; `clear: true` restores unrestricted writes |
 | `subagent_list` | Running/finished subagents: name, model, usage, latest output |
 | `subagent_result { name }` | Full transcript: task, steering messages, tool activity, outputs |
 | `subagent_forget { name }` | Delete a subagent and its session |
@@ -75,6 +76,24 @@ Key behaviors:
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
   `tool_call` hook: `write`/`edit` targeting out-of-scope paths are blocked
   with a clear reason, so parallel subagents never collide.
+- **Live scope changes** — the scope is mirrored to a small side file (`<id>.scope`)
+  that the child re-reads before every `write`/`edit`. `subagent_scope` updates it,
+  so the main agent can widen or narrow a running subagent's scope **without a
+  restart** (e.g. hand a collided subagent an extra shared file, then lock it back
+  down). `clear: true` removes the scope and restores unrestricted writes.
+- **Interrupt & steer** — subagent processes run pi in **RPC mode**, so
+  `subagent_interrupt` issues pi's real `abort` command: the in-flight tool call
+  (including a running bash command) and streaming are cancelled, then the
+  `[emergency] <message>` is submitted as the next prompt to the **same process**
+  (full in-process context preserved; no restart). The run's normal completion
+  handler then finalizes and announces the new turn's result. If the process has
+  no live control channel (or abort fails), it falls back to SIGTERM/SIGKILL and a
+  fresh turn; orphaned processes are stopped by pid first.
+- **RPC transport** — each turn's child is launched as `pi --mode rpc` and the
+  prompt is sent as a `prompt` command on stdin (the event stream parsed is the
+  same as `--mode json`, so usage/output/bubbles are unchanged). The control
+  channel is what makes graceful abort-and-continue possible; the child is shut
+  down by closing stdin once a turn settles with no continuation queued.
 - **Multi-layer nesting** — subagents can spawn their own sub-subagents up to
   the configured `maxDepth` layers (default 3), and at most `maxSubagents`
   subagents run concurrently across all layers (default 4). Both limits are
@@ -84,7 +103,7 @@ Key behaviors:
   report how many subagents are running right now vs the `maxSubagents` limit,
   and the nesting depth; `subagent_spawn` refuses to exceed either limit with
   a clear reason.
-- **Named subagents** — every spawn requires a short, unique `name` (single `name` or `tasks[].name`); it is the only handle used by users and agents, in listings, completion notifications, and `subagent_send` / `subagent_result` / `subagent_forget` (exact name or unique prefix). The internal id is never shown and exists only for session-file management.
+- **Named subagents** — every spawn requires a short, unique `name` (single `name` or `tasks[].name`); it is the only handle used by users and agents, in listings, completion notifications, and `subagent_interrupt` / `subagent_result` / `subagent_forget` (exact name or unique prefix). The internal id is never shown and exists only for session-file management.
 - **Bubble channel** — `subagent_message` inside a child is
   emitted as `{"type":"subagent_bubble",...}` JSON lines on the child's
   **stderr**. Pi takes over `process.stdout` in non-interactive modes (`json`,
@@ -96,9 +115,10 @@ Key behaviors:
   (and triggers one even when idle). If a push was missed (e.g. extension
   reloaded mid-run), a flusher re-delivers it at session start / turn end /
   every 30s.
-- **`/subagent` command** — manage direct subagents with `list`, `result <id>`, `send <id> <msg>`,
-  `switch <id>` (read-only live viewer), `forget <id>`, `model [provider/id]` (pi's built-in
-  model selector), `config`.
+- **`/subagent` command** — a management-only command for direct subagents: `list`,
+  `result <name>`, `interrupt <name> <msg>`, `scope <name> <path|none>`, `forget <name>`,
+  `model [provider/id]` (pi's built-in model selector), `config`. Subagents are spawned
+  by the agent through the `subagent_spawn` tool, not from this command.
 - **Session-based context + auto-resume** — each subagent's private pi session file is
   the durable store of its context. Records are scoped to the owning main session and
   record that session's file, so when the main session is resumed (`--continue`/`--resume`
@@ -107,12 +127,6 @@ Key behaviors:
   `maxAutoResumes` (default `3`); disable with `/subagent config autoResume no`. If pi was
   hard-killed and left an orphan child, the live pid is detected, stopped, and replaced on
   resume.
-- **Watch a subagent live (read-only)** — `/subagent switch [id]` (alias `/subagent view`)
-  opens a live, auto-refreshing view of that subagent's transcript and status in the TUI
-  (↑/↓, PgUp/PgDn scroll; End follows the tail; Esc closes). With no id it opens a picker.
-  It is purely observational: it only **reads** the subagent's transcript file and record,
-  so the main agent and every subagent — including the one you are watching — keep running
-  completely unaffected. Nothing is paused, stopped, or steered.
 
 ## 2. bash-timeout — no more hung commands
 

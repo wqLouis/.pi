@@ -4,7 +4,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
@@ -22,15 +21,12 @@ import {
 	matchesKey,
 	SettingsList,
 	Text,
-	truncateToWidth,
-	wrapTextWithAnsi,
 	type Component,
 	type TUI,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DEFAULT_MAX_SUBAGENTS = 4;
-const MAX_ERROR_CHARS = 500;
 const PREVIEW_CHARS = 200;
 const DETAIL_CHARS = 300;
 const KILL_GRACE_MS = 5000;
@@ -68,6 +64,33 @@ function normalizeScope(baseCwd: string, scope: string | string[] | undefined): 
 	const list = Array.isArray(scope) ? scope : [scope];
 	const abs = list.map((p) => path.resolve(baseCwd, p));
 	return abs.length > 0 ? [...new Set(abs)] : undefined;
+}
+
+/**
+ * Read a subagent's live edit scope from the scope file the parent refreshes on
+ * every spawn and every scope change. The child re-reads it before each
+ * write/edit, so the main agent can widen or narrow the scope of an already
+ * running subagent without restarting it. Returns `found: false` when the file
+ * is absent/unreadable so callers can fall back to the spawn-time env scope.
+ */
+function readLiveScope(): { found: boolean; scope?: string[]; allowTmp?: boolean } {
+	const id = process.env.PI_SUBAGENT_ID;
+	const dir = process.env.PI_SUBAGENT_DIR;
+	if (!id || !dir) return { found: false };
+	try {
+		const raw = fs.readFileSync(path.join(path.resolve(dir), `${id}.scope`), "utf-8");
+		const parsed = JSON.parse(raw) as { scope?: unknown; allowTmp?: unknown };
+		const scope = Array.isArray(parsed.scope)
+			? parsed.scope.filter((s): s is string => typeof s === "string" && s.length > 0)
+			: [];
+		return {
+			found: true,
+			scope: scope.length > 0 ? scope : undefined,
+			allowTmp: typeof parsed.allowTmp === "boolean" ? parsed.allowTmp : undefined,
+		};
+	} catch {
+		return { found: false };
+	}
 }
 
 type SubagentStatus = "running" | "idle" | "error";
@@ -163,6 +186,19 @@ interface RunningEntry {
 	proc: ChildProcess;
 	done: Promise<RunResult>;
 	rec: SubagentRecord;
+	/** Set by subagent_interrupt so the completion handler skips finalize/notify on a killed run. */
+	interrupted?: boolean;
+	/** RPC transport control channel, used to abort gracefully and continue in the same process. */
+	control?: RpcControl;
+}
+
+interface RpcControl {
+	/** Additional agent runs queued on top of the current settle, so the process is not shut down early. */
+	pendingContinuations: number;
+	/** True once stdin has been closed and the child is shutting down. */
+	closed: boolean;
+	/** Send an RPC command and resolve with its correlated response. */
+	sendCommand: (cmd: Record<string, unknown>) => Promise<any>;
 }
 
 const EMPTY_USAGE = (): RunUsage => ({
@@ -365,6 +401,28 @@ function sessionFileForRecord(rec: Pick<SubagentRecord, "id" | "sessionPath">): 
 	return rec.sessionPath ?? sessionFile(rec.id);
 }
 
+function scopeFile(id: string): string {
+	return path.join(subagentDir(), `${id}.scope`);
+}
+
+/**
+ * Persist the subagent's edit scope to a side file the child polls live. Written
+ * atomically (tmp + rename) so a running child never reads a half-written file.
+ */
+function writeScopeFile(rec: SubagentRecord): void {
+	try {
+		const file = scopeFile(rec.id);
+		const tmp = `${file}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify({ scope: rec.scope ?? [], allowTmp: rec.allowTmp !== false }), {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+		fs.renameSync(tmp, file);
+	} catch {
+
+	}
+}
+
 function newSubagentId(): string {
 	return `sa_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -408,13 +466,6 @@ function sanitizeName(name: string | undefined): string | undefined {
 	if (!name) return undefined;
 	const cleaned = name.trim().replace(/\s+/g, " ").slice(0, 60);
 	return cleaned || undefined;
-}
-
-/** Fallback label derived from a task's first few words (used by the /subagent command). */
-function deriveName(task: string | undefined): string | undefined {
-	if (!task) return undefined;
-	const words = firstLine(task).replace(/[#*`>|_-]+/g, " ").trim().split(/\s+/).slice(0, 6).join(" ");
-	return sanitizeName(words);
 }
 
 /** The public handle for a subagent. Ids are internal and never shown. */
@@ -664,25 +715,57 @@ async function spawnSubagentProcess(
 	onUpdate?: (text: string) => void,
 	onBubble?: (bubble: { text: string }) => void,
 	taskBase?: string,
-): Promise<{ proc: ChildProcess; done: Promise<RunResult> }> {
-	const args: string[] = ["--mode", "json", "-p", "--session", sessionFileForRecord(rec)];
+): Promise<{ proc: ChildProcess; done: Promise<RunResult>; control: RpcControl }> {
+	const args: string[] = ["--mode", "rpc", "--session", sessionFileForRecord(rec)];
 	if (rec.model) args.push("--model", rec.model);
 
+	writeScopeFile(rec);
+
 	const tmp = await writePromptToTempFile(rec.systemPrompt);
-	try {
-		args.push("--append-system-prompt", tmp.filePath);
-		args.push(userText);
+	args.push("--append-system-prompt", tmp.filePath);
 
-		const result: RunResult = {
-			exitCode: 0,
-			messages: [],
-			stderr: "",
-			usage: EMPTY_USAGE(),
-			bubbles: [],
-		};
+	const result: RunResult = {
+		exitCode: 0,
+		messages: [],
+		stderr: "",
+		usage: EMPTY_USAGE(),
+		bubbles: [],
+	};
 
-		let proc: ChildProcess | undefined;
-		const done = new Promise<RunResult>((resolve) => {
+	let proc: ChildProcess | undefined;
+	let stdinClosed = false;
+	let commandSeq = 0;
+	const pendingResponses = new Map<string, (response: any) => void>();
+	const writeCommand = (cmd: Record<string, unknown>) => {
+		try {
+			if (!stdinClosed && proc?.stdin?.writable) proc.stdin.write(`${JSON.stringify(cmd)}\n`);
+		} catch {
+
+		}
+	};
+	const closeStdin = () => {
+		if (stdinClosed) return;
+		stdinClosed = true;
+		control.closed = true;
+		try {
+			proc?.stdin?.end();
+		} catch {
+
+		}
+	};
+	const control: RpcControl = {
+		pendingContinuations: 0,
+		closed: false,
+		sendCommand: (cmd) => {
+			const id = `sub-${++commandSeq}`;
+			return new Promise((resolve) => {
+				pendingResponses.set(id, resolve);
+				writeCommand({ id, ...cmd });
+			});
+		},
+	};
+
+	const done = new Promise<RunResult>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const env: Record<string, string> = {
 				...process.env,
@@ -698,7 +781,7 @@ async function spawnSubagentProcess(
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: rec.cwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 				env,
 			});
 			let buffer = "";
@@ -745,6 +828,23 @@ async function spawnSubagentProcess(
 					result.messages.push(event.message as Message);
 				}
 				if (event.type === "subagent_bubble") emitBubble(event);
+				if (event.type === "response" && typeof event.id === "string") {
+					const pending = pendingResponses.get(event.id);
+					if (pending) {
+						pendingResponses.delete(event.id);
+						pending(event);
+					}
+				}
+				if (event.type === "extension_ui_request" && (event.method === "select" || event.method === "confirm" || event.method === "input" || event.method === "editor")) {
+					// Headless subagents must never block on a dialog: answer with the default.
+					writeCommand({ type: "extension_ui_response", id: event.id, cancelled: true });
+				}
+				if (event.type === "agent_settled") {
+					// Keep the process alive only while another run is queued (e.g. an emergency
+					// interrupt that aborted this turn and pushed a new prompt).
+					if (control.pendingContinuations > 0) control.pendingContinuations--;
+					else closeStdin();
+				}
 			};
 
 			const processStderrLine = (line: string) => {
@@ -778,7 +878,9 @@ async function spawnSubagentProcess(
 			proc!.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
 				if (stderrBuffer.trim()) processStderrLine(stderrBuffer);
-				result.exitCode = code ?? 0;
+				// Keep an exit code we already set for a known failure (e.g. a rejected
+				// prompt still lets the child shut down cleanly with code 0).
+				result.exitCode = result.exitCode || (code ?? 0);
 				resolve(result);
 			});
 			proc!.on("error", () => {
@@ -795,10 +897,23 @@ async function spawnSubagentProcess(
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
 			}
+
+			// RPC mode starts idle; the initial turn is submitted as a `prompt` command.
+			// A `handled` disposition means no run started, so shut down immediately; a
+			// rejected prompt is surfaced as a failed run rather than hanging forever.
+			pendingResponses.set("sub-initial", (response) => {
+				if (response?.success === false) {
+					result.exitCode = 1;
+					result.errorMessage = response.error ?? "prompt failed";
+					closeStdin();
+				} else if (response?.data?.disposition === "handled") {
+					closeStdin();
+				}
+			});
+			writeCommand({ id: "sub-initial", type: "prompt", message: userText });
 		});
 
-		return { proc: proc!, done };
-	} finally {
+	done.finally(() => {
 		try {
 			fs.unlinkSync(tmp.filePath);
 		} catch {
@@ -809,22 +924,11 @@ async function spawnSubagentProcess(
 		} catch {
 
 		}
-	}
+	});
+
+	return { proc: proc!, done, control };
 }
 
-
-async function runSubagentTurn(
-	rec: SubagentRecord,
-	userText: string,
-	depth: number,
-	signal: AbortSignal | undefined,
-	onUpdate?: (text: string) => void,
-	onBubble?: (bubble: { text: string }) => void,
-	taskBase?: string,
-): Promise<RunResult> {
-	const { done } = await spawnSubagentProcess(rec, userText, depth, signal, onUpdate, onBubble, taskBase);
-	return done;
-}
 
 function isFailedRun(run: RunResult): boolean {
 	return run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
@@ -845,45 +949,6 @@ function finalizeRecord(rec: SubagentRecord, run: RunResult): { output: string; 
 }
 
 
-async function runAndRecord(
-	rec: SubagentRecord,
-	userText: string,
-	signal: AbortSignal | undefined,
-	onUpdate?: (partial: AgentToolResult<SubagentDetails>) => void,
-	onBubble?: (bubble: { text: string }) => void,
-	taskBase?: string,
-): Promise<{ ok: boolean; error?: string; output: string; usage: RunUsage; bubbles: Array<{ text: string }> }> {
-	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
-	rec.status = "running";
-	rec.suspended = false;
-	rec.activeTask = userText;
-	saveRecord(rec);
-
-	const run = await runSubagentTurn(rec, userText, depth, signal, (text) => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text }],
-				details: {
-					name: rec.name,
-					model: rec.model,
-					output: text,
-					status: "running",
-					usage: rec.totalUsage,
-				},
-			});
-		}
-	}, onBubble, taskBase);
-
-	const { output, failed } = finalizeRecord(rec, run);
-	if (failed) {
-		const reason = run.stopReason ?? `exit code ${run.exitCode}`;
-		const detail = run.errorMessage || run.stderr || output;
-		return { ok: false, error: `subagent ${reason}: ${detail.slice(0, MAX_ERROR_CHARS)}`, output, usage: run.usage, bubbles: run.bubbles ?? [] };
-	}
-	return { ok: true, output, usage: run.usage, bubbles: run.bubbles ?? [] };
-}
-
-
 const running = new Map<string, RunningEntry>();
 
 
@@ -895,7 +960,7 @@ function buildCompletionText(rec: SubagentRecord): string {
 			`[subagent ${recordLabel(rec)} error]\n\n` +
 			`Error: ${detail}\n\n` +
 			`Last output:\n${output}\n\n` +
-			`Resolve it with subagent_send { name: "${recordLabel(rec)}", message: "<what to fix>" }, ` +
+			`Resolve it with subagent_interrupt { name: "${recordLabel(rec)}", message: "<what to fix>" }, ` +
 			`or inspect the full transcript with subagent_result { name: "${recordLabel(rec)}" }. ` +
 			`Use subagent_forget { name: "${recordLabel(rec)}" } to discard it.`
 		);
@@ -1089,6 +1154,7 @@ async function startBackground(
 
 	let proc: ChildProcess;
 	let done: Promise<RunResult>;
+	let control: RpcControl | undefined;
 	try {
 		const spawned = await spawnSubagentProcess(
 			rec,
@@ -1117,6 +1183,7 @@ async function startBackground(
 		);
 		proc = spawned.proc;
 		done = spawned.done;
+		control = spawned.control;
 	} catch (error) {
 		rec.status = "error";
 		saveRecord(rec);
@@ -1125,13 +1192,14 @@ async function startBackground(
 
 	rec.pid = proc.pid;
 	saveRecord(rec);
-	running.set(rec.id, { proc, done, rec });
+	const entry: RunningEntry = { proc, done, rec, control };
+	running.set(rec.id, entry);
 
 	done.then(async (run) => {
 		running.delete(rec.id);
-		if (rec.suspended) {
-			// Intentionally stopped (session switch/quit): keep it resumable rather
-			// than finalizing it as an error or a completion.
+		if (rec.suspended || entry.interrupted) {
+			// Intentionally stopped (session switch/quit/interrupt): keep it
+			// resumable rather than finalizing it as an error or a completion.
 			rec.pid = undefined;
 			saveRecord(rec);
 			return;
@@ -1148,6 +1216,78 @@ async function startBackground(
 	});
 
 	return { started: true };
+}
+
+/**
+ * Interrupt a running subagent so a message can be delivered right now.
+ *
+ * Preferred path: the child runs pi in RPC mode, so we issue a real `abort`
+ * command (pi aborts the in-flight tool call — including a running bash command
+ * — and streaming) and then submit the message as the next prompt on the SAME
+ * process. The ordinary completion handler then finalizes and notifies with the
+ * new turn's result, so the caller must NOT start another turn.
+ *
+ * Fallbacks: if the process has no control channel or abort fails, kill it and
+ * report `restarted`; if nothing is running, report `idle`. In both fallback
+ * cases the caller starts a fresh turn.
+ */
+async function interruptRunning(rec: SubagentRecord, message: string): Promise<"aborted" | "restarted" | "idle"> {
+	const entry = running.get(rec.id);
+	if (entry?.control && !entry.control.closed) {
+		// Reserve the settle that is about to happen so the process is not shut
+		// down before the emergency prompt gets its turn.
+		entry.control.pendingContinuations++;
+		try {
+			const response = await entry.control.sendCommand({ type: "abort" });
+			if (response?.success === false) throw new Error(response.error ?? "abort failed");
+			if (entry.control.closed) throw new Error("subagent process closed during abort");
+			const promptResponse = await entry.control.sendCommand({ type: "prompt", message });
+			if (promptResponse?.success === false) throw new Error(promptResponse.error ?? "prompt failed");
+			return "aborted";
+		} catch {
+			entry.control.pendingContinuations = Math.max(0, entry.control.pendingContinuations - 1);
+			// Fall through to a hard restart so the message is still delivered.
+		}
+	}
+	if (entry) {
+		// Hard fallback: kill the process and let the caller start a fresh turn.
+		entry.interrupted = true;
+		rec.suspended = true;
+		saveRecord(rec);
+		try {
+			entry.proc.kill("SIGTERM");
+		} catch {
+
+		}
+		const escalate = setTimeout(() => {
+			try {
+				if (entry.proc.exitCode === null) entry.proc.kill("SIGKILL");
+			} catch {
+
+			}
+		}, KILL_GRACE_MS);
+		try {
+			await Promise.race([entry.done, sleep(KILL_GRACE_MS + 1500)]);
+		} finally {
+			clearTimeout(escalate);
+		}
+		if (running.get(rec.id) === entry) running.delete(rec.id);
+		rec.suspended = false;
+		rec.pid = undefined;
+		saveRecord(rec);
+		return "restarted";
+	}
+	if (isPidAlive(rec.pid)) {
+		// Orphan left by a previous pi process: no control channel, so stop it by pid.
+		rec.suspended = true;
+		saveRecord(rec);
+		await waitForPidExit(rec.pid, RESUME_WAIT_MS);
+		rec.suspended = false;
+		rec.pid = undefined;
+		saveRecord(rec);
+		return "restarted";
+	}
+	return "idle";
 }
 
 /**
@@ -1173,13 +1313,7 @@ const SpawnParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "The task to delegate to the subagent (use tasks for multiple)." })),
 	name: Type.Optional(
 		Type.String({
-			description: "Short, unique, human-readable name for this subagent (required). Used as its handle in listings, notifications, and subagent_send/result/forget.",
-		}),
-	),
-	await: Type.Optional(
-		Type.Boolean({
-			description: "true (default): wait for the subagent to finish and return its output. false: run in the background and return immediately; completion is automatically notified to the main agent.",
-			default: true,
+			description: "Short, unique, human-readable name for this subagent (required). Used as its handle in listings, notifications, and subagent_interrupt/result/forget.",
 		}),
 	),
 	tasks: Type.Optional(
@@ -1241,9 +1375,25 @@ const SpawnParams = Type.Object({
 	),
 });
 
-const SendParams = Type.Object({
+const ScopeParams = Type.Object({
 	name: Type.String({ description: "Name returned by subagent_spawn" }),
-	message: Type.String({ description: "Follow-up message / steering instruction for the subagent" }),
+	scope: Type.Optional(
+		Type.Union([
+			Type.String({
+				description: "Directory or file path the subagent may edit (relative paths resolve against the subagent's cwd).",
+			}),
+			Type.Array(Type.String({ description: "A directory or file path the subagent may edit." }), { minItems: 1 }),
+		]),
+	),
+	clear: Type.Optional(Type.Boolean({ description: "Remove the edit scope entirely, restoring unrestricted writes." })),
+	allowTmp: Type.Optional(
+		Type.Boolean({ description: "Whether writes to the system temp dir are allowed while a scope is set." }),
+	),
+});
+
+const InterruptParams = Type.Object({
+	name: Type.String({ description: "Name returned by subagent_spawn" }),
+	message: Type.String({ description: "The urgent instruction to deliver immediately after interrupting the subagent" }),
 });
 
 const ListParams = Type.Object({});
@@ -1303,35 +1453,33 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => clearInterval(flushTimer));
 
 
-	const scopeEnv = process.env.PI_SUBAGENT_SCOPE;
-	if (scopeEnv) {
-		let scope: string[] = [];
-		try {
-			scope = JSON.parse(scopeEnv);
-		} catch {
-
-		}
-		if (Array.isArray(scope) && scope.length > 0) {
-			const tmpDir = os.tmpdir();
-			const blockTmp = process.env.PI_SUBAGENT_SCOPE_BLOCK_TMP === "1";
-			const taskBoardFile = process.env.PI_TASK_BASE ? path.resolve(path.join(process.env.PI_TASK_BASE, "TASK.md")) : undefined;
-			pi.on("tool_call", (event, ctx) => {
-				if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
-				const target = (event.input as { path?: string }).path;
-				if (!target) return undefined;
-				const targetAbs = path.resolve(target.replace(/^@/, ""));
-				if (isWithinScope(targetAbs, scope)) return undefined;
-				const logicalTaskBoardFile = path.resolve(ctx.cwd, "TASK.md");
-				if (taskBoardFile && (targetAbs === taskBoardFile || targetAbs === logicalTaskBoardFile)) return undefined;
-				if (!blockTmp && isWithinScope(targetAbs, [tmpDir])) return undefined;
-				return {
-					block: true,
-					reason:
-						`Writing to "${targetAbs}" is outside this subagent's edit scope. ` +
-						`Allowed: scope (${scope.join(", ")}) and the temp dir. Reads are unrestricted; use write/edit only within those.`,
-				};
-			});
-		}
+	if (isSubagentProcess) {
+		const envScope = toStringArray(process.env.PI_SUBAGENT_SCOPE);
+		const envBlockTmp = process.env.PI_SUBAGENT_SCOPE_BLOCK_TMP === "1";
+		const tmpDir = os.tmpdir();
+		const taskBoardFile = process.env.PI_TASK_BASE ? path.resolve(path.join(process.env.PI_TASK_BASE, "TASK.md")) : undefined;
+		// Always registered inside a subagent so a scope added/changed later (via
+		// subagent_scope) takes effect live, even for a subagent spawned without one.
+		pi.on("tool_call", (event, ctx) => {
+			if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
+			const target = (event.input as { path?: string }).path;
+			if (!target) return undefined;
+			const live = readLiveScope();
+			const scope = live.found ? live.scope : envScope;
+			if (!scope || scope.length === 0) return undefined;
+			const blockTmp = live.found && typeof live.allowTmp === "boolean" ? !live.allowTmp : envBlockTmp;
+			const targetAbs = path.resolve(target.replace(/^@/, ""));
+			if (isWithinScope(targetAbs, scope)) return undefined;
+			const logicalTaskBoardFile = path.resolve(ctx.cwd, "TASK.md");
+			if (taskBoardFile && (targetAbs === taskBoardFile || targetAbs === logicalTaskBoardFile)) return undefined;
+			if (!blockTmp && isWithinScope(targetAbs, [tmpDir])) return undefined;
+			return {
+				block: true,
+				reason:
+					`Writing to "${targetAbs}" is outside this subagent's edit scope. ` +
+					`Allowed: scope (${scope.join(", ")}) and the temp dir. Reads are unrestricted; use write/edit only within those.`,
+			};
+		});
 	}
 
 
@@ -1376,20 +1524,21 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
 		description:
-			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one direct subagent — with await: true (default) this blocks until it finishes; with await: false it runs in the background. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). Multi-task spawns are always asynchronous.",
+			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one background subagent. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). All spawns are asynchronous: the tool returns immediately and you are notified when each subagent finishes.",
 		promptSnippet: "Spawn isolated subagent(s) to delegate work to",
 		promptGuidelines: [
-			"Always give every subagent a short unique name via name (single) or tasks[].name. The name is its handle in listings and notifications, and is what subagent_send/subagent_result/subagent_forget use.",
+			"Always give every subagent a short unique name via name (single) or tasks[].name. The name is its handle in listings and notifications, and is what subagent_interrupt/subagent_result/subagent_forget use.",
 			"Pass tasks (array of { task, name?, scope? }) to run several independent subagents in parallel; each runs in the background with automatic completion notifications.",
 			"When multiple subagents need the same files, pass prefillReads (file paths): the files are read once and injected verbatim, identically, into every spawned subagent's context before the task — the subagents share that prompt-cache prefix instead of each issuing their own reads (better cache hits, fewer read calls).",
-			"Use a single task with await: false for background work, or await: true (default) to block until it finishes.",
+			"Spawns are always asynchronous: the tool returns immediately and the completion auto-bubbles. Keep working while subagents run.",
 			"Give each task a narrow edit scope so the harness can block writes outside those files or directories — use this to keep parallel subagents from colliding on the same files.",
-			"Use subagent_send to steer a subagent — it continues with its full previous context; messages sent while it is running are queued and delivered as its next turn.",
-			"If a subagent errors, steer it to fix the error with subagent_send or respawn it with subagent_spawn — don't just give up.",
+			"Use subagent_interrupt to steer a running subagent urgently — it kills the current turn and restarts it immediately with your message, keeping the subagent's full previous context.",
+			"Change a subagent's edit scope after spawning with subagent_scope (it takes effect live, even mid-run).",
+			"If a subagent errors, steer it to fix the error with subagent_interrupt or respawn it with subagent_spawn — don't just give up.",
 			"Check subagent_config to see how many subagents are currently running vs the maxSubagents limit. Spawn only as many as you actually need.",
 		],
 		parameters: SpawnParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const task = params.task?.trim();
 			const assignments = toAssignments(params.tasks);
 			const prefillReads = toStringArray(params.prefillReads);
@@ -1517,7 +1666,7 @@ export default function (pi: ExtensionAPI) {
 							text:
 								`Spawned ${assignments.length} subagent(s) in the background; each will notify you when it finishes.\n` +
 								lines.join("\n") +
-								`\nSteer with subagent_send, inspect with subagent_result, forget with subagent_forget.`,
+								`\nSteer with subagent_interrupt, inspect with subagent_result, forget with subagent_forget.`,
 						},
 					],
 					details: {
@@ -1560,145 +1709,18 @@ export default function (pi: ExtensionAPI) {
 			saveRecord(record);
 
 			const userText = prefillBlock ? `${prefillBlock}\n\n${task}` : task;
-			if (params.await === false) {
-				const bg = await startBackground(pi, ctx, record, userText);
-				if (!bg.started) {
-					record.status = "error";
-					saveRecord(record);
-					return {
-						content: [{ type: "text", text: bg.error ?? "Failed to start subagent." }],
-						details: {
-							name: record.name,
-							model: record.model,
-							output: "",
-							status: "error",
-							usage: EMPTY_USAGE(),
-						} as SubagentDetails,
-						isError: true,
-					};
-				}
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Spawned subagent ${recordLabel(record)} in the background (model: ${record.model ?? "session model"}).\n` +
-								(scope ? `Edit scope: ${scope.join(", ")} — writes outside are blocked.\n` : "") +
-								`You will be notified when it finishes; read its transcript with subagent_result or steer it with subagent_send afterward.`,
-						},
-					],
-					details: {
-						name: record.name,
-						model: record.model,
-						output: "",
-						status: "running",
-						usage: EMPTY_USAGE(),
-					} as SubagentDetails,
-				};
-			}
-
-			const result = await runAndRecord(record, userText, signal, onUpdate, (bubble) => {
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						`[subagent ${recordLabel(record)}] ${firstLine(bubble.text).slice(0, PREVIEW_CHARS)}`,
-						"info",
-					);
-				}
-			}, childTaskBase(ctx, record.id));
-			await deliverQueuedMessages(pi, ctx, record);
-			if (!result.ok) {
-				return {
-					content: [{ type: "text", text: result.error ?? "Subagent failed." }],
-					details: {
-						name: record.name,
-						model: record.model,
-						output: result.output,
-						status: "error",
-						usage: result.usage ?? EMPTY_USAGE(),
-					} as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const bubbleText =
-				result.bubbles.length > 0
-					? "\n\n[subagent bubbles — messages the subagent sent you during the run]\n" +
-						result.bubbles.map((b) => `- ${b.text}`).join("\n")
-					: "";
-			const note =
-				`\n\n[subagent ${recordLabel(record)} — model ${record.model ?? "session model"}]\n` +
-				(scope ? `Edit scope: ${scope.join(", ")} (writes outside are blocked).\n` : "") +
-				`Steer it with subagent_send, read its transcript with subagent_result, forget it with subagent_forget.`;
-			return {
-				content: [{ type: "text", text: `${result.output}${bubbleText}${note}` }],
-				details: {
-					name: record.name,
-					model: record.model,
-					output: result.output,
-					status: "idle",
-					usage: result.usage ?? EMPTY_USAGE(),
-				} as SubagentDetails,
-			};
-		},
-	});
-
-
-
-	pi.registerTool({
-		name: "subagent_send",
-		label: "Subagent Send",
-		description:
-			"Push a follow-up message to a spawned subagent (name from subagent_spawn). The subagent continues its private session, so it keeps full context of its previous work. Use this to steer, redirect, ask for more detail, or assign follow-up work. Always async: if the subagent is idle/error it starts a background steering turn immediately; if it is currently running, the message is queued and delivered as its next turn when the current run finishes. The complete result auto-bubbles when it finishes.",
-		promptSnippet: "Send a steering message to a subagent",
-		promptGuidelines: [
-			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_send (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
-			"subagent_send is async — it returns immediately; if the subagent is running, the message is queued for its next turn, otherwise a background turn starts now. The completion message auto-bubbles; keep working while it runs.",
-		],
-		parameters: SendParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const message = params.message?.trim();
-			if (!message) {
-				return {
-					content: [{ type: "text", text: "Error: message is required." }],
-					details: { name: params.name, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
-					isError: true,
-				};
-			}
-
-			const record = findRecordByName(params.name);
-			if (!record) {
-				return {
-					content: [{ type: "text", text: `Unknown subagent "${params.name}". Spawn one first with subagent_spawn.` }],
-					details: { name: params.name, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
-					isError: true,
-				};
-			}
-			if (record.status === "running") {
-				record.pendingMessages = [...(record.pendingMessages ?? []), message];
+			const bg = await startBackground(pi, ctx, record, userText);
+			if (!bg.started) {
+				record.status = "error";
 				saveRecord(record);
 				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Subagent ${recordLabel(record)} is currently running — message queued. It will be delivered as the subagent's next turn when the current run finishes (with its full session context).`,
-						},
-					],
-					details: { name: params.name, output: "", status: "running", usage: record.totalUsage } as SubagentDetails,
-				};
-			}
-
-
-			const started = await startBackground(pi, ctx, record, message);
-			if (!started.started) {
-				return {
-					content: [{ type: "text", text: started.error ?? "Failed to start the subagent turn." }],
+					content: [{ type: "text", text: bg.error ?? "Failed to start subagent." }],
 					details: {
-						name: params.name,
+						name: record.name,
 						model: record.model,
 						output: "",
 						status: "error",
-						usage: record.totalUsage,
+						usage: EMPTY_USAGE(),
 					} as SubagentDetails,
 					isError: true,
 				};
@@ -1708,7 +1730,162 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`Steering message sent to subagent ${recordLabel(record)} in the background — the complete result will auto-bubble when it finishes. Inspect the output with subagent_result if needed.`,
+							`Spawned subagent ${recordLabel(record)} in the background (model: ${record.model ?? "session model"}).\n` +
+							(scope ? `Edit scope: ${scope.join(", ")} — writes outside are blocked.\n` : "") +
+							`You will be notified when it finishes; read its transcript with subagent_result or redirect it with subagent_interrupt.`,
+					},
+				],
+				details: {
+					name: record.name,
+					model: record.model,
+					output: "",
+					status: "running",
+					usage: EMPTY_USAGE(),
+				} as SubagentDetails,
+			};
+		},
+	});
+
+
+	pi.registerTool({
+		name: "subagent_scope",
+		label: "Subagent Scope",
+		description:
+			"Change a spawned subagent's edit scope (the directories/files its write/edit calls may touch). Paths resolve against the subagent's cwd; reads are always unrestricted. The change is live: an already-running subagent re-reads its scope before every write/edit, so no restart is needed. Use clear: true to remove the scope and restore full write access.",
+		promptSnippet: "Change a subagent's edit scope",
+		promptGuidelines: [
+			"Use subagent_scope to widen or narrow a subagent's write scope after spawning — e.g. when parallel subagents need an extra shared file or one collided. It takes effect immediately, even for a running subagent.",
+			"Pass scope as a directory or file path (or an array) to set it, or clear: true to allow writes anywhere again.",
+		],
+		parameters: ScopeParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const record = findRecordByName(params.name);
+			if (!record) {
+				return {
+					content: [{ type: "text", text: `Unknown subagent "${params.name}". Spawn one first with subagent_spawn.` }],
+					details: { name: params.name, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
+					isError: true,
+				};
+			}
+			const clear = params.clear === true;
+			const hasScope = params.scope !== undefined && params.scope !== null;
+			if (!clear && !hasScope && typeof params.allowTmp !== "boolean") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Nothing to change. Pass scope: "<path>" (or an array), clear: true, or allowTmp: true|false.`,
+						},
+					],
+					details: { name: record.name, output: "", status: record.status, usage: record.totalUsage } as SubagentDetails,
+					isError: true,
+				};
+			}
+			if (clear) {
+				record.scope = undefined;
+			} else if (hasScope) {
+				const normalized = normalizeScope(record.cwd, params.scope as string | string[]);
+				if (!normalized || normalized.length === 0) {
+					return {
+						content: [{ type: "text", text: "Error: scope must contain at least one path." }],
+						details: { name: record.name, output: "", status: record.status, usage: record.totalUsage } as SubagentDetails,
+						isError: true,
+					};
+				}
+				record.scope = normalized;
+			}
+			if (typeof params.allowTmp === "boolean") record.allowTmp = params.allowTmp;
+			saveRecord(record);
+			writeScopeFile(record);
+			const scopeText =
+				record.scope && record.scope.length > 0 ? record.scope.join(", ") : "(none — writes unrestricted)";
+			const live = record.status === "running" || running.has(record.id);
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Edit scope for subagent ${recordLabel(record)} is now: ${scopeText}` +
+							(record.scope && record.scope.length > 0
+								? ` (temp writes ${record.allowTmp === false ? "blocked" : "allowed"})`
+								: "") +
+							(live
+								? `\nThe change is live: the running subagent re-reads its scope before every write/edit.`
+								: `\nIt applies to the subagent's next turn.`),
+					},
+				],
+				details: {
+					name: record.name,
+					model: record.model,
+					output: "",
+					status: record.status,
+					usage: record.totalUsage,
+				} as SubagentDetails,
+			};
+		},
+	});
+
+
+	pi.registerTool({
+		name: "subagent_interrupt",
+		label: "Subagent Interrupt",
+		description:
+			"Steer a spawned subagent by interrupting it right now and pushing a message to it immediately. If the subagent is running, its current turn is aborted (its process is killed, mid-tool if necessary), then it resumes from its full session context with your message as the next instruction — no waiting for the current turn to finish. If it is not running, your message starts a new background turn on its session. Use it to steer, redirect, ask for more detail, assign follow-up work, or fix an error.",
+		promptSnippet: "Interrupt and steer a subagent immediately",
+		promptGuidelines: [
+			"Use subagent_interrupt to steer a subagent: it continues with its full previous context, and any in-flight turn is killed immediately so your message takes effect now.",
+			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_interrupt (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
+			"After interrupting, the subagent keeps its full session history, so it can continue from where it was while following the new instruction.",
+		],
+		parameters: InterruptParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const message = params.message?.trim();
+			if (!message) {
+				return {
+					content: [{ type: "text", text: "Error: message is required." }],
+					details: { name: params.name, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
+					isError: true,
+				};
+			}
+			const record = findRecordByName(params.name);
+			if (!record) {
+				return {
+					content: [{ type: "text", text: `Unknown subagent "${params.name}". Spawn one first with subagent_spawn.` }],
+					details: { name: params.name, output: "", status: "error", usage: EMPTY_USAGE() } as SubagentDetails,
+					isError: true,
+				};
+			}
+			const emergencyText = `[emergency] ${message}`;
+			const outcome = await interruptRunning(record, emergencyText);
+			record.donePushedAt = undefined;
+			saveRecord(record);
+
+			if (outcome !== "aborted") {
+				const started = await startBackground(pi, ctx, record, emergencyText);
+				if (!started.started) {
+					return {
+						content: [{ type: "text", text: started.error ?? "Failed to start the subagent turn." }],
+						details: {
+							name: params.name,
+							model: record.model,
+							output: "",
+							status: "error",
+							usage: record.totalUsage,
+						} as SubagentDetails,
+						isError: true,
+					};
+				}
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							outcome === "aborted"
+								? `Interrupted subagent ${recordLabel(record)} with pi's abort and pushed your message into the same session — the in-flight tool call/stream was aborted and it is now running your instruction with full prior context. The result will auto-bubble when it finishes.`
+								: outcome === "restarted"
+									? `Interrupted subagent ${recordLabel(record)} (hard process restart) and pushed your message immediately. The result will auto-bubble when it finishes.`
+									: `Subagent ${recordLabel(record)} was not running; pushed the message as a new turn. The result will auto-bubble when it finishes.`,
 					},
 				],
 				details: {
@@ -1839,7 +2016,7 @@ export default function (pi: ExtensionAPI) {
 				running.delete(record.id);
 			}
 			let removed = 0;
-			for (const file of [recordFile(record.id), sessionFileForRecord(record)]) {
+			for (const file of [recordFile(record.id), sessionFileForRecord(record), scopeFile(record.id)]) {
 				try {
 					fs.unlinkSync(file);
 					removed++;
@@ -1905,7 +2082,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("subagent", {
 		description:
-			"Spawn or manage subagents: /subagent <task> | list | result <name> | send <name> <msg> | switch <name> | forget <name> | model [provider/id] | config",
+			"Manage subagents: /subagent list | result <name> | interrupt <name> <msg> | scope <name> <path|none> | forget <name> | model [provider/id] | config (agents spawn subagents via the subagent_spawn tool)",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const first = parts[0];
@@ -2025,10 +2202,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(lines.length ? lines.join("\n") : "No subagents spawned yet.", "info");
 				return;
 			}
-			if (first === "result" || first === "send" || first === "forget") {
+			if (first === "result" || first === "forget") {
 				const name = parts[1];
 				if (!name) {
-					ctx.ui.notify(`Usage: /subagent ${first} <name>${first === "send" ? " <message>" : ""}`, "info");
+					ctx.ui.notify(`Usage: /subagent ${first} <name>`, "info");
 					return;
 				}
 				if (first === "result") {
@@ -2056,7 +2233,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						running.delete(rec.id);
 					}
-					for (const file of [recordFile(rec.id), sessionFileForRecord(rec)]) {
+					for (const file of [recordFile(rec.id), sessionFileForRecord(rec), scopeFile(rec.id)]) {
 						try {
 							fs.unlinkSync(file);
 						} catch {
@@ -2066,9 +2243,13 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Forgot subagent ${recordLabel(rec)}.`, "info");
 					return;
 				}
-				const message = parts.slice(2).join(" ");
-				if (!message) {
-					ctx.ui.notify(`Usage: /subagent send ${name} <message>`, "info");
+			}
+
+			if (first === "scope") {
+				const name = parts[1];
+				const value = parts.slice(2).join(" ").trim();
+				if (!name) {
+					ctx.ui.notify("Usage: /subagent scope <name> <path[,path...]|none>", "info");
 					return;
 				}
 				const rec = findRecordByName(name);
@@ -2076,88 +2257,59 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Unknown subagent "${name}".`, "error");
 					return;
 				}
-				if (rec.status === "running") {
-					rec.pendingMessages = [...(rec.pendingMessages ?? []), message];
-					saveRecord(rec);
-					ctx.ui.notify(`Subagent ${recordLabel(rec)} is running — message queued; it will run as its next turn when the current run finishes.`, "info");
-					return;
+				if (!value || value === "none") {
+					rec.scope = undefined;
+				} else {
+					const scope = value.includes(",")
+						? value.split(",").map((x) => x.trim()).filter(Boolean)
+						: value;
+					rec.scope = normalizeScope(rec.cwd, scope);
 				}
-				if (ctx.hasUI) ctx.ui.setStatus("subagent", `sending to ${recordLabel(rec)}...`);
-				const result = await runAndRecord(rec, message, ctx.signal, undefined, undefined, childTaskBase(ctx, rec.id));
-				await deliverQueuedMessages(pi, ctx, rec);
-				if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
-				if (!result.ok) {
-					ctx.ui.notify(result.error ?? "Failed", "error");
-					return;
-				}
-				ctx.ui.notify(`[subagent ${recordLabel(rec)}] ${(result.output ?? "").slice(0, 600)}`, "info");
+				saveRecord(rec);
+				writeScopeFile(rec);
+				const scopeText = rec.scope && rec.scope.length > 0 ? rec.scope.join(", ") : "(none — unrestricted)";
+				ctx.ui.notify(`Edit scope for ${recordLabel(rec)}: ${scopeText}`, "info");
 				return;
 			}
 
-			if (first === "switch" || first === "view") {
-				let name = parts[1];
-				if (!name) {
-					const records = listRecords().sort((a, b) => b.createdAt - a.createdAt);
-					if (records.length === 0) {
-						ctx.ui.notify("No subagents to view.", "info");
-						return;
-					}
-					if (!ctx.hasUI || ctx.mode !== "tui") {
-						ctx.ui.notify("Usage: /subagent switch <name>", "info");
-						return;
-					}
-					const byLabel = new Map<string, SubagentRecord>();
-					const labels = records.map((r) => {
-						const label = `${recordLabel(r)} [${r.status}] ${firstLine(r.lastOutput).slice(0, 60) || "(no output)"}`;
-						byLabel.set(label, r);
-						return label;
-					});
-					const choice = await ctx.ui.select("View subagent:", labels);
-					if (!choice) return;
-					name = byLabel.get(choice)?.name ?? choice;
+			if (first === "interrupt") {
+				const name = parts[1];
+				const message = parts.slice(2).join(" ").trim();
+				if (!name || !message) {
+					ctx.ui.notify("Usage: /subagent interrupt <name> <message>", "info");
+					return;
 				}
-				const picked = findRecordByName(name);
-				if (!picked) {
+				const rec = findRecordByName(name);
+				if (!rec) {
 					ctx.ui.notify(`Unknown subagent "${name}".`, "error");
 					return;
 				}
-				await showSubagentViewer(ctx, picked.id);
-				return;
-			}
-
-
-			if (!first) {
+				const emergencyText = `[emergency] ${message}`;
+				const outcome = await interruptRunning(rec, emergencyText);
+				rec.donePushedAt = undefined;
+				saveRecord(rec);
+				if (outcome !== "aborted") {
+					const started = await startBackground(pi, ctx, rec, emergencyText);
+					if (!started.started) {
+						ctx.ui.notify(started.error ?? "Failed to start subagent.", "error");
+						return;
+					}
+				}
 				ctx.ui.notify(
-					"Usage: /subagent <task> | list | result <name> | send <name> <msg> | switch <name> | forget <name> | model [provider/id] | config",
+					outcome === "aborted"
+						? `Interrupted ${recordLabel(rec)} with pi's abort and pushed your message into the same session.`
+						: outcome === "restarted"
+							? `Interrupted ${recordLabel(rec)} (hard restart) and pushed your message immediately.`
+							: `Subagent ${recordLabel(rec)} was idle; pushed the message as a new turn.`,
 					"info",
 				);
 				return;
 			}
-			const task = parts.join(" ");
-			const opts = resolveSpawnOptions(ctx, {});
-			const record: SubagentRecord = {
-				id: newSubagentId(),
-				name: uniqueName(deriveName(task), existingNames()),
-				model: opts.model,
-				systemPrompt: opts.systemPrompt,
-				cwd: opts.cwd,
-				tools: opts.tools,
-				status: "idle",
-				createdAt: Date.now(),
-				updatedAt: Date.now(),
-				lastOutput: "",
-				totalUsage: EMPTY_USAGE(),
-			};
-			saveRecord(record);
-			if (ctx.hasUI) ctx.ui.setStatus("subagent", "spawning subagent...");
-			const result = await runAndRecord(record, task, ctx.signal, undefined, undefined, childTaskBase(ctx, record.id));
-			await deliverQueuedMessages(pi, ctx, record);
-			if (ctx.hasUI) ctx.ui.setStatus("subagent", "");
-			if (!result.ok) {
-				ctx.ui.notify(result.error ?? "Subagent failed", "error");
-				return;
-			}
-			ctx.ui.notify(`[subagent ${recordLabel(record)}] ${(result.output ?? "").slice(0, 600)}`, "info");
+
+			ctx.ui.notify(
+				"Usage: /subagent list | result <name> | interrupt <name> <msg> | scope <name> <path|none> | forget <name> | model [provider/id] | config",
+				"info",
+			);
 		},
 	});
 }
@@ -2220,163 +2372,6 @@ async function showModelPicker(
 	}
 	return await ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
 		return makeModelSelector(ctx, tui, initialFilter, currentLabel, done);
-	});
-}
-
-
-/**
- * Read-only live viewer for a subagent's private session.
- *
- * It only READS the subagent's transcript file and record — it never switches the
- * session, never writes the session file, and never signals the subagent. The main
- * agent and every subagent keep running completely unaffected while the user watches.
- */
-async function showSubagentViewer(ctx: ExtensionCommandContext, id: string): Promise<void> {
-	if (!ctx.hasUI || ctx.mode !== "tui") {
-		const rec = loadRecord(id);
-		const transcript = (readTranscript(id) || rec?.lastOutput || "(no transcript yet)").trim();
-		ctx.ui.notify(transcript.slice(-2000), "info");
-		return;
-	}
-
-	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-		let body: string[] = [];
-		let wrappedWidth = 0;
-		let offset = 0;
-		let follow = true;
-		let dirty = true;
-		let lastSig = "";
-		let header = "";
-		let subHeader = "";
-
-		const transcriptFile = (): string | undefined => {
-			const rec = loadRecord(id);
-			return rec ? rec.sessionPath ?? sessionFileForRecord(rec) : undefined;
-		};
-
-		const statSig = (file: string | undefined): string => {
-			if (!file) return "-";
-			try {
-				const st = fs.statSync(file);
-				return `${st.size}:${st.mtimeMs}`;
-			} catch {
-				return "0";
-			}
-		};
-
-		// Watch both the transcript and the record so status/usage updates show up too.
-		const signature = (): string => `${statSig(transcriptFile())}|${statSig(recordFile(id))}`;
-
-		const rebuild = (width: number): void => {
-			const rec = loadRecord(id);
-			header =
-				theme.fg("accent", theme.bold(` subagent ${rec?.name ?? "(unnamed)"} `)) +
-				theme.fg(rec?.status === "error" ? "error" : "dim", ` [${rec?.status ?? "unknown"}] ${rec?.model ?? "session model"}`);
-			const usage = rec ? formatUsage(rec.totalUsage) : "";
-			const preview = firstLine(rec?.lastOutput ?? "").slice(0, 140);
-			subHeader = theme.fg("dim", `${usage}${usage && preview ? " · " : ""}${preview}`);
-
-			const lines: string[] = [];
-			const file = rec ? rec.sessionPath ?? sessionFileForRecord(rec) : undefined;
-			let raw = "";
-			try {
-				raw = file ? fs.readFileSync(file, "utf-8") : "";
-			} catch {
-
-			}
-			for (const line of raw.split("\n")) {
-				if (!line.trim()) continue;
-				let entry: { type?: string; message?: { role?: string; content?: unknown; toolName?: string } };
-				try {
-					entry = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (entry.type !== "message" || !entry.message) continue;
-				const msg = entry.message;
-				const text = extractText(msg.content).trim();
-				if (msg.role === "user") {
-					lines.push(`${theme.fg("accent", "▌ you")}\n${text}`);
-				} else if (msg.role === "assistant") {
-					if (text) lines.push(`${theme.fg("success", "▌ assistant")}\n${text}`);
-				} else if (msg.role === "toolResult") {
-					const short = text.length > 400 ? `${text.slice(0, 400)}…` : text;
-					lines.push(theme.fg("dim", `  ⚙ ${msg.toolName ?? "tool"}: ${short}`));
-				}
-			}
-			if (lines.length === 0) lines.push(theme.fg("dim", "(no messages yet — the subagent is starting up)"));
-			const wrapped: string[] = [];
-			for (const block of lines) {
-				for (const l of wrapTextWithAnsi(block, Math.max(20, width - 1))) wrapped.push(l);
-			}
-			body = wrapped;
-			wrappedWidth = width;
-			dirty = false;
-		};
-
-		// Poll the transcript file for changes; only re-render when it actually grows.
-		const timer = setInterval(() => {
-			const sig = signature();
-			if (sig !== lastSig) {
-				lastSig = sig;
-				dirty = true;
-				tui.requestRender();
-			}
-		}, 600);
-
-		return {
-			render(width: number) {
-				if (width !== wrappedWidth || dirty) rebuild(width);
-				// Use ~70% of the terminal so the chat and pi's chrome stay visible.
-				const viewport = Math.max(8, Math.floor(tui.terminal.rows * 0.7));
-				const bodyHeight = Math.max(1, viewport - 3);
-				const maxOffset = Math.max(0, body.length - bodyHeight);
-				if (follow) offset = maxOffset;
-				else offset = Math.min(offset, maxOffset);
-				const slice = body.slice(offset, offset + bodyHeight);
-				while (slice.length < bodyHeight) slice.push("");
-				const range =
-					body.length === 0 ? "0/0" : `${offset + 1}-${Math.min(offset + bodyHeight, body.length)}/${body.length}`;
-				const footer = theme.fg(
-					"dim",
-					truncateToWidth(`↑/↓ scroll · PgUp/PgDn · End=follow · Esc close · ${range}${follow ? " (live)" : ""}`, width),
-				);
-				return [truncateToWidth(header, width), truncateToWidth(subHeader, width), ...slice, footer];
-			},
-			invalidate() {
-				wrappedWidth = 0;
-				dirty = true;
-			},
-			handleInput(data: string) {
-				if (matchesKey(data, "escape") || matchesKey(data, "esc") || data === "q" || matchesKey(data, "ctrl+c")) {
-					done();
-					return;
-				}
-				const page = Math.max(1, Math.floor(tui.terminal.rows * 0.7) - 4);
-				if (matchesKey(data, "up")) {
-					offset = Math.max(0, offset - 1);
-					follow = false;
-				} else if (matchesKey(data, "down")) {
-					offset = Math.min(body.length, offset + 1);
-					follow = false;
-				} else if (matchesKey(data, "pageUp")) {
-					offset = Math.max(0, offset - page);
-					follow = false;
-				} else if (matchesKey(data, "pageDown")) {
-					offset = Math.min(body.length, offset + page);
-					follow = false;
-				} else if (matchesKey(data, "end")) {
-					follow = true;
-				} else if (matchesKey(data, "home")) {
-					offset = 0;
-					follow = false;
-				}
-				tui.requestRender();
-			},
-			dispose() {
-				clearInterval(timer);
-			},
-		};
 	});
 }
 
