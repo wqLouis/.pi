@@ -42,9 +42,8 @@ import { ListPickerComponent } from "./list-picker.ts";
 
 const POLL_MS = 1000;
 const MIN_VIEWPORT = 5;
-const MAX_VIEWPORT = 30;
-/** Rows reserved for the overlay chrome (border + header + footer + borders). */
-const CHROME_ROWS = 11;
+/** Rows reserved for the viewer chrome (top border + 2 header lines + footer + bottom border). */
+const CHROME_ROWS = 5;
 
 /** The subset of pi's theme API the viewer needs. */
 export interface ViewTheme {
@@ -324,7 +323,7 @@ export class SubagentViewComponent implements Component {
 
 	private viewportHeight(): number {
 		const rows = this.tui.terminal?.rows ?? 24;
-		return Math.max(MIN_VIEWPORT, Math.min(MAX_VIEWPORT, rows - CHROME_ROWS));
+		return Math.max(MIN_VIEWPORT, rows - CHROME_ROWS);
 	}
 
 	private rule(width: number): string {
@@ -502,6 +501,6 @@ export async function showSubagentView(ctx: ExtensionCommandContext, name?: stri
 	const target = rec;
 	await ctx.ui.custom<void>(
 		(tui, theme, _kb, done) => new SubagentViewComponent({ rec: target, tui, theme, done }),
-		{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center", margin: 1 } },
+		{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center", margin: 0 } },
 	);
 }
