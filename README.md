@@ -36,6 +36,7 @@ automatically:
 
 - `subagent_spawn` — delegate and move on; **every spawn is asynchronous** and the
   completion **auto-bubbles** as a real message with the subagent's full final response.
+  Do not sleep or poll for subagents; the harness wakes the agent when each finishes.
 - `subagent_interrupt` — steering is immediate: it kills the subagent's in-flight turn
   and restarts it with your message; keep working and get pinged when it finishes.
 - **Idle timers** re-deliver anything that was missed (reloads, busy turns)
@@ -52,25 +53,34 @@ flow back to the top.
 ## 1. subagent — spawn, steer, scope
 
 One generic subagent type (model chosen by the user via `/subagent model`),
-each owning a private pi session file. Every turn runs a one-shot pi process
-against that session, so steering truly continues its work with full history.
+each owning a private pi session file (or an OpenCode session, on the opencode
+backend). Every turn runs a one-shot pi/opencode process against that session,
+so steering truly continues its work with full history.
+
+The extension is a folder project (`subagent/`): `index.ts` (wiring), `tools.ts`,
+`command.ts`, `runtime.ts` (process registry, notify, resume), `config.ts` +
+`constants.ts` + `types.ts`, `models.ts` (backend inference, thinking levels),
+`records.ts` / `scope.ts` / `state.ts` (persistence + enforcement), `prompts.ts`,
+`usage.ts`, `child.ts` (in-subagent hooks), `backends/pi.ts` + `backends/opencode.ts`
+(process spawners, ACP probe), and `ui/` (settings panel, pickers).
 
 | Tool | Purpose |
 |------|---------|
-| `subagent_dispatch { exploreScope, tasks: [{ task, scope }], ... }` | Always runs asynchronously: explore once, then fork scoped task agents from the shared exploration session; skips exploration for a single task |
-| `subagent_spawn { task, name, model?, backend?, cwd?, tools?, scope? }` | Spawn one background subagent (always async). Or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent. `backend: "opencode"` (or an `opencode/...` model) runs it on the OpenCode CLI |
+| `subagent_spawn { task?, name?, tasks?, backend?, prefillReads?, scope? }` | Spawn one background subagent (always async), or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent. `backend: "opencode"` runs on the OpenCode CLI; everything else (model, thinking level/effort, cwd, tools, system prompt) comes from the user's configuration |
 | `subagent_interrupt { name, message }` | Steer a subagent now: kills its in-flight turn (or starts a fresh turn if idle) and immediately restarts it with the message (full context preserved) |
 | `subagent_scope { name, scope?, clear?, allowTmp? }` | Change a subagent's edit scope — **live**, even while it is running; `clear: true` restores unrestricted writes |
 | `subagent_list` | Running/finished subagents: name, model, usage, latest output |
 | `subagent_result { name }` | Full transcript: task, steering messages, tool activity, outputs |
 | `subagent_forget { name }` | Delete a subagent and its session |
-| `subagent_config` | Effective config: model, system prompt, cwd, tools |
+| `subagent_config` | Effective config: backend, model, thinking level, OpenCode model/effort, system prompt, cwd, tools, per-pool limits + live usage |
 | `subagent_message { message }` | Bubble-up tool (only inside subagents): send progress, findings, questions, or blockers to the main agent |
 
 Key behaviors:
 
-- **Shared exploration** — `subagent_dispatch` accepts one `exploreScope` and an array of `{ task, scope }` assignments and always returns immediately. With multiple tasks it runs one read-only exploration pass in the background, then uses Pi's session fork API to create each scoped task agent from the explorer's complete session, preserving the shared context and cacheable prefix. With one task it uses a direct fast path and does not create an explorer.
-- **Per-task edit scope** — Every dispatched task supplies its own file or directory scope. The harness blocks that task agent's `write` and `edit` calls outside the assigned scope, preventing parallel tasks from colliding.
+- **Never sleep for subagents** — `subagent_spawn` returns immediately and the
+  harness auto-bubbles the completion; the tool description and guidelines
+  explicitly tell the agent not to sleep, poll, or wait for subagents.
+- **Per-task edit scope** — Every spawn can supply its own file or directory scope. The harness blocks `write` and `edit` calls outside the assigned scope, preventing parallel subagents from colliding.
 - **Session-scoped listing** — Subagent records and `subagent_list` are isolated to the current main session; one session cannot see another session's agents.
 - **Edit scope** — `scope` limits a subagent's writes to a directory or file
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
@@ -98,28 +108,42 @@ Key behaviors:
   `opencode/big-pickle`) to run a subagent on the **OpenCode CLI** instead of pi.
   The child is launched as `opencode acp` and driven over the Agent Client
   Protocol (newline-delimited JSON-RPC on stdio): `initialize` → `session/new`
-  (or `session/load`) → `session/set_config_option` (model) → `session/prompt`,
-  streaming `session/update` chunks back. This is how pi uses OpenCode's **free
-  models**, which the inference endpoint rejects for any client that is not
-  OpenCode itself. OpenCode runs its own agent loop and tools, so give it a
-  self-contained task; pi receives the final text. The OpenCode session id is
+  (or `session/load`) → `session/set_config_option` (model, effort, mode) →
+  `session/prompt`, streaming `session/update` chunks back. This is how pi uses
+  OpenCode's **free models**, which the inference endpoint rejects for any client
+  that is not OpenCode itself. OpenCode runs its own agent loop and tools, so give
+  it a self-contained task; pi receives the final text. The OpenCode session id is
   stored on the record, so `subagent_interrupt` (idle path) and auto-resume
   reload the same conversation via `session/load`, and a mid-run
   `subagent_interrupt` aborts the in-flight turn with `session/cancel` and
   continues on the same session. Edit scope is conveyed to OpenCode in the
-  first-turn preamble (OpenCode enforces its own permissions). Configure the
-  default with `/subagent config backend opencode` and
-  `/subagent config opencodeModel <id>` (default: `opencode/big-pickle`). Models
-  from pi's own `opencode-go` provider stay on the pi backend.
-- **Multi-layer nesting** — subagents can spawn their own sub-subagents up to
-  the configured `maxDepth` layers (default 3), and at most `maxSubagents`
-  subagents run concurrently across all layers (default 4). Both limits are
-  user-configurable (`/subagent config maxDepth N` / `maxSubagents N`, or
-  `maxDepth` / `maxSubagents` in `subagent-config.json`).
+  first-turn preamble (OpenCode enforces its own permissions). The OpenCode
+  model and effort are user configuration: set them in `/subagent config`
+  (backend, OpenCode model + effort, probed live from the CLI) or with
+  `/subagent config backend opencode`, `/subagent config opencodeModel <id>`,
+  and `/subagent config opencodeEffort <variant|default>` (default model:
+  `opencode/big-pickle`). A spawn only chooses the backend — pass
+  `backend: "opencode"`. Models from pi's own `opencode-go` provider stay on the
+  pi backend.
+- **Thinking levels & efforts are user-configured** — the spawn tool does not
+  take model/thinking/effort parameters; it only takes tasks and, optionally,
+  the backend. For pi subagents, `/subagent config` sets the **thinking level**
+  (`off` … `max`, passed to the child as `--thinking`); the panel lists only the
+  levels the selected model supports (`getSupportedThinkingLevels` from
+  `@earendil-works/pi-ai`). For opencode subagents it sets the model's **effort**
+  (`thought_level` variants probed over ACP, selected alongside the model in the
+  panel's picker and applied with `session/set_config_option`); `default` leaves
+  the model default.
+- **Multi-layer isolation** — nested subagents are rejected (`Nested subagents
+  are not supported.`), and the two backends run in **independent concurrency
+  pools**: at most `maxSubagents` pi subagents (default 4) and at most
+  `maxOpencodeSubagents` opencode subagents (default 2) at the same time, so
+  running opencode work never blocks pi work. Configure with
+  `/subagent config maxSubagents N` / `maxOpencodeSubagents N` (or the matching
+  keys in `subagent-config.json`).
 - **Limits visible to every agent** — `subagent_config` and `subagent_list`
-  report how many subagents are running right now vs the `maxSubagents` limit,
-  and the nesting depth; `subagent_spawn` refuses to exceed either limit with
-  a clear reason.
+  report each pool's live usage vs its limit (`maxSubagents` / `maxOpencodeSubagents`);
+  `subagent_spawn` refuses to exceed a pool with a clear reason.
 - **Named subagents** — every spawn requires a short, unique `name` (single `name` or `tasks[].name`); it is the only handle used by users and agents, in listings, completion notifications, and `subagent_interrupt` / `subagent_result` / `subagent_forget` (exact name or unique prefix). The internal id is never shown and exists only for session-file management.
 - **Bubble channel** — `subagent_message` inside a child is
   emitted as `{"type":"subagent_bubble",...}` JSON lines on the child's
@@ -132,12 +156,22 @@ Key behaviors:
   (and triggers one even when idle). If a push was missed (e.g. extension
   reloaded mid-run), a flusher re-delivers it at session start / turn end /
   every 30s.
-- **`/subagent` command** — a management-only command for direct subagents: `list`,
-  `result <name>`, `interrupt <name> <msg>`, `scope <name> <path|none>`, `forget <name>`,
+- **`/subagent` command + settings panel** — a management-only command: `list`,
+  `view [name]` (live, markdown-rendered transcript overlay with scrolling,
+  tool-call cards, follow mode, and Esc to close), `result <name>`,
+  `interrupt <name> <msg>`, `scope <name> <path|none>`, `forget <name>`,
   `model [provider/id]` (pi's built-in model selector; also accepts `opencode/<id>`),
-  `config` (`backend pi|opencode`, `opencodeModel <id>`, `maxSubagents`, `autoResume`,
-  `maxAutoResumes`, `scope`, `allowTmp`). Subagents are spawned by the agent through
-  the `subagent_spawn` tool, not from this command.
+  and `config`. `/subagent config` with no arguments opens an interactive panel
+  where every change **saves immediately** (no Ctrl+S): backend (`auto|pi|opencode`),
+  pi model picker (Tab toggles scoped models), thinking level for the selected model,
+  OpenCode model + effort (probed live from the CLI), `maxSubagents`,
+  `maxOpencodeSubagents` (the opencode pool), `allowTmp`, `autoResume`,
+  `maxAutoResumes`, plus the current cwd/scope. The same keys are
+  settable non-interactively: `backend`, `opencodeModel`, `opencodeEffort`,
+  `thinkingLevel`, `maxSubagents`, `maxOpencodeSubagents`, `autoResume`,
+  `maxAutoResumes`, `scope`, `allowTmp`.
+  Subagents are spawned by the agent through the `subagent_spawn` tool, not from this
+  command.
 - **Session-based context + auto-resume** — each subagent's private pi session file is
   the durable store of its context. Records are scoped to the owning main session and
   record that session's file, so when the main session is resumed (`--continue`/`--resume`
@@ -218,7 +252,8 @@ stored in this repository.
 | `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
-| `PI_SUBAGENT_MAX_DEPTH` / `PI_SUBAGENT_MAX_SUBAGENTS` | Override nesting depth / concurrency limits |
+| `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`) |
+| `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |
 | `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
 | `PI_OPENCODE_BIN` | Path to the `opencode` CLI for opencode-backed subagents (default: `opencode` on `PATH`) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
