@@ -135,8 +135,6 @@ export interface ToolUnitChecklistOptions {
 	units: ToolUnit[];
 	/** Unit ids to start checked. */
 	selected: string[];
-	/** Unit ids that are always on and cannot be switched off. */
-	locked?: string[];
 	hint?: string;
 	onDone: (value: string[] | undefined) => void;
 }
@@ -147,7 +145,6 @@ export interface ToolUnitChecklistOptions {
  */
 export class ToolUnitChecklist implements Component {
 	private readonly selected: Set<string>;
-	private readonly locked: Set<string>;
 	private index = 0;
 	private offset = 0;
 	private cachedWidth?: number;
@@ -155,11 +152,6 @@ export class ToolUnitChecklist implements Component {
 
 	constructor(private readonly opts: ToolUnitChecklistOptions) {
 		this.selected = new Set(opts.selected.filter((id) => opts.units.some((unit) => unit.id === id)));
-		this.locked = new Set(opts.locked ?? []);
-		// A locked unit is always part of the selection.
-		for (const id of this.locked) {
-			if (opts.units.some((unit) => unit.id === id)) this.selected.add(id);
-		}
 	}
 
 	private move(delta: number): void {
@@ -171,7 +163,6 @@ export class ToolUnitChecklist implements Component {
 	private toggle(): void {
 		const unit = this.opts.units[this.index];
 		if (!unit) return;
-		if (this.locked.has(unit.id)) return;
 		if (this.selected.has(unit.id)) this.selected.delete(unit.id);
 		else this.selected.add(unit.id);
 		this.invalidate();
@@ -180,7 +171,6 @@ export class ToolUnitChecklist implements Component {
 	private setAll(selected: boolean): void {
 		this.selected.clear();
 		if (selected) for (const unit of this.opts.units) this.selected.add(unit.id);
-		for (const id of this.locked) this.selected.add(id);
 		this.invalidate();
 	}
 
@@ -282,17 +272,11 @@ export class ToolUnitChecklist implements Component {
 				}
 				const active = i === this.index;
 				const cursor = active ? th.fg("accent", "› ") : "  ";
-				const locked = this.locked.has(unit.id);
-				const checkbox = locked
-					? th.fg("accent", "[*]")
-					: this.selected.has(unit.id)
-						? th.fg("success", "[x]")
-						: th.fg("dim", "[ ]");
+				const checkbox = this.selected.has(unit.id) ? th.fg("success", "[x]") : th.fg("dim", "[ ]");
 				const label = this.selected.has(unit.id)
 					? th.fg("text", unitSummary(unit))
 					: th.fg("muted", unitSummary(unit));
-				const lockNote = locked ? th.fg("dim", "  (always on)") : "";
-				lines.push(truncateToWidth(`  ${cursor}${checkbox} ${label}${lockNote}`, width));
+				lines.push(truncateToWidth(`  ${cursor}${checkbox} ${label}`, width));
 				const detail =
 					unit.kind === "tool" ? (unit.description ?? "") : unit.tools.join(", ");
 				if (detail) lines.push(truncateToWidth(`      ${th.fg("dim", detail)}`, width));

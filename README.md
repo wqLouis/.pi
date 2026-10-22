@@ -281,18 +281,18 @@ The canonical setting is also present in `~/.pi/agent/settings.json`:
 { "defaultTools": ["+codemode"] }
 ```
 
-**Codemode is never switched off.** It is the harness's scripting layer, so the
-tool loadout keeps it active even when the selection excludes it: the
-checklist shows it as `[*] codemode (always on)`, and `/tools none` leaves
-`codemode` as the only active tool.
+**Codemode is not part of the tool selection.** It is the harness's scripting
+layer, so it never appears in the loadout checklist and is always active:
+`/tools none` leaves `codemode` as the only active tool, and `/tools codemode`
+answers that it is always on.
 
 **The system prompt says so.** The extension adds a `codemode` section to the
 structured system prompt:
 
-> Use the codemode tool for multi-step work.
-> - Prefer one codemode script over many individual tool calls: the script can run independent calls with `Promise.allSettled`, chain them, and return only the part you need. A single tool call is fine on its own.
+> Use the codemode tool for all tool work. Do not call tools directly.
+> - Never call a tool directly. Write one codemode script per step instead: it runs the calls (independent ones with `Promise.allSettled`), chains them, and returns only the part you need.
+> - A direct tool call is a mistake, not a shortcut: even a single step belongs in a script.
 > - The script output is what reaches you, so filter large results inside the script instead of pulling everything into the conversation.
-> - Direct tool calls are still right for a one-off step; everything else belongs in a script.
 
 The tool's own description says the same (see section 9).
 
@@ -331,7 +331,8 @@ restores the persisted choice without asking. `/tools` changes it later.
 **The selection is remembered across sessions.** Every choice is also written to
 `~/.pi/agent/tool-loadout.json`, so the next session starts from the last
 selection instead of the default tool set (the checklist opens with it
-pre-checked). `codemode` is always on and cannot be switched off.
+pre-checked). `codemode` is not part of the selection: it is always active and
+is left out of the checklist and of the remembered list.
 
 **Selection unit.** Core tools (`read`, `bash`, `edit`, `write`, `grep`,
 `find`, `ls`, `powershell`) toggle one by one — turning off `write` while

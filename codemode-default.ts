@@ -21,11 +21,11 @@ const CODEMODE_TOOL = "codemode";
 const SECTION_NAME = "codemode";
 
 const CODEMODE_SECTION = [
-	"Use the codemode tool for multi-step work.",
+	"Use the codemode tool for all tool work. Do not call tools directly.",
 	"",
-	"- Prefer one codemode script over many individual tool calls: the script can run independent calls with `Promise.allSettled`, chain them, and return only the part you need. A single tool call is fine on its own.",
+	"- Never call a tool directly. Write one codemode script per step instead: it runs the calls (independent ones with `Promise.allSettled`), chains them, and returns only the part you need.",
+	"- A direct tool call is a mistake, not a shortcut: even a single step belongs in a script.",
 	"- The script output is what reaches you, so filter large results inside the script instead of pulling everything into the conversation.",
-	"- Direct tool calls are still right for a one-off step; everything else belongs in a script.",
 ].join("\n");
 
 function explicitToolsOmitCodemode(pi: ExtensionAPI): boolean {

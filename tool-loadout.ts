@@ -74,18 +74,24 @@ export default function (pi: ExtensionAPI) {
 	let selectedUnits: string[] | undefined;
 	let pendingInjection: string | undefined;
 
+	/** The tools the user picks between. The always-on tools are not part of it. */
 	const declarableTools = (): ToolInfo[] =>
-		pi.getAllTools().filter((tool) => tool.exposure === "direct" || tool.exposure === "model-only");
+		pi
+			.getAllTools()
+			.filter(
+				(tool) =>
+					(tool.exposure === "direct" || tool.exposure === "model-only") &&
+					!ALWAYS_ON_TOOLS.includes(tool.name),
+			);
 
 	const units = (): ToolUnit[] => toolUnits(declarableTools());
 
-	/** The units that hold an always-on tool (codemode). */
-	const alwaysOnUnits = (): string[] => {
-		const all = units();
-		return all
-			.filter((unit) => unit.tools.some((name) => ALWAYS_ON_TOOLS.includes(name)))
-			.map((unit) => unit.id);
-	};
+	/**
+	 * The always-on tools. `codemode` is not part of the selection: it never
+	 * appears in the checklist and is always active.
+	 */
+	const alwaysOnToolNames = (): string[] =>
+		ALWAYS_ON_TOOLS.filter((name) => pi.getAllTools().some((tool) => tool.name === name));
 
 	/** Tool names of the enabled units, restricted to the registered ones. */
 	const selectedToolNames = (): string[] => {
@@ -94,11 +100,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** The enabled tools plus the always-on ones. */
-	const effectiveToolNames = (): string[] => {
-		const known = new Set(declarableTools().map((tool) => tool.name));
-		const always = toolsOfUnits(units(), alwaysOnUnits()).filter((name) => known.has(name));
-		return unique([...selectedToolNames(), ...always]);
-	};
+	const effectiveToolNames = (): string[] =>
+		unique([...selectedToolNames(), ...alwaysOnToolNames()]);
 
 	const persist = (): void => {
 		pi.appendEntry(CUSTOM_TYPE, {
@@ -127,7 +130,8 @@ export default function (pi: ExtensionAPI) {
 		const lines = [
 			"[TOOL LOADOUT — ACTIVE TOOLS]",
 			`Enabled: ${enabled.length > 0 ? enabled.map((unit) => unit.label).join(", ") : "(none)"}.`,
-			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools. The codemode tool is always enabled: prefer one codemode script over many individual tool calls.",
+			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools.",
+			"codemode is always enabled and is not part of this selection: do the tool work through codemode scripts instead of calling the tools one by one.",
 		];
 		if (added.length > 0) lines.push(`Newly available: ${added.join(", ")}.`);
 		if (removed.length > 0) lines.push(`No longer available: ${removed.join(", ")}.`);
@@ -168,10 +172,9 @@ export default function (pi: ExtensionAPI) {
 		const valid = resolveUnitIds(all, unitIds);
 		const previous = selectedUnits !== undefined ? effectiveToolNames() : pi.getActiveTools();
 		const known = new Set(declarableTools().map((tool) => tool.name));
-		const always = toolsOfUnits(all, alwaysOnUnits()).filter((name) => known.has(name));
 		const next = unique([
 			...toolsOfUnits(all, valid).filter((name) => known.has(name)),
-			...always,
+			...alwaysOnToolNames(),
 		]);
 
 		const changed = !sameTools(previous, next);
@@ -197,7 +200,6 @@ export default function (pi: ExtensionAPI) {
 				theme,
 				units: units(),
 				selected: current,
-				locked: alwaysOnUnits(),
 				onDone: (value) => done(value),
 			});
 			return {
@@ -252,7 +254,7 @@ export default function (pi: ExtensionAPI) {
 			`Enabled (${enabled.length}): ${enabled.map((unit) => unit.label).join(", ") || "(none)"}\n` +
 				`Available (${available.length}): ${available.map((unit) => unit.label).join(", ") || "(none)"}\n` +
 				`Active tools: ${effectiveToolNames().join(", ") || "(none)"}\n` +
-				`Always on: ${ALWAYS_ON_TOOLS.join(", ")} · remembered in ${selectionFile()}`,
+				`Always on (not selectable): ${alwaysOnToolNames().join(", ")} · remembered in ${selectionFile()}`,
 			"info",
 		);
 	};
@@ -346,7 +348,11 @@ export default function (pi: ExtensionAPI) {
 					return exposure === "deferred" || exposure === "codemode";
 				})
 			: [];
-		const desired = unique([...effectiveToolNames().filter((name) => known.has(name)), ...dynamic]);
+		const alwaysOn = alwaysOnToolNames();
+		const desired = unique([
+			...effectiveToolNames().filter((name) => known.has(name) || alwaysOn.includes(name)),
+			...dynamic,
+		]);
 		const active = pi.getActiveTools();
 		if (!sameTools(active, desired)) {
 			pi.setActiveTools(desired);
@@ -415,12 +421,22 @@ export default function (pi: ExtensionAPI) {
 				unitIds = [];
 			} else {
 				const matched = all.filter((unit) => wants.some((want) => matches(want.part, unit)));
+				const alwaysOn = alwaysOnToolNames();
 				const unknown = wants
-					.filter((want) => !all.some((unit) => matches(want.part, unit)))
+					.filter(
+						(want) =>
+							!all.some((unit) => matches(want.part, unit)) && !alwaysOn.includes(want.part),
+					)
 					.map((want) => want.part);
 				if (unknown.length > 0) {
 					ctx.ui.notify(`Unknown tools or extensions: ${unknown.join(", ")}`, "warning");
 					return;
+				}
+				const ignored = wants
+					.filter((want) => alwaysOn.includes(want.part))
+					.map((want) => want.part);
+				if (ignored.length > 0) {
+					ctx.ui.notify(`${ignored.join(", ")} is always on and is not part of the selection.`, "info");
 				}
 
 				const matchedIds = matched.map((unit) => unit.id);
