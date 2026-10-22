@@ -26,6 +26,18 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 const SESSION = process.env.PI_SUBAGENT_ID ?? "main";
 
+/**
+ * The main pi process. The browser daemon watches it and closes the browser
+ * when it goes away, so a killed pi leaves no chromium behind. Subagents
+ * inherit the variable, so a finished subagent turn never kills the main
+ * agent's browser.
+ */
+const MAIN_PID = Number(process.env.PI_MAIN_PID ?? process.pid);
+if (!process.env.PI_MAIN_PID) process.env.PI_MAIN_PID = String(process.pid);
+
+/** Only the main process owns the browser daemon. */
+const IS_SUBAGENT = Boolean(process.env.PI_SUBAGENT_ID);
+
 
 function resolvePlaywrightImport(): string | undefined {
 
@@ -163,11 +175,15 @@ async function ensureDaemon(): Promise<{ base: string; token: string }> {
 	fs.rmSync(STATE_FILE, { force: true });
 
 	const token = randomBytes(16).toString("hex");
-	const child = spawn(process.execPath, [DAEMON_FILE, "--port", "0", "--token", token, "--state", STATE_FILE], {
+	const child = spawn(
+		process.execPath,
+		[DAEMON_FILE, "--port", "0", "--token", token, "--state", STATE_FILE, "--owner-pid", String(MAIN_PID)],
+		{
 		stdio: "ignore",
 		detached: true,
-		env: { ...process.env, PI_PLAYWRIGHT_IMPORT: resolvePlaywrightImport() ?? "" },
-	});
+			env: { ...process.env, PI_PLAYWRIGHT_IMPORT: resolvePlaywrightImport() ?? "" },
+		},
+	);
 	child.unref();
 
 
@@ -407,6 +423,26 @@ async function runPlaywrightSetup(ctx: ExtensionCommandContext, force: boolean) 
 }
 
 
+/**
+ * Stop the browser daemon (and with it every browser it holds). The daemon
+ * also watches the owning pi process, so a hard kill of pi is covered too.
+ */
+function killDaemon(): void {
+	const info = readDaemon();
+	if (info?.pid) {
+		try {
+			process.kill(info.pid, "SIGTERM");
+		} catch {
+			// Already gone.
+		}
+	}
+	try {
+		fs.rmSync(STATE_FILE, { force: true });
+	} catch {
+		// Nothing to remove.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("playwright-setup", {
@@ -489,7 +525,15 @@ export default function (pi: ExtensionAPI) {
 
 
 	pi.on("session_shutdown", () => {
-		daemonRequest("/close", {}, 3000).catch(() => {});
+		if (IS_SUBAGENT) {
+			// A subagent only closes its own page; the daemon belongs to the main
+			// pi process and must outlive this turn.
+			daemonRequest("/close", {}, 3000).catch(() => {});
+			return;
+		}
+		// The session is going away (quit, reload, or a session switch): close
+		// the browser and stop the daemon instead of leaving chromium running.
+		killDaemon();
 	});
 }
 

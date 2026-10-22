@@ -13,6 +13,14 @@ const getArg = (name) => {
 const port = Number(getArg("--port") ?? "0");
 const token = getArg("--token") ?? "";
 const statePath = getArg("--state") ?? path.join(process.env.HOME ?? ".", ".pi", "agent", "browser", "daemon.json");
+/**
+ * The pi process that owns this daemon. When it goes away (pi quit, or the
+ * session was replaced), the browser is closed and the daemon exits, so no
+ * chromium is left running. The main pi process is passed in, not the direct
+ * parent, so a finished subagent turn does not kill the main agent's browser.
+ */
+const ownerPid = Number(getArg("--owner-pid") ?? process.env.PI_MAIN_PID ?? process.ppid);
+const OWNER_CHECK_INTERVAL_MS = 4000;
 
 
 const sessions = new Map();
@@ -151,7 +159,8 @@ server.listen(port, "127.0.0.1", () => {
 	process.stdout.write(`browser daemon ready on 127.0.0.1:${actualPort}\n`);
 });
 
-process.on("SIGTERM", async () => {
+/** Close every browser and remove the state file. */
+async function shutdown() {
 	for (const s of sessions.values()) {
 		try {
 			await s.browser.close();
@@ -159,5 +168,41 @@ process.on("SIGTERM", async () => {
 
 		}
 	}
+	sessions.clear();
+	try {
+		fs.rmSync(statePath, { force: true });
+	} catch {
+
+	}
 	process.exit(0);
+}
+
+process.on("SIGTERM", () => {
+	void shutdown();
 });
+process.on("SIGINT", () => {
+	void shutdown();
+});
+
+/**
+ * Stop when the owning pi process is gone. A hard kill of pi never runs its
+ * shutdown hooks, so the daemon watches the owner itself.
+ */
+function ownerIsAlive() {
+	if (!Number.isFinite(ownerPid) || ownerPid <= 0) return true;
+	try {
+		process.kill(ownerPid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means the process exists but belongs to someone else.
+		return error?.code === "EPERM";
+	}
+}
+
+const ownerTimer = setInterval(() => {
+	if (!ownerIsAlive()) {
+		clearInterval(ownerTimer);
+		void shutdown();
+	}
+}, OWNER_CHECK_INTERVAL_MS);
+ownerTimer.unref?.();

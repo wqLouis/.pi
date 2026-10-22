@@ -219,10 +219,18 @@ can hang forever. This extension:
 
 ## 3. playwright-browser — real browser automation
 
-The browser lives in a **detached daemon process** (`browser-server.mjs`), so
-browser state survives pi restarts and one-shot subagent turns — a subagent can
-navigate on turn 1 and keep clicking on turn 2. Each client (main agent or
-subagent) gets its own session/page, so parallel subagents don't collide.
+The browser lives in a **detached daemon process** (`browser-server.mjs`). Each
+client (main agent or subagent) gets its own session/page, so parallel
+subagents don't collide.
+
+**The browser dies with pi.** The daemon is told which pi process owns it
+(`--owner-pid`, the *main* pi process, so a finished subagent turn does not kill
+the main agent's browser) and watches it every few seconds. When that process
+goes away — a clean quit, a session switch, or a hard kill that never runs the
+shutdown hooks — the daemon closes every browser it holds, removes its state
+file and exits. `session_shutdown` (quit, `/reload`, `/new`, `/resume`,
+`/fork`) also stops the daemon directly. A stale daemon from an older version
+is killed and replaced on the next browser call.
 
 | Tool | Purpose |
 |------|---------|
