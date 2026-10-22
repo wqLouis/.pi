@@ -33,9 +33,16 @@ import {
 	unitsOfActiveTools,
 	type ToolUnit,
 } from "./subagent/tool-groups.ts";
+import { loadSelection, saveSelection, selectionFile } from "./subagent/tool-selection.ts";
 
 const CUSTOM_TYPE = "tool-loadout";
 const MAX_PROMPT_CHARS = 8_000;
+
+/**
+ * Tools that are always active. `codemode` is the harness's scripting layer:
+ * it is how multi-step work is done, so it is never switched off.
+ */
+const ALWAYS_ON_TOOLS = ["codemode"];
 
 interface LoadoutState {
 	/** Enabled unit ids. */
@@ -72,16 +79,33 @@ export default function (pi: ExtensionAPI) {
 
 	const units = (): ToolUnit[] => toolUnits(declarableTools());
 
+	/** The units that hold an always-on tool (codemode). */
+	const alwaysOnUnits = (): string[] => {
+		const all = units();
+		return all
+			.filter((unit) => unit.tools.some((name) => ALWAYS_ON_TOOLS.includes(name)))
+			.map((unit) => unit.id);
+	};
+
 	/** Tool names of the enabled units, restricted to the registered ones. */
 	const selectedToolNames = (): string[] => {
 		const known = new Set(declarableTools().map((tool) => tool.name));
 		return toolsOfUnits(units(), selectedUnits ?? []).filter((name) => known.has(name));
 	};
 
+	/** The enabled tools plus the always-on ones. */
+	const effectiveToolNames = (): string[] => {
+		const known = new Set(declarableTools().map((tool) => tool.name));
+		const always = toolsOfUnits(units(), alwaysOnUnits()).filter((name) => known.has(name));
+		return unique([...selectedToolNames(), ...always]);
+	};
+
 	const persist = (): void => {
 		pi.appendEntry(CUSTOM_TYPE, {
 			...(selectedUnits !== undefined ? { units: selectedUnits } : {}),
 		} satisfies LoadoutState);
+		// Remembered across sessions, so a new one starts from the last choice.
+		if (selectedUnits !== undefined) saveSelection(selectedUnits);
 	};
 
 	const updateStatus = (ctx: ExtensionContext): void => {
@@ -103,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 		const lines = [
 			"[TOOL LOADOUT — ACTIVE TOOLS]",
 			`Enabled: ${enabled.length > 0 ? enabled.map((unit) => unit.label).join(", ") : "(none)"}.`,
-			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools.",
+			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools. The codemode tool is always enabled: prefer one codemode script over many individual tool calls.",
 		];
 		if (added.length > 0) lines.push(`Newly available: ${added.join(", ")}.`);
 		if (removed.length > 0) lines.push(`No longer available: ${removed.join(", ")}.`);
@@ -142,9 +166,13 @@ export default function (pi: ExtensionAPI) {
 	const applySelection = (ctx: ExtensionContext, unitIds: string[]): boolean => {
 		const all = units();
 		const valid = resolveUnitIds(all, unitIds);
-		const previous = selectedToolNames();
+		const previous = selectedUnits !== undefined ? effectiveToolNames() : pi.getActiveTools();
 		const known = new Set(declarableTools().map((tool) => tool.name));
-		const next = toolsOfUnits(all, valid).filter((name) => known.has(name));
+		const always = toolsOfUnits(all, alwaysOnUnits()).filter((name) => known.has(name));
+		const next = unique([
+			...toolsOfUnits(all, valid).filter((name) => known.has(name)),
+			...always,
+		]);
 
 		const changed = !sameTools(previous, next);
 		selectedUnits = valid;
@@ -169,6 +197,7 @@ export default function (pi: ExtensionAPI) {
 				theme,
 				units: units(),
 				selected: current,
+				locked: alwaysOnUnits(),
 				onDone: (value) => done(value),
 			});
 			return {
@@ -222,22 +251,30 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(
 			`Enabled (${enabled.length}): ${enabled.map((unit) => unit.label).join(", ") || "(none)"}\n` +
 				`Available (${available.length}): ${available.map((unit) => unit.label).join(", ") || "(none)"}\n` +
-				`Active tools: ${selectedToolNames().join(", ") || "(none)"}`,
+				`Active tools: ${effectiveToolNames().join(", ") || "(none)"}\n` +
+				`Always on: ${ALWAYS_ON_TOOLS.join(", ")} · remembered in ${selectionFile()}`,
 			"info",
 		);
 	};
 
-	/** Unit ids restored from the session: explicit units, or a legacy tool list. */
+	/**
+	 * Unit ids for this session: the session entry first (it follows the
+	 * branch), then the selection remembered from an earlier session, then
+	 * nothing (the user picks at session start).
+	 */
 	const restoredUnitIds = (ctx: ExtensionContext): string[] | undefined => {
-		const state = readState(ctx);
-		if (!state) return undefined;
 		const all = units();
-		if (Array.isArray(state.units)) {
-			return state.units.filter((id) => all.some((unit) => unit.id === id));
+		const state = readState(ctx);
+		if (state) {
+			if (Array.isArray(state.units)) {
+				return state.units.filter((id) => all.some((unit) => unit.id === id));
+			}
+			if (Array.isArray(state.tools)) {
+				return unitsForTools(all, state.tools);
+			}
 		}
-		if (Array.isArray(state.tools)) {
-			return unitsForTools(all, state.tools);
-		}
+		const remembered = loadSelection();
+		if (remembered) return remembered.filter((id) => all.some((unit) => unit.id === id));
 		return undefined;
 	};
 
@@ -309,7 +346,7 @@ export default function (pi: ExtensionAPI) {
 					return exposure === "deferred" || exposure === "codemode";
 				})
 			: [];
-		const desired = unique([...selectedToolNames().filter((name) => known.has(name)), ...dynamic]);
+		const desired = unique([...effectiveToolNames().filter((name) => known.has(name)), ...dynamic]);
 		const active = pi.getActiveTools();
 		if (!sameTools(active, desired)) {
 			pi.setActiveTools(desired);
@@ -371,32 +408,34 @@ export default function (pi: ExtensionAPI) {
 				unit.label.toLowerCase() === part ||
 				unit.id.toLowerCase() === part ||
 				unit.tools.some((tool) => tool.toLowerCase() === part);
-			const matched = all.filter((unit) => wants.some((want) => matches(want.part, unit)));
-			const unknown = wants
-				.filter((want) => !all.some((unit) => matches(want.part, unit)))
-				.map((want) => want.part);
-			if (unknown.length > 0) {
-				ctx.ui.notify(`Unknown tools or extensions: ${unknown.join(", ")}`, "warning");
-				return;
-			}
-
-			const matchedIds = matched.map((unit) => unit.id);
 			let unitIds: string[];
 			if (first === "all") {
 				unitIds = all.map((unit) => unit.id);
 			} else if (first === "none") {
 				unitIds = [];
-			} else if (wants.every((want) => want.mode === "replace")) {
-				unitIds = matchedIds;
 			} else {
-				const current = selectedUnits ?? unitsOfActiveTools(all, pi.getActiveTools());
-				unitIds = [...current];
-				for (const want of wants) {
-					const ids = all.filter((unit) => matches(want.part, unit)).map((unit) => unit.id);
-					if (want.mode === "add") {
-						unitIds = unique([...unitIds, ...ids]);
-					} else {
-						unitIds = unitIds.filter((id) => !ids.includes(id));
+				const matched = all.filter((unit) => wants.some((want) => matches(want.part, unit)));
+				const unknown = wants
+					.filter((want) => !all.some((unit) => matches(want.part, unit)))
+					.map((want) => want.part);
+				if (unknown.length > 0) {
+					ctx.ui.notify(`Unknown tools or extensions: ${unknown.join(", ")}`, "warning");
+					return;
+				}
+
+				const matchedIds = matched.map((unit) => unit.id);
+				if (wants.every((want) => want.mode === "replace")) {
+					unitIds = matchedIds;
+				} else {
+					const current = selectedUnits ?? unitsOfActiveTools(all, pi.getActiveTools());
+					unitIds = [...current];
+					for (const want of wants) {
+						const ids = all.filter((unit) => matches(want.part, unit)).map((unit) => unit.id);
+						if (want.mode === "add") {
+							unitIds = unique([...unitIds, ...ids]);
+						} else {
+							unitIds = unitIds.filter((id) => !ids.includes(id));
+						}
 					}
 				}
 			}

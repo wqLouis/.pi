@@ -268,7 +268,7 @@ Set `CMD_API_KEY` before starting pi, then select a model such as
 `CMD_ZDR=1` by sending the `x-cmd-zdr: 1` request header. API keys are never
 stored in this repository.
 
-## 6. codemode-default — codemode on by default
+## 6. codemode-default — codemode on by default, and recommended
 
 pi registers `codemode` inactive. `codemode-default.ts` activates it on every
 `session_start` (including `/reload`), so scripts can call the other tools,
@@ -280,6 +280,21 @@ The canonical setting is also present in `~/.pi/agent/settings.json`:
 ```json
 { "defaultTools": ["+codemode"] }
 ```
+
+**Codemode is never switched off.** It is the harness's scripting layer, so the
+tool loadout keeps it active even when the selection excludes it: the
+checklist shows it as `[*] codemode (always on)`, and `/tools none` leaves
+`codemode` as the only active tool.
+
+**The system prompt says so.** The extension adds a `codemode` section to the
+structured system prompt:
+
+> Use the codemode tool for multi-step work.
+> - Prefer one codemode script over many individual tool calls: the script can run independent calls with `Promise.allSettled`, chain them, and return only the part you need. A single tool call is fine on its own.
+> - The script output is what reaches you, so filter large results inside the script instead of pulling everything into the conversation.
+> - Direct tool calls are still right for a one-off step; everything else belongs in a script.
+
+The tool's own description says the same (see section 9).
 
 ## 7. agent-mode — system-prompt templates at session/compaction boundaries
 
@@ -313,6 +328,11 @@ The footer shows `mode:token-maxing` or `mode:single`.
 set; Escape keeps the restored/default set. Resuming or reloading a session
 restores the persisted choice without asking. `/tools` changes it later.
 
+**The selection is remembered across sessions.** Every choice is also written to
+`~/.pi/agent/tool-loadout.json`, so the next session starts from the last
+selection instead of the default tool set (the checklist opens with it
+pre-checked). `codemode` is always on and cannot be switched off.
+
 **Selection unit.** Core tools (`read`, `bash`, `edit`, `write`, `grep`,
 `find`, `ls`, `powershell`) toggle one by one — turning off `write` while
 keeping `read` is a normal wish. Everything an **extension** registers is one
@@ -326,7 +346,7 @@ tool added to an extension joins the unit automatically.
 /tools read,bash,edit          # replace the selection with these
 /tools +subagent               # add a unit (or a single core tool)
 /tools -write                  # remove a unit (or a single core tool)
-/tools all | none              # every unit / no unit
+/tools all | none              # every unit / only codemode (always on)
 /tools show                    # current selection + available units
 ```
 

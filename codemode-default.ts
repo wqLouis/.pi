@@ -1,9 +1,12 @@
 /**
- * Codemode by default.
+ * Codemode by default, and explicitly recommended.
  *
  * `codemode` is registered inactive by pi. This extension activates it at the
- * start of every session (and after `/reload`), so the agent always has the
- * codemode tool available without requiring a `defaultTools` setting.
+ * start of every session (and after `/reload`) and keeps it active: it is the
+ * harness's scripting layer, so it is never switched off by the tool loadout.
+ *
+ * It also adds a system-prompt section that tells the agent to work through
+ * codemode scripts instead of chaining single tool calls.
  *
  * Explicit configuration wins: `--tools`, `--no-tools`, or a plain
  * `defaultTools` list that omits `codemode` is left alone. Opt out for one
@@ -15,6 +18,15 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CODEMODE_TOOL = "codemode";
+const SECTION_NAME = "codemode";
+
+const CODEMODE_SECTION = [
+	"Use the codemode tool for multi-step work.",
+	"",
+	"- Prefer one codemode script over many individual tool calls: the script can run independent calls with `Promise.allSettled`, chain them, and return only the part you need. A single tool call is fine on its own.",
+	"- The script output is what reaches you, so filter large results inside the script instead of pulling everything into the conversation.",
+	"- Direct tool calls are still right for a one-off step; everything else belongs in a script.",
+].join("\n");
 
 function explicitToolsOmitCodemode(pi: ExtensionAPI): boolean {
 	const configured = pi.getSettings().defaultTools;
@@ -53,4 +65,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", enable);
+
+	pi.on("before_agent_start", (event) => {
+		// The section is a structured part of the prompt, so pi's section
+		// machinery (and the prompt cache) keep working.
+		const sections = event.systemPromptOptions.sections;
+		if (sections[SECTION_NAME] === CODEMODE_SECTION) return undefined;
+		sections[SECTION_NAME] = CODEMODE_SECTION;
+		return undefined;
+	});
 }
