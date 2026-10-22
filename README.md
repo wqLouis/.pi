@@ -24,7 +24,7 @@ self-managing, multi-agent system. Eight extensions, loaded from
 5. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
 6. **codemode-default** — `codemode` is active in every session by default.
 7. **agent-mode** — pick TOKEN MAXING (delegate to subagents) or SINGLE AGENT at startup and after compaction.
-8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); changes are injected without replacing the cached system prompt.
+8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); core tools toggle one by one, extension tools as a unit.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -176,13 +176,14 @@ Key behaviors:
   Subagents are spawned by the agent through the `subagent_spawn` tool, not from this
   command.
 - **Per-subagent tools** — `/subagent config` includes a **Subagent tools**
-  checklist (also `/subagent config tools read,bash,edit`, `tools core`, `tools all`, or `tools reset`).
-  The comma-separated list is stored as `tools` in `subagent-config.json`,
-  passed to pi-backed children as `--tools`, and reported by `subagent_config`.
-  Unset means the child inherits its normal default tools. Changes apply to
-  newly spawned subagents. OpenCode has its own tool names, so the list is sent
-  there as a preference in the first-turn preamble rather than as a hard
-  allowlist.
+  checklist (also `/subagent config tools read,bash,edit`, `tools all`, or
+  `tools reset`). Core tools toggle one by one; an extension's tools are one
+  unit, so a child gets all of an extension's tools or none. The
+  comma-separated list is stored as `tools` in `subagent-config.json`, passed to
+  pi-backed children as `--tools`, and reported by `subagent_config`. Unset
+  means the child inherits its normal default tools. Changes apply to newly
+  spawned subagents. OpenCode has its own tool names, so the list is sent there
+  as a preference in the first-turn preamble rather than as a hard allowlist.
 - **Session-based context + auto-resume** — each subagent's private pi session file is
   the durable store of its context. Records are scoped to the owning main session and
   record that session's file, so when the main session is resumed (`--continue`/`--resume`
@@ -300,14 +301,27 @@ The footer shows `mode:token-maxing` or `mode:single`.
 set; Escape keeps the restored/default set. Resuming or reloading a session
 restores the persisted choice without asking. `/tools` changes it later.
 
+**Selection unit.** Core tools (`read`, `bash`, `edit`, `write`, `grep`,
+`find`, `ls`, `powershell`) toggle one by one — turning off `write` while
+keeping `read` is a normal wish. Everything an **extension** registers is one
+unit: the browser tools, the subagent tools and pi's built-in `codemode` /
+`tool_search` extensions are enabled or disabled as a whole, because half an
+extension is rarely useful. The unit id is the extension's file path, so a new
+tool added to an extension joins the unit automatically.
+
 ```text
 /tools                         # interactive checklist
-/tools read,bash,edit          # set an explicit list
-/tools core                    # read, bash, edit, write, codemode
-/tools readonly                # read, grep, find, ls
-/tools all | none              # every declarable tool / no tools
-/tools show                    # current selection + available tools
+/tools read,bash,edit          # replace the selection with these
+/tools +subagent               # add a unit (or a single core tool)
+/tools -write                  # remove a unit (or a single core tool)
+/tools all | none              # every unit / no unit
+/tools show                    # current selection + available units
 ```
+
+Note: `codemode` does not bypass the loadout. A script can only call tools
+that are callable — a `direct` tool must be active. With `codemode` alone the
+sandbox has no `tools.read`/`tools.bash` (only MCP tools with `codemode`
+exposure stay reachable).
 
 **Cache safety and interruptions.** Changing tools with
 `pi.setActiveTools()` makes pi record a system-prompt *patch*

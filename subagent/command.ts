@@ -29,8 +29,8 @@ import { interruptRunning, running, startBackground } from "./runtime.ts";
 import { normalizeScope, writeScopeFile } from "./scope.ts";
 import { recordFile, scopeFile, sessionFileForRecord, subagentDir } from "./state.ts";
 import { showSubagentConfigUi } from "./ui/config-panel.ts";
-import { ToolChecklistComponent } from "./ui/tool-picker.ts";
-import { initialSubagentToolSelection, listSubagentTools } from "./tool-options.ts";
+import { initialSubagentToolUnits, listSubagentToolUnits } from "./tool-options.ts";
+import { ToolUnitChecklist, toolsOfUnits } from "./tool-groups.ts";
 import { showModelPicker } from "./ui/model-selector.ts";
 import { showSubagentView } from "./ui/subagent-view.ts";
 import type { SubagentRecord } from "./types.ts";
@@ -70,7 +70,7 @@ function listAllRecords(): SubagentRecord[] {
 }
 
 const CONFIG_USAGE =
-	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|core|readonly|reset>] — no args opens the settings panel.";
+	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|reset>] — no args opens the settings panel.";
 
 export function registerSubagentCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("subagent", {
@@ -204,24 +204,24 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 				}
 				if (key === "tools") {
 					const value = parts.slice(2).join(" ").trim();
-					const tools = listSubagentTools(pi);
+					const units = listSubagentToolUnits(pi);
 					if (!value) {
 						if (ctx.mode !== "tui") {
 							ctx.ui.notify(
-								`Subagent tools: ${cfg.tools ?? "(inherit child defaults)"}. Use /subagent config tools <names|all|core|readonly|reset>.`,
+								`Subagent tools: ${cfg.tools ?? "(inherit child defaults)"}. Use /subagent config tools <names|all|reset>.`,
 								"info",
 							);
 							return;
 						}
 						await ctx.ui.custom<void>((_tui, theme, _kb, done) =>
-							new ToolChecklistComponent({
+							new ToolUnitChecklist({
 								title: "Subagent tools",
 								theme,
-								tools,
-								selected: initialSubagentToolSelection(pi, cfg.tools, tools),
+								units,
+								selected: initialSubagentToolUnits(pi, cfg.tools, units),
 								onDone: (picked) => {
 									if (picked !== undefined) {
-										cfg.tools = formatToolList(picked);
+										cfg.tools = formatToolList(toolsOfUnits(units, picked));
 										saveConfig(cfg);
 										ctx.ui.notify(
 											cfg.tools
@@ -236,27 +236,30 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 						);
 						return;
 					}
-					if (["reset", "default", "clear", "none"].includes(value.toLowerCase())) {
+					if (["reset", "default", "clear"].includes(value.toLowerCase())) {
 						cfg.tools = undefined;
 						saveConfig(cfg);
 						ctx.ui.notify("Subagent tools reset to child defaults.", "info");
 						return;
 					}
 					const preset = value.toLowerCase();
-					const names =
-						preset === "all"
-							? tools.map((tool) => tool.name)
-							: preset === "core"
-								? ["read", "bash", "edit", "write", "codemode"]
-								: preset === "readonly"
-									? ["read", "grep", "find", "ls"]
-									: parseToolList(value);
-					const known = new Set(tools.map((tool) => tool.name));
-					const isPreset = preset === "all" || preset === "core" || preset === "readonly";
-					const unknown = isPreset ? [] : names.filter((name) => !known.has(name));
-					if (unknown.length > 0) {
-						ctx.ui.notify(`Unknown or non-declarable tools: ${unknown.join(", ")}`, "warning");
-						return;
+					const known = new Set(units.flatMap((unit) => unit.tools));
+					let names: string[];
+					if (preset === "all") {
+						names = units.flatMap((unit) => unit.tools);
+					} else {
+						const wanted = parseToolList(value).map((name) => name.toLowerCase());
+						const matches = (part: string, unit: (typeof units)[number]) =>
+							unit.label.toLowerCase() === part ||
+							unit.id.toLowerCase() === part ||
+							unit.tools.some((tool) => tool.toLowerCase() === part);
+						const matched = units.filter((unit) => wanted.some((part) => matches(part, unit)));
+						const unknown = wanted.filter((part) => !units.some((unit) => matches(part, unit)));
+						if (unknown.length > 0) {
+							ctx.ui.notify(`Unknown tools or extensions: ${unknown.join(", ")}`, "warning");
+							return;
+						}
+						names = toolsOfUnits(matched, matched.map((unit) => unit.id));
 					}
 					cfg.tools = formatToolList(names.filter((name) => known.has(name)));
 					saveConfig(cfg);

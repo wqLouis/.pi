@@ -3,42 +3,32 @@
  *
  * A spawned pi child starts from the same registered tools as this process, so
  * the parent can present a checklist and pass the chosen names to the child as
- * `--tools`.
+ * `--tools`. Core tools toggle one by one; an extension's tools are one unit,
+ * so a child gets all of an extension's tools or none.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseToolList } from "./config.ts";
+import { toolUnits, unitsOfActiveTools, type ToolUnit } from "./tool-groups.ts";
 
-export interface SubagentToolChoice {
-	name: string;
-	description: string;
-	builtin: boolean;
+/** The selectable units for a child: core tools plus one unit per extension. */
+export function listSubagentToolUnits(pi: ExtensionAPI): ToolUnit[] {
+	return toolUnits(pi.getAllTools().filter((tool) => tool.exposure === "direct" || tool.exposure === "model-only"));
 }
 
-/** Tools a subagent can be given directly (direct/model-only exposure). */
-export function listSubagentTools(pi: ExtensionAPI): SubagentToolChoice[] {
-	return pi
-		.getAllTools()
-		.filter((tool) => tool.exposure === "direct" || tool.exposure === "model-only")
-		.sort((a, b) => {
-			const rank = (tool: typeof a) => (tool.sourceInfo.source === "builtin" ? 0 : 1);
-			return rank(a) - rank(b) || a.name.localeCompare(b.name);
-		})
-		.map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			builtin: tool.sourceInfo.source === "builtin",
-		}));
-}
-
-/** Initial checklist state: the configured set, else the parent's current tools. */
-export function initialSubagentToolSelection(
+/** Initial checklist state: the configured tool list, else the parent's current tools. */
+export function initialSubagentToolUnits(
 	pi: ExtensionAPI,
 	configured: string | undefined,
-	tools: SubagentToolChoice[] = listSubagentTools(pi),
+	units: ToolUnit[] = listSubagentToolUnits(pi),
 ): string[] {
-	const known = new Set(tools.map((tool) => tool.name));
+	const known = new Set(units.flatMap((unit) => unit.tools));
 	const saved = parseToolList(configured).filter((name) => known.has(name));
-	if (saved.length > 0) return saved;
-	return pi.getActiveTools().filter((name) => known.has(name));
+	if (saved.length > 0) {
+		// A legacy per-tool list: keep the units that contain those tools.
+		return units
+			.filter((unit) => unit.tools.some((tool) => saved.includes(tool)))
+			.map((unit) => unit.id);
+	}
+	return unitsOfActiveTools(units, pi.getActiveTools());
 }

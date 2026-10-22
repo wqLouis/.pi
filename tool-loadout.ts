@@ -1,10 +1,12 @@
 /**
  * Tool Loadout — per-session tool selection without rewriting the cached prompt.
  *
- * At the start of a new session the user picks the tools for that session with
- * an interactive checklist; `/tools` changes the selection later. Resuming or
- * reloading a session restores the persisted choice. The chosen set is enforced
- * before every run.
+ * At the start of a new session the user picks the tools for that session.
+ * Core tools (read, bash, edit, write, …) toggle individually; everything an
+ * extension registers is one unit, so an extension's tools are enabled or
+ * disabled as a whole. `/tools` changes the selection later. Resuming or
+ * reloading a session restores the persisted choice. The chosen set is
+ * enforced before every run.
  *
  * Cache safety: the extension never returns a replacement `systemPrompt`.
  * `pi.setActiveTools()` records the tool delta as a system-prompt patch
@@ -23,197 +25,32 @@ import type {
 	Theme,
 	ToolInfo,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import {
+	ToolUnitChecklist,
+	toolUnits,
+	toolsOfUnits,
+	unitsForTools,
+	unitsOfActiveTools,
+	type ToolUnit,
+} from "./subagent/tool-groups.ts";
 
 const CUSTOM_TYPE = "tool-loadout";
 const MAX_PROMPT_CHARS = 8_000;
-const PICKER_MAX_VISIBLE = 14;
 
 interface LoadoutState {
+	/** Enabled unit ids. */
+	units?: string[];
+	/** Legacy per-tool selection (older sessions). */
 	tools?: string[];
-}
-
-interface PickerItem {
-	value: string;
-	label: string;
-	description: string;
-	group: string;
-	selected: boolean;
-}
-
-class ToolPicker {
-	private selectedIndex: number;
-	private offset = 0;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: Theme,
-		private readonly title: string,
-		private readonly items: PickerItem[],
-		private readonly done: (value: string[] | undefined) => void,
-	) {
-		const firstSelected = items.findIndex((item) => item.selected);
-		this.selectedIndex = firstSelected >= 0 ? firstSelected : 0;
-	}
-
-	private selectedTools(): string[] {
-		return this.items.filter((item) => item.selected).map((item) => item.value);
-	}
-
-	private move(delta: number): void {
-		if (this.items.length === 0) return;
-		this.selectedIndex = (this.selectedIndex + delta + this.items.length) % this.items.length;
-		this.invalidate();
-		this.tui.requestRender();
-	}
-
-	private toggle(): void {
-		const item = this.items[this.selectedIndex];
-		if (!item) return;
-		item.selected = !item.selected;
-		this.invalidate();
-		this.tui.requestRender();
-	}
-
-	private setAll(selected: boolean): void {
-		for (const item of this.items) item.selected = selected;
-		this.invalidate();
-		this.tui.requestRender();
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.done(undefined);
-			return;
-		}
-		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
-			this.done(this.selectedTools());
-			return;
-		}
-		if (matchesKey(data, "up") || matchesKey(data, "k")) {
-			this.move(-1);
-			return;
-		}
-		if (matchesKey(data, "down") || matchesKey(data, "j")) {
-			this.move(1);
-			return;
-		}
-		if (matchesKey(data, "pageUp")) {
-			this.move(-PICKER_MAX_VISIBLE);
-			return;
-		}
-		if (matchesKey(data, "pageDown")) {
-			this.move(PICKER_MAX_VISIBLE);
-			return;
-		}
-		if (matchesKey(data, "home")) {
-			this.selectedIndex = 0;
-			this.invalidate();
-			this.tui.requestRender();
-			return;
-		}
-		if (matchesKey(data, "end")) {
-			this.selectedIndex = Math.max(0, this.items.length - 1);
-			this.invalidate();
-			this.tui.requestRender();
-			return;
-		}
-		if (matchesKey(data, "space") || data === " ") {
-			this.toggle();
-			return;
-		}
-		const lower = data.toLowerCase();
-		if (lower === "a") {
-			this.setAll(true);
-			return;
-		}
-		if (lower === "n") {
-			this.setAll(false);
-		}
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedWidth === width && this.cachedLines) return this.cachedLines;
-
-		const th = this.theme;
-		const lines: string[] = [];
-		const selectedCount = this.items.filter((item) => item.selected).length;
-
-		lines.push("");
-		lines.push(
-			truncateToWidth(
-				`${th.fg("accent", th.bold(` ${this.title} `))}${th.fg("dim", `(${selectedCount}/${this.items.length} selected)`)}`,
-				width,
-			),
-		);
-		lines.push("");
-
-		if (this.items.length === 0) {
-			lines.push(truncateToWidth(`  ${th.fg("dim", "No selectable tools are registered.")}`, width));
-		} else {
-			if (this.selectedIndex < this.offset) this.offset = this.selectedIndex;
-			if (this.selectedIndex >= this.offset + PICKER_MAX_VISIBLE) {
-				this.offset = this.selectedIndex - PICKER_MAX_VISIBLE + 1;
-			}
-
-			const end = Math.min(this.items.length, this.offset + PICKER_MAX_VISIBLE);
-			let lastGroup: string | undefined;
-			for (let index = this.offset; index < end; index++) {
-				const item = this.items[index];
-				if (!item) continue;
-				if (item.group !== lastGroup) {
-					if (lastGroup !== undefined) lines.push("");
-					lines.push(truncateToWidth(`  ${th.fg("accent", th.bold(item.group))}`, width));
-					lastGroup = item.group;
-				}
-				const active = index === this.selectedIndex;
-				const cursor = active ? th.fg("accent", "› ") : "  ";
-				const checkbox = item.selected ? th.fg("success", "[x]") : th.fg("dim", "[ ]");
-				const label = item.selected ? th.fg("text", item.label) : th.fg("muted", item.label);
-				const description = item.description ? `  ${th.fg("dim", item.description)}` : "";
-				lines.push(truncateToWidth(`  ${cursor}${checkbox} ${label}${description}`, width));
-			}
-
-			if (this.offset > 0 || end < this.items.length) {
-				lines.push(
-					truncateToWidth(
-						`  ${th.fg("dim", `${this.offset + 1}–${end} of ${this.items.length}`)}`,
-						width,
-					),
-				);
-			}
-		}
-
-		lines.push("");
-		lines.push(
-			truncateToWidth(
-				`  ${th.fg("dim", "↑/↓ move · space toggle · a all · n none · enter apply · esc cancel")}`,
-				width,
-			),
-		);
-		lines.push("");
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
-	}
 }
 
 const unique = (values: string[]): string[] => [...new Set(values.filter(Boolean))];
 
-const sameTools = (a: string[], b: string[]): boolean =>
-	a.length === b.length && a.every((value, index) => value === b[index]);
-
-const compactText = (value: string, max = 120): string => {
-	const text = value.replace(/\s+/g, " ").trim();
-	return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+/** Set comparison: the order of the declared tools does not matter. */
+const sameTools = (a: string[], b: string[]): boolean => {
+	if (a.length !== b.length) return false;
+	const other = new Set(b);
+	return a.every((value) => other.has(value));
 };
 
 function readState(ctx: ExtensionContext): LoadoutState | undefined {
@@ -226,60 +63,56 @@ function readState(ctx: ExtensionContext): LoadoutState | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
-	let selectedTools: string[] | undefined;
+	/** Enabled unit ids; undefined until the user picks (or a session restores one). */
+	let selectedUnits: string[] | undefined;
 	let pendingInjection: string | undefined;
 
-	const declarableTools = (): ToolInfo[] => {
-		const tools = pi
-			.getAllTools()
-			.filter((tool) => tool.exposure === "direct" || tool.exposure === "model-only");
-		const rank = (tool: ToolInfo) => (tool.sourceInfo.source === "builtin" ? 0 : 1);
-		return tools.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
-	};
+	const declarableTools = (): ToolInfo[] =>
+		pi.getAllTools().filter((tool) => tool.exposure === "direct" || tool.exposure === "model-only");
 
-	const sanitize = (names: string[]): string[] => {
+	const units = (): ToolUnit[] => toolUnits(declarableTools());
+
+	/** Tool names of the enabled units, restricted to the registered ones. */
+	const selectedToolNames = (): string[] => {
 		const known = new Set(declarableTools().map((tool) => tool.name));
-		return unique(names).filter((name) => known.has(name));
+		return toolsOfUnits(units(), selectedUnits ?? []).filter((name) => known.has(name));
 	};
 
 	const persist = (): void => {
 		pi.appendEntry(CUSTOM_TYPE, {
-			...(selectedTools !== undefined ? { tools: selectedTools } : {}),
+			...(selectedUnits !== undefined ? { units: selectedUnits } : {}),
 		} satisfies LoadoutState);
 	};
 
 	const updateStatus = (ctx: ExtensionContext): void => {
 		if (ctx.mode !== "tui") return;
 		const theme = ctx.ui.theme;
-		const label = selectedTools === undefined ? "tools:auto" : `tools:${selectedTools.length}`;
+		const all = units();
+		const label =
+			selectedUnits === undefined ? "tools:auto" : `tools:${selectedUnits.length}/${all.length}`;
 		ctx.ui.setStatus("tool-loadout", theme.fg("accent", label));
 	};
 
 	const buildLoadoutPrompt = (next: string[], previous: string[]): string => {
-		const infoByName = new Map(declarableTools().map((tool) => [tool.name, tool]));
+		const all = units();
+		const enabled = all.filter((unit) => unit.tools.some((name) => next.includes(name)));
+		const disabled = all.filter((unit) => !unit.tools.some((name) => next.includes(name)));
 		const added = next.filter((name) => !previous.includes(name));
 		const removed = previous.filter((name) => !next.includes(name));
 
 		const lines = [
-			"[TOOL LOADOUT — ACTIVE SET]",
-			`The active tool set for this session is now: ${next.length > 0 ? next.join(", ") : "(none)"}.`,
-			"Use only these tools. Tools that are not listed are disabled or reachable only through codemode. If you need a tool that is not enabled, ask the user to enable it with /tools.",
+			"[TOOL LOADOUT — ACTIVE TOOLS]",
+			`Enabled: ${enabled.length > 0 ? enabled.map((unit) => unit.label).join(", ") : "(none)"}.`,
+			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools.",
 		];
-		if (added.length > 0) lines.push(`Newly enabled: ${added.join(", ")}.`);
-		if (removed.length > 0) lines.push(`Disabled: ${removed.join(", ")}.`);
+		if (added.length > 0) lines.push(`Newly available: ${added.join(", ")}.`);
+		if (removed.length > 0) lines.push(`No longer available: ${removed.join(", ")}.`);
+		if (disabled.length > 0) {
+			lines.push(`Disabled: ${disabled.map((unit) => unit.label).join(", ")}.`);
+		}
 		lines.push(
 			"If this update interrupted your previous turn, continue the interrupted task using the new tool set.",
 		);
-
-		const rules: string[] = [];
-		for (const name of added) {
-			const info = infoByName.get(name);
-			const guidelines = info?.promptGuidelines?.map((line) => line.trim()).filter(Boolean) ?? [];
-			if (guidelines.length > 0) rules.push(`- ${name}: ${guidelines.join(" ")}`);
-		}
-		if (rules.length > 0) {
-			lines.push("", "Rules for newly enabled tools:", ...rules);
-		}
 
 		const text = lines.join("\n");
 		return text.length > MAX_PROMPT_CHARS
@@ -287,50 +120,67 @@ export default function (pi: ExtensionAPI) {
 			: text;
 	};
 
-	const applySelection = (ctx: ExtensionContext, names: string[]): boolean => {
-		const hadSelection = selectedTools !== undefined;
-		const previous = selectedTools ?? sanitize(pi.getActiveTools());
-		const next = sanitize(names);
-		const changed = !sameTools(previous, next);
+	/** Accept unit ids as well as plain tool names, and map both to unit ids. */
+	const resolveUnitIds = (all: ToolUnit[], ids: string[]): string[] => {
+		const resolved: string[] = [];
+		for (const id of ids) {
+			const unit = all.find((candidate) => candidate.id === id);
+			if (unit) {
+				resolved.push(unit.id);
+				continue;
+			}
+			for (const candidate of all) {
+				if (candidate.tools.includes(id)) {
+					resolved.push(candidate.id);
+					break;
+				}
+			}
+		}
+		return unique(resolved);
+	};
 
-		selectedTools = next;
+	const applySelection = (ctx: ExtensionContext, unitIds: string[]): boolean => {
+		const all = units();
+		const valid = resolveUnitIds(all, unitIds);
+		const previous = selectedToolNames();
+		const known = new Set(declarableTools().map((tool) => tool.name));
+		const next = toolsOfUnits(all, valid).filter((name) => known.has(name));
+
+		const changed = !sameTools(previous, next);
+		selectedUnits = valid;
 		if (changed) {
 			pi.setActiveTools(next);
 			pendingInjection = buildLoadoutPrompt(next, previous);
 		}
-		if (changed || !hadSelection) persist();
+		persist();
 		updateStatus(ctx);
 		return changed;
 	};
 
-	const pickTools = async (
+	const pickUnits = async (
 		ctx: ExtensionContext,
 		title: string,
 		current: string[],
 	): Promise<string[] | undefined> => {
 		if (!ctx.hasUI || ctx.mode !== "tui") return undefined;
-		const items: PickerItem[] = declarableTools().map((info) => ({
-			value: info.name,
-			label: info.name,
-			description: compactText(
-				info.description,
-				120,
-			),
-			group: info.sourceInfo.source === "builtin" ? "Built-in" : "Extension",
-			selected: current.includes(info.name),
-		}));
-
 		return await ctx.ui.custom<string[] | undefined>((tui, theme, _keybindings, done) => {
-			const picker = new ToolPicker(tui, theme, title, items, done);
+			const checklist = new ToolUnitChecklist({
+				title,
+				theme,
+				units: units(),
+				selected: current,
+				onDone: (value) => done(value),
+			});
 			return {
 				render(width: number) {
-					return picker.render(width);
+					return checklist.render(width);
 				},
 				invalidate() {
-					picker.invalidate();
+					checklist.invalidate();
 				},
 				handleInput(data: string) {
-					picker.handleInput(data);
+					checklist.handleInput(data);
+					tui.requestRender();
 				},
 			};
 		});
@@ -366,32 +216,41 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const notifyCurrent = (ctx: ExtensionContext): void => {
-		if (selectedTools === undefined) selectedTools = sanitize(pi.getActiveTools());
-		const available = declarableTools().map((tool) => tool.name);
+		const all = units();
+		const enabled = all.filter((unit) => selectedUnits?.includes(unit.id));
+		const available = all.filter((unit) => !selectedUnits?.includes(unit.id));
 		ctx.ui.notify(
-			`Active tools (${selectedTools.length}): ${selectedTools.join(", ") || "(none)"}\n` +
-				`Available (${available.length}): ${available.join(", ")}`,
+			`Enabled (${enabled.length}): ${enabled.map((unit) => unit.label).join(", ") || "(none)"}\n` +
+				`Available (${available.length}): ${available.map((unit) => unit.label).join(", ") || "(none)"}\n` +
+				`Active tools: ${selectedToolNames().join(", ") || "(none)"}`,
 			"info",
 		);
 	};
 
-	const restore = (ctx: ExtensionContext): void => {
+	/** Unit ids restored from the session: explicit units, or a legacy tool list. */
+	const restoredUnitIds = (ctx: ExtensionContext): string[] | undefined => {
 		const state = readState(ctx);
-		// Keep names that are not registered yet (for example MCP tools that
-		// connect after session_start); they activate when they register.
-		selectedTools = Array.isArray(state?.tools)
-			? unique(state.tools.filter((name): name is string => typeof name === "string"))
-			: sanitize(pi.getActiveTools());
+		if (!state) return undefined;
+		const all = units();
+		if (Array.isArray(state.units)) {
+			return state.units.filter((id) => all.some((unit) => unit.id === id));
+		}
+		if (Array.isArray(state.tools)) {
+			return unitsForTools(all, state.tools);
+		}
+		return undefined;
+	};
+
+	const restore = (ctx: ExtensionContext): void => {
+		selectedUnits = restoredUnitIds(ctx) ?? unitsOfActiveTools(units(), pi.getActiveTools());
 		pendingInjection = undefined;
-		if (!state || !Array.isArray(state.tools)) persist();
+		persist();
 		updateStatus(ctx);
 	};
 
 	const chooseAtSessionStart = async (event: SessionStartEvent, ctx: ExtensionContext): Promise<void> => {
-		const state = readState(ctx);
-		selectedTools = Array.isArray(state?.tools)
-			? unique(state.tools.filter((name): name is string => typeof name === "string"))
-			: undefined;
+		const restored = restoredUnitIds(ctx);
+		selectedUnits = restored;
 		pendingInjection = undefined;
 
 		// Like the system-prompt mode picker: ask on a new session, but restore
@@ -401,20 +260,20 @@ export default function (pi: ExtensionAPI) {
 			ctx.hasUI &&
 			ctx.mode === "tui" &&
 			isNewish &&
-			(event.reason !== "startup" || selectedTools === undefined);
+			(event.reason !== "startup" || selectedUnits === undefined);
 
 		if (shouldPrompt) {
-			const current = selectedTools ?? sanitize(pi.getActiveTools());
-			const picked = await pickTools(ctx, "Select tools for this session", current);
+			const current = selectedUnits ?? unitsOfActiveTools(units(), pi.getActiveTools());
+			const picked = await pickUnits(ctx, "Select tools for this session", current);
 			if (picked) {
 				applySelection(ctx, picked);
-			} else if (selectedTools === undefined) {
+			} else if (selectedUnits === undefined) {
 				// Cancelled on a brand-new session: keep the normal default set.
-				selectedTools = current;
+				selectedUnits = current;
 				persist();
 			}
-		} else if (selectedTools === undefined) {
-			selectedTools = sanitize(pi.getActiveTools());
+		} else if (selectedUnits === undefined) {
+			selectedUnits = unitsOfActiveTools(units(), pi.getActiveTools());
 			persist();
 		}
 		updateStatus(ctx);
@@ -424,12 +283,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 	pi.on("session_compact", () => {
 		// Keep the choice after the compaction boundary so a later resume restores it.
-		if (selectedTools !== undefined) persist();
+		if (selectedUnits !== undefined) persist();
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
-		if (selectedTools === undefined) {
-			selectedTools = sanitize(pi.getActiveTools());
+		if (selectedUnits === undefined) {
+			selectedUnits = unitsOfActiveTools(units(), pi.getActiveTools());
 			persist();
 		}
 		updateStatus(ctx);
@@ -439,20 +298,18 @@ export default function (pi: ExtensionAPI) {
 
 		// Re-apply the chosen loadout before the request. Pi records tool changes
 		// as a system-prompt patch, so the existing cached prefix is preserved.
-		// Compare only registered tools; persisted names may be waiting to
-		// register (for example tools of an MCP server still connecting).
 		// Keep tools that codemode/tool_search loaded dynamically, so this
 		// extension does not undo them on the next run.
 		const toolInfo = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 		const known = new Set(declarableTools().map((tool) => tool.name));
-		const keepDynamic = selectedTools.includes("tool_search") || selectedTools.includes("codemode");
+		const keepDynamic = selectedToolNames().includes("tool_search") || selectedToolNames().includes("codemode");
 		const dynamic = keepDynamic
 			? pi.getActiveTools().filter((name) => {
 					const exposure = toolInfo.get(name)?.exposure;
 					return exposure === "deferred" || exposure === "codemode";
 				})
 			: [];
-		const desired = unique([...selectedTools.filter((name) => known.has(name)), ...dynamic]);
+		const desired = unique([...selectedToolNames().filter((name) => known.has(name)), ...dynamic]);
 		const active = pi.getActiveTools();
 		if (!sameTools(active, desired)) {
 			pi.setActiveTools(desired);
@@ -473,21 +330,22 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("tools", {
 		description:
-			"Pick the active tools. /tools (checklist), /tools read,bash,edit, /tools core|readonly|all|none, /tools show.",
+			"Pick the enabled tools. /tools (checklist), /tools all|none, /tools <names> (replace), /tools +name / -name (add/remove), /tools show.",
 		handler: async (args, ctx) => {
-			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const parts = (args ?? "").trim().split(/[\s,]+/).filter(Boolean);
 			const first = parts[0]?.toLowerCase();
+			const all = units();
 
 			if (!first || first === "pick" || first === "select") {
 				if (!ctx.hasUI || ctx.mode !== "tui") {
 					ctx.ui.notify(
-						"Interactive picker unavailable here. Use /tools <tool names> or /tools show.",
+						"Interactive picker unavailable here. Use /tools <names> or /tools show.",
 						"warning",
 					);
 					return;
 				}
-				const current = selectedTools ?? sanitize(pi.getActiveTools());
-				const picked = await pickTools(ctx, "Select tools", current);
+				const current = selectedUnits ?? unitsOfActiveTools(all, pi.getActiveTools());
+				const picked = await pickUnits(ctx, "Select tools", current);
 				if (!picked) return;
 				const changed = applySelection(ctx, picked);
 				if (!changed) {
@@ -503,26 +361,47 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			let names: string[];
-			if (first === "all") {
-				names = declarableTools().map((tool) => tool.name);
-			} else if (first === "core") {
-				names = ["read", "bash", "edit", "write", "codemode"];
-			} else if (first === "readonly" || first === "read-only") {
-				names = ["read", "grep", "find", "ls"];
-			} else if (first === "none") {
-				names = [];
-			} else {
-				names = parts.join(" ").split(/[,\s]+/).filter(Boolean);
+			// Plain names replace the selection; "+name" adds, "-name" removes.
+			const wants = parts.map((part) => {
+				if (part.startsWith("+")) return { part: part.slice(1).toLowerCase(), mode: "add" as const };
+				if (part.startsWith("-")) return { part: part.slice(1).toLowerCase(), mode: "remove" as const };
+				return { part: part.toLowerCase(), mode: "replace" as const };
+			});
+			const matches = (part: string, unit: ToolUnit) =>
+				unit.label.toLowerCase() === part ||
+				unit.id.toLowerCase() === part ||
+				unit.tools.some((tool) => tool.toLowerCase() === part);
+			const matched = all.filter((unit) => wants.some((want) => matches(want.part, unit)));
+			const unknown = wants
+				.filter((want) => !all.some((unit) => matches(want.part, unit)))
+				.map((want) => want.part);
+			if (unknown.length > 0) {
+				ctx.ui.notify(`Unknown tools or extensions: ${unknown.join(", ")}`, "warning");
+				return;
 			}
 
-			const known = new Set(declarableTools().map((tool) => tool.name));
-			const unknown = names.filter((name) => !known.has(name));
-			const picked = names.filter((name) => known.has(name));
-			if (unknown.length > 0) {
-				ctx.ui.notify(`Unknown or non-declarable tools ignored: ${unknown.join(", ")}`, "warning");
+			const matchedIds = matched.map((unit) => unit.id);
+			let unitIds: string[];
+			if (first === "all") {
+				unitIds = all.map((unit) => unit.id);
+			} else if (first === "none") {
+				unitIds = [];
+			} else if (wants.every((want) => want.mode === "replace")) {
+				unitIds = matchedIds;
+			} else {
+				const current = selectedUnits ?? unitsOfActiveTools(all, pi.getActiveTools());
+				unitIds = [...current];
+				for (const want of wants) {
+					const ids = all.filter((unit) => matches(want.part, unit)).map((unit) => unit.id);
+					if (want.mode === "add") {
+						unitIds = unique([...unitIds, ...ids]);
+					} else {
+						unitIds = unitIds.filter((id) => !ids.includes(id));
+					}
+				}
 			}
-			const changed = applySelection(ctx, picked);
+
+			const changed = applySelection(ctx, unitIds);
 			if (!changed) {
 				ctx.ui.notify("Tool loadout unchanged.", "info");
 				return;

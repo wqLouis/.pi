@@ -46,8 +46,8 @@ import type { SubagentBackend, SubagentConfig } from "../types.ts";
 import { ListPickerComponent, type UiTheme } from "./list-picker.ts";
 import { makeModelSelector } from "./model-selector.ts";
 import { OpencodePickerComponent, type OpencodeChoice } from "./opencode-picker.ts";
-import { ToolChecklistComponent } from "./tool-picker.ts";
-import { initialSubagentToolSelection, listSubagentTools } from "../tool-options.ts";
+import { initialSubagentToolUnits, listSubagentToolUnits } from "../tool-options.ts";
+import { ToolUnitChecklist, toolsOfUnits } from "../tool-groups.ts";
 
 const FOOTER_HINT = "↑/↓ navigate · Enter to change · type a number to set a limit · Esc close";
 const SAVED_FLASH_MS = 2000;
@@ -79,7 +79,7 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 		const draft: SubagentConfig = { ...loadConfig() };
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 		const sessionModelText = sessionModel ?? "(none)";
-		const selectableTools = listSubagentTools(pi);
+		const selectableUnits = listSubagentToolUnits(pi);
 		let savedAt = 0;
 		let closed = false;
 		let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -121,7 +121,7 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 			if (names.length === 0) return "inherit (child defaults)";
 			return names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4}`;
 		};
-		const initialToolSelection = () => initialSubagentToolSelection(pi, draft.tools, selectableTools);
+		const initialToolSelection = () => initialSubagentToolUnits(pi, draft.tools, selectableUnits);
 
 		const finish = () => {
 			if (closed) return;
@@ -229,20 +229,20 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 				id: "tools",
 				label: "Subagent tools",
 				description:
-					"Tools declared to spawned pi subagents (passed as --tools). Enter to pick; leaving everything unchecked inherits the child's defaults. OpenCode receives the list as a preference.",
+					"Tools declared to spawned pi subagents (passed as --tools). Core tools toggle one by one; an extension's tools are one unit. Leaving everything unchecked inherits the child's defaults.",
 				currentValue: toolsValue(),
 				submenu: (_current, subDone) =>
-					new ToolChecklistComponent({
+					new ToolUnitChecklist({
 						title: "Subagent tools",
 						theme,
-						tools: selectableTools,
+						units: selectableUnits,
 						selected: initialToolSelection(),
 						onDone: (value) => {
 							if (value === undefined) {
 								subDone(undefined);
 								return;
 							}
-							draft.tools = formatToolList(value);
+							draft.tools = formatToolList(toolsOfUnits(selectableUnits, value));
 							autoSave();
 							subDone(toolsValue());
 						},
