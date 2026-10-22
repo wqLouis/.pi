@@ -25,6 +25,7 @@ self-managing, multi-agent system. Eight extensions, loaded from
 6. **codemode-default** — `codemode` is active in every session by default.
 7. **agent-mode** — pick TOKEN MAXING (delegate to subagents) or SINGLE AGENT at startup and after compaction.
 8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); core tools toggle one by one, extension tools as a unit.
+9. **codemode prompt patch** — the codemode tool prompt tells the model to prefer codemode over single tool calls.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -333,6 +334,29 @@ a compact tool-loadout message injected into the conversation — the same
 interrupt-then-continue idea as `subagent_interrupt`. When the agent is idle,
 the message is injected with the next prompt. The selected set is persisted per
 session branch and re-applied before every run.
+
+## 9. codemode prompt patch — prefer codemode over single tool calls
+
+`tools/patch-codemode-prompt.mjs` edits the installed pi package so the
+codemode tool's own prompt tells the model to prefer codemode over one tool
+call at a time:
+
+- the tool description (what the model reads when it picks a tool) gains
+  *"Prefer this tool over separate tool calls: put the steps of a task into one
+  script and return only the part you need."*
+- the codemode system-prompt guideline gains the same preference.
+
+Both copies are patched: `dist/extensions/codemode/tool.js` and the bundled
+CLI chunk. pi is installed globally, so an update overwrites the patch — rerun
+the script afterwards:
+
+```bash
+node tools/patch-codemode-prompt.mjs            # apply (idempotent)
+node tools/patch-codemode-prompt.mjs --revert   # undo
+```
+
+The script finds the package through the `pi` binary on `PATH`, or takes an
+explicit package directory as its first argument.
 
 ## Environment variables
 
