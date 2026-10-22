@@ -22,6 +22,7 @@ import {
 	setCurrentMainSessionFile,
 	subagentDir,
 } from "./state.ts";
+import { recordRead } from "./reads.ts";
 import { registerMainTools } from "./tools.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -71,9 +72,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => clearInterval(flushTimer));
 
 	if (isSubagentProcess) {
+		// A child cannot spawn subagents, so the management tools would only add
+		// their (long) descriptions to the child's system prompt. The bubble tool
+		// comes with the child hooks.
 		registerChildHooks(pi);
+	} else {
+		registerMainTools(pi);
+		// Remember what the main agent reads: those files are prefilled into the
+		// next child's first message (fewer reads in the child, one shared
+		// cached prefix for the whole batch).
+		pi.on("tool_call", (event, ctx) => {
+			if (event.toolName !== "read") return;
+			const file = (event.input as { path?: unknown }).path;
+			if (typeof file === "string" && file.trim()) recordRead(file, ctx.cwd);
+		});
 	}
-
-	registerMainTools(pi);
 	registerSubagentCommand(pi);
 }

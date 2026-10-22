@@ -5,13 +5,30 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { KILL_GRACE_MS } from "../constants.ts";
 import { getPiInvocation, writePromptToTempFile } from "../prompts.ts";
 import { writeScopeFile } from "../scope.ts";
+import { getCurrentMainSessionFile } from "../state.ts";
 import { sessionFileForRecord, subagentDir } from "../state.ts";
 import type { RpcControl, RunResult, SubagentRecord } from "../types.ts";
 import { EMPTY_USAGE, getFinalOutput } from "../usage.ts";
+
+/**
+ * A cache key shared by every child of the current main session, so the
+ * provider reuses one cached prompt prefix across the batch.
+ */
+let cachedPromptKey: string | undefined;
+
+function promptCacheKey(): string | undefined {
+	if (cachedPromptKey) return cachedPromptKey;
+	const sessionFile = getCurrentMainSessionFile();
+	const id = sessionFile ? path.basename(sessionFile).replace(/\.jsonl$/, "") : process.env.PI_SESSION_ID;
+	const base = id ? `pi-sub-${id}` : `pi-sub-${process.pid}`;
+	cachedPromptKey = base.slice(0, 64);
+	return cachedPromptKey;
+}
 
 export interface SpawnedProcess {
 	proc: ChildProcess;
@@ -97,6 +114,12 @@ export async function spawnSubagentProcess(
 			env.PI_SUBAGENT_SCOPE = JSON.stringify(rec.scope);
 		}
 		if (rec.tools) env.PI_SUBAGENT_TOOLS_SET = "1";
+		// Cache: keep the shared prefix (system prompt + prefill) cached for a
+		// day, and route every child of this main session to the same cache key
+		// so the batch reuses one cached prefix instead of one per child.
+		env.PI_CACHE_RETENTION = env.PI_CACHE_RETENTION ?? "long";
+		const cacheKey = promptCacheKey();
+		if (cacheKey) env.PI_PROMPT_CACHE_KEY = cacheKey;
 		if (taskBase) env.PI_TASK_BASE = taskBase;
 		if (rec.allowTmp === false) env.PI_SUBAGENT_SCOPE_BLOCK_TMP = "1";
 		proc = spawn(invocation.command, invocation.args, {

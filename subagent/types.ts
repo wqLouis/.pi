@@ -116,6 +116,13 @@ export interface SubagentConfig {
 	scope?: string | string[];
 
 	allowTmp?: boolean;
+
+	/**
+	 * Prefill the files the main agent recently read into a child's first
+	 * message, so the child does not read them again and every child of a
+	 * batch shares the same cached prefix. Default true.
+	 */
+	autoPrefill?: boolean;
 }
 
 export interface RunningEntry {

@@ -17,6 +17,7 @@ import {
 import { DEFAULT_OPENCODE_MODEL, DEFAULT_SUBAGENT_PROMPT, OPENCODE_DEFAULT_EFFORT } from "./constants.ts";
 import { isOpencodeCliModel, modelKnownToPi } from "./models.ts";
 import { buildPrefillBlock } from "./prompts.ts";
+import { recentReads } from "./reads.ts";
 import {
 	countRunningSubagents,
 	existingNames,
@@ -211,7 +212,7 @@ export function registerMainTools(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const task = params.task?.trim();
 			const assignments = toAssignments(params.tasks);
-			const prefillReads = toStringArray(params.prefillReads);
+			const prefillReads: string[] = toStringArray(params.prefillReads) ?? [];
 
 			if (task && assignments.length > 0) {
 				return {
@@ -370,6 +371,12 @@ export function registerMainTools(pi: ExtensionAPI): void {
 			const cfg = loadConfig();
 			const scope = normalizeScope(opts.cwd, params.scope ?? cfg.scope);
 			const allowTmp = cfg.allowTmp ?? true;
+			if (prefillReads.length === 0 && cfg.autoPrefill !== false) {
+				// The files the main agent just read are the ones the child needs
+				// most; prefilling them saves the child its own reads and gives
+				// every child of the batch the same cached prefix.
+				prefillReads.push(...recentReads(opts.cwd));
+			}
 			const prefillBlock = buildPrefillBlock(prefillReads, opts.cwd);
 
 			const record: SubagentRecord = {

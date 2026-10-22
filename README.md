@@ -96,6 +96,25 @@ Key behaviors:
   before the process goes down, so no error notification bubbles up to the main
   agent and the forgotten record does not come back from the dead.
 - **Per-task edit scope** — Every spawn can supply its own file or directory scope. The harness blocks `write` and `edit` calls outside the assigned scope, preventing parallel subagents from colliding.
+- **Cheaper children, better cache hits** — four things make a batch of
+  subagents cheaper and more cache-friendly:
+  1. **A child gets no management tools.** A subagent cannot spawn subagents, so
+     the seven `subagent_*` tools are not registered inside a child: their
+     descriptions would only add ~6k characters to the child's system prompt.
+     The child keeps `subagent_message` (its bubble channel).
+  2. **Auto prefill.** The files the main agent just read are injected into the
+     child's first message (the `<shared-context-prefill>` block), so the child
+     does not spend tokens reading them again — and every child of the batch
+     gets the *same* prefix, which is what the provider cache keys on. Turn it
+     off with `/subagent config autoPrefill no`; name files explicitly with
+     `prefillReads` to override it.
+  3. **One cache key per batch.** Every child of a main session is started with
+     `PI_PROMPT_CACHE_KEY` (a key derived from the main session), so the
+     provider routes them to the same cache slot instead of one slot per child.
+     This needs the `PI_PROMPT_CACHE_KEY` patch from section 9.
+  4. **Long cache retention.** Children run with `PI_CACHE_RETENTION=long`, so
+     the shared prefix stays cached (24h on providers that support it) instead
+     of expiring in minutes. Set `PI_CACHE_RETENTION` yourself to override.
 - **Session-scoped listing** — Subagent records and `subagent_list` are isolated to the current main session; one session cannot see another session's agents.
 - **Edit scope** — `scope` limits a subagent's writes to a directory or file
   list (reads stay unrestricted). Enforced *inside* the subagent process via a
@@ -181,10 +200,12 @@ Key behaviors:
   pi model picker (Tab toggles scoped models), thinking level for the selected model,
   OpenCode model + effort (probed live from the CLI), a **Subagent tools**
   checklist, `maxSubagents`, `maxOpencodeSubagents` (the opencode pool),
-  `allowTmp`, `autoResume`, `maxAutoResumes`, plus the current cwd/scope. The
+  `allowTmp`, `autoPrefill`, `autoResume`, `maxAutoResumes`, plus the current
+  cwd/scope. The
   same keys are settable non-interactively: `backend`, `opencodeModel`,
   `opencodeEffort`, `thinkingLevel`, `tools`, `maxSubagents`,
-  `maxOpencodeSubagents`, `autoResume`, `maxAutoResumes`, `scope`, `allowTmp`.
+  `maxOpencodeSubagents`, `autoPrefill`, `autoResume`, `maxAutoResumes`,
+  `scope`, `allowTmp`.
   Subagents are spawned by the agent through the `subagent_spawn` tool, not from this
   command.
 - **Per-subagent tools** — `/subagent config` includes a **Subagent tools**
@@ -386,6 +407,12 @@ call at a time:
   script and return only the part you need."*
 - the codemode system-prompt guideline gains the same preference.
 
+It also patches the provider adapters (`@earendil-works/pi-ai` and pi's
+bundled copies) so the prompt-cache key can be overridden with
+`PI_PROMPT_CACHE_KEY`. pi derives that key from the session id, so every
+subagent would land in its own cache slot; the subagent extension passes one
+shared key per batch instead (see section 1).
+
 Both copies are patched: `dist/extensions/codemode/tool.js` and the bundled
 CLI chunk. pi is installed globally, so an update overwrites the patch — rerun
 the script afterwards:
@@ -494,6 +521,8 @@ bring the docs section back. They now contribute structured parts instead:
 | `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |
 | `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
 | `PI_SUBAGENT_TOOLS_SET` | Set by the parent when a subagent has an explicit tools list; skips default `codemode` activation in the child |
+| `PI_CACHE_RETENTION` | Prompt-cache retention for child processes: the harness sets `long` so a batch's shared prefix stays cached |
+| `PI_PROMPT_CACHE_KEY` | Prompt-cache key for child processes: the harness sets one key per main session so a batch shares a cache slot (needs the patch from section 9) |
 | `PI_OPENCODE_BIN` | Path to the `opencode` CLI for opencode-backed subagents (default: `opencode` on `PATH`) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
 | `PI_PLAYWRIGHT_IMPORT` | Absolute path to a playwright entry file (override) |

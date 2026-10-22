@@ -67,6 +67,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", enable);
 
 	pi.on("before_agent_start", (event) => {
+		// Only when codemode is really available: a subagent with an explicit
+		// tool list may not have it.
+		if (!pi.getActiveTools().includes(CODEMODE_TOOL)) return undefined;
 		// The section is a structured part of the prompt, so pi's section
 		// machinery (and the prompt cache) keep working.
 		const sections = event.systemPromptOptions.sections;

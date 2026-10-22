@@ -42,7 +42,7 @@ const MAX_PROMPT_CHARS = 8_000;
  * Tools that are always active. `codemode` is the harness's scripting layer:
  * it is how multi-step work is done, so it is never switched off.
  */
-const ALWAYS_ON_TOOLS = ["codemode"];
+const ALWAYS_ON_TOOLS = process.env.PI_SUBAGENT_TOOLS_SET === "1" ? [] : ["codemode"];
 
 interface LoadoutState {
 	/** Enabled unit ids. */

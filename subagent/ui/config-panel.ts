@@ -282,6 +282,14 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 				values: ["yes", "no"],
 			},
 			{
+				id: "autoPrefill",
+				label: "Auto prefill",
+				description:
+					"Inject the files you recently read into a child's first message, so the child does not read them again and every child of a batch shares the same cached prompt prefix. Enter to toggle.",
+				currentValue: draft.autoPrefill === false ? "no" : "yes",
+				values: ["yes", "no"],
+			},
+			{
 				id: "autoResume",
 				label: "Auto-resume subagents",
 				description: "Resume subagents interrupted by a quit or session switch when the session is resumed. Enter to toggle.",
@@ -313,6 +321,8 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 					draft.allowTmp = newValue === "yes";
 				} else if (id === "autoResume") {
 					draft.autoResume = newValue === "yes";
+				} else if (id === "autoPrefill") {
+					draft.autoPrefill = newValue === "yes";
 				} else {
 					return;
 				}

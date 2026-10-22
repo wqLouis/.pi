@@ -30,6 +30,32 @@ const OLD_GUIDELINE =
 const NEW_GUIDELINE = `${OLD_GUIDELINE} ${MARKER}: put the steps of a task into one script, run independent calls with Promise.allSettled, and let the script return only what you need.`;
 
 const OLD_INTRO = "Run JavaScript that calls other tools.";
+
+/**
+ * pi sends the session id as the provider prompt-cache key. Every subagent has
+ * its own session, so each child would land in its own cache slot even though
+ * they share the same prompt prefix. This patch lets the parent override the
+ * key (PI_PROMPT_CACHE_KEY), so a batch of subagents reuses one cached prefix.
+ */
+const OLD_CACHE_KEY = "clampOpenAIPromptCacheKey(options?.sessionId)";
+const NEW_CACHE_KEY = "clampOpenAIPromptCacheKey(process.env.PI_PROMPT_CACHE_KEY ?? options?.sessionId)";
+
+/**
+ * The old strings are prefixes of the new ones, so a second run would append
+ * the new tail again. These are the tails that may have been duplicated by an
+ * earlier run, and the helper collapses them.
+ */
+const INTRO_TAIL = " Prefer this tool over separate tool calls: put the steps of a task into one script and return only the part you need.";
+const GUIDELINE_TAIL = " Prefer the codemode tool over calling tools one by one: put the steps of a task into one script, run independent calls with Promise.allSettled, and let the script return only what you need.";
+
+/** Collapse a repeated unit down to a single occurrence. */
+function collapseRepeats(text, unit) {
+	let out = text;
+	while (out.includes(unit + unit)) {
+		out = out.split(unit + unit).join(unit);
+	}
+	return out;
+}
 /** An earlier revision of the patch (with an apostrophe) that --revert also removes. */
 const LEGACY_NEW_INTRO =
 	"Run JavaScript that calls other tools. Prefer this tool over separate tool calls: put a task's steps into one script and return only the part you need.";
@@ -55,6 +81,21 @@ function findPackageDir(explicit) {
 		".bun/install/global/node_modules/@earendil-works/pi-coding-agent",
 	);
 	return fallback;
+}
+
+/** The pi-ai package: a sibling of pi, or nested inside it. */
+function findPiAiDirs(piRoot) {
+	const candidates = [
+		join(piRoot, "node_modules", "@earendil-works", "pi-ai"),
+		join(dirname(piRoot), "pi-ai"),
+	];
+	return candidates.filter((dir) => {
+		try {
+			return statSync(dir).isDirectory();
+		} catch {
+			return false;
+		}
+	});
 }
 
 /** Every file in the package that carries the codemode prompt strings. */
@@ -94,14 +135,21 @@ function main() {
 	let patched = 0;
 	let already = 0;
 
-	for (const file of candidateFiles(root)) {
+	const roots = [root, ...findPiAiDirs(root)];
+	for (const file of roots.flatMap((dir) => candidateFiles(dir))) {
 		let content;
 		try {
 			content = readFileSync(file, "utf-8");
 		} catch {
 			continue;
 		}
-		if (!content.includes(OLD_GUIDELINE) && !content.includes(OLD_INTRO)) continue;
+		if (
+			!content.includes(OLD_GUIDELINE) &&
+			!content.includes(OLD_INTRO) &&
+			!content.includes(OLD_CACHE_KEY)
+		) {
+			continue;
+		}
 
 		let next = content;
 		if (revert) {
@@ -109,17 +157,23 @@ function main() {
 			next = next.split(NEW_GUIDELINE).join(OLD_GUIDELINE);
 			next = next.split(LEGACY_NEW_INTRO).join(OLD_INTRO);
 			next = next.split(LEGACY_NEW_GUIDELINE).join(OLD_GUIDELINE);
+			next = next.split(NEW_CACHE_KEY).join(OLD_CACHE_KEY);
 			if (next === content) {
 				already++;
 				continue;
 			}
 		} else {
-			if (next.includes(NEW_INTRO)) {
+			if (next.includes(NEW_INTRO) && next.includes(NEW_CACHE_KEY)) {
 				already++;
 				continue;
 			}
-			next = next.split(OLD_INTRO).join(NEW_INTRO);
-			next = next.split(OLD_GUIDELINE).join(NEW_GUIDELINE);
+			// Repair a duplicated tail, then apply each replacement only when its
+			// new text is missing.
+			next = collapseRepeats(next, INTRO_TAIL);
+			next = collapseRepeats(next, GUIDELINE_TAIL);
+			if (!next.includes(NEW_INTRO)) next = next.split(OLD_INTRO).join(NEW_INTRO);
+			if (!next.includes(NEW_GUIDELINE)) next = next.split(OLD_GUIDELINE).join(NEW_GUIDELINE);
+			if (!next.includes(NEW_CACHE_KEY)) next = next.split(OLD_CACHE_KEY).join(NEW_CACHE_KEY);
 		}
 		if (next !== content) {
 			writeFileSync(file, next);

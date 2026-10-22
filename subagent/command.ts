@@ -68,7 +68,7 @@ function listAllRecords(): SubagentRecord[] {
 }
 
 const CONFIG_USAGE =
-	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|reset>] — no args opens the settings panel.";
+	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | autoPrefill yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|reset>] — no args opens the settings panel.";
 
 export function registerSubagentCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("subagent", {
@@ -130,6 +130,22 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 						: undefined;
 					saveConfig(cfg);
 					ctx.ui.notify(v ? `Default edit scope set to: ${v}` : "Default edit scope cleared (full access).", "info");
+					return;
+				}
+				if (key === "autoPrefill") {
+					const v = parts[2]?.toLowerCase();
+					if (v !== "yes" && v !== "no") {
+						ctx.ui.notify("Usage: /subagent config autoPrefill yes|no", "info");
+						return;
+					}
+					cfg.autoPrefill = v === "yes";
+					saveConfig(cfg);
+					ctx.ui.notify(
+						cfg.autoPrefill
+							? "Auto prefill on: the files you recently read are injected into a child's first message (fewer reads in the child, one shared cached prefix per batch)."
+							: "Auto prefill off: children only get the files named in prefillReads.",
+						"info",
+					);
 					return;
 				}
 				if (key === "allowTmp" || key === "autoResume") {
