@@ -26,6 +26,8 @@ self-managing, multi-agent system. Eight extensions, loaded from
 7. **agent-mode** — pick TOKEN MAXING (delegate to subagents) or SINGLE AGENT at startup and after compaction.
 8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); core tools toggle one by one, extension tools as a unit.
 9. **codemode prompt patch** — the codemode tool prompt tells the model to prefer codemode over single tool calls.
+10. **system-prompt-view** — `/system` shows the live system prompt in gray TUI text plus an approximate token count.
+11. **web-search** — `web_search` / `web_fetch` backed by DeepSeek's Search & Fetch API or EXA.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -221,8 +223,8 @@ subagent) gets its own session/page, so parallel subagents don't collide.
 
 Only these three tools are exposed: the browser is a shared daemon, so the
 agent drives pages through `browser_eval` instead of a family of narrow tools.
-The daemon still implements `/click`, `/type`, `/content`, `/screenshot` and
-`/status` for scripted use and for re-exposing them later.
+The daemon itself was trimmed to the routes these tools need (`/open`,
+`/eval`, `/close`, plus `/status` for the health check).
 
 Plus **`/playwright-setup`** — a user command that installs playwright +
 chromium (`bun add -g playwright && playwright install chromium`, with a
@@ -358,6 +360,54 @@ node tools/patch-codemode-prompt.mjs --revert   # undo
 The script finds the package through the `pi` binary on `PATH`, or takes an
 explicit package directory as its first argument.
 
+## 10. system-prompt-view — see the live system prompt
+
+`system-prompt-view.ts` shows the system prompt the agent is actually running
+with, as gray text above the editor, together with an approximate token count
+(characters / 4).
+
+```text
+/system            # toggle the widget
+/system on|off     # show or hide it
+/system tokens     # notify the approximate token count
+/system full       # write the whole prompt to a temp file and report the path
+```
+
+The prompt is refreshed before every run, so the widget always matches the next
+request. The widget shows a short preview (first lines); `/system full` writes
+the complete prompt to `/tmp/pi-system-prompt-<timestamp>.md`.
+
+## 11. web-search — search and fetch the live web
+
+`web-search.ts` registers two tools backed by the same providers:
+
+| Tool | Purpose |
+|---|---|
+| `web_search { query, count?, provider?, includeContent?, context? }` | Ranked web results with title, url, snippet, optional page content |
+| `web_fetch { url, provider? }` | One page as Markdown |
+
+**Providers**
+
+- **deepseek** — DeepSeek's own [Search & Fetch API](https://api-docs.deepseek.com/guides/search/):
+  `POST /v1/tools/search` and `POST /v1/tools/fetch`. The key comes from the
+  `deepseek` provider configured in pi, `DEEPSEEK_API_KEY`, or an `exa`/`deepseek`
+  entry in `~/.pi/agent/auth.json`. The search query supports the DeepSeek
+  operators `site:`, `-site:`, `lang:`, `after:`, `before:`, `"exact phrase"`
+  and `-`; `context` passes the original question for better query
+  understanding.
+- **exa** — EXA's search API (`POST https://api.exa.ai/search`) and contents
+  API (`POST https://api.exa.ai/contents`). The key comes from `EXA_API_KEY` or
+  an `exa` entry in `~/.pi/agent/auth.json`.
+
+```text
+/web-search                      # provider status (which keys are found)
+/web-search provider auto|deepseek|exa
+/web-search test <query>         # run a search and list the hits
+```
+
+The pinned provider is stored in `~/.pi/agent/web-search.json`; `auto` (the
+default) uses the first provider with a key, deepseek before exa.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -366,6 +416,8 @@ explicit package directory as its first argument.
 | `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
 | `PI_CODEMODE_DEFAULT` | `0`/`false`/`no` disables automatic `codemode` activation |
+| `DEEPSEEK_API_KEY` | Key for the DeepSeek Search & Fetch API (falls back to the configured `deepseek` provider) |
+| `EXA_API_KEY` | Key for the EXA search and contents APIs |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
 | `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`) |
 | `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |

@@ -13,8 +13,6 @@ const getArg = (name) => {
 const port = Number(getArg("--port") ?? "0");
 const token = getArg("--token") ?? "";
 const statePath = getArg("--state") ?? path.join(process.env.HOME ?? ".", ".pi", "agent", "browser", "daemon.json");
-const shotsDir = path.join(path.dirname(statePath), "shots");
-fs.mkdirSync(shotsDir, { recursive: true });
 
 
 const sessions = new Map();
@@ -124,35 +122,6 @@ const server = http.createServer(async (req, res) => {
 				const page = await getPage(session);
 				await page.goto(String(body.url), { waitUntil: "domcontentloaded", timeout: 30000 });
 				return send(res, 200, { ok: true, url: page.url(), title: await page.title() });
-			}
-			case "/click": {
-				if (!body.selector) return send(res, 400, { error: "selector required" });
-				const page = await getPage(session);
-				await page.waitForSelector(String(body.selector), { state: "visible", timeout: 15000 });
-				await page.click(String(body.selector));
-				return send(res, 200, { ok: true });
-			}
-			case "/type": {
-				if (!body.selector) return send(res, 400, { error: "selector required" });
-				const page = await getPage(session);
-				await page.waitForSelector(String(body.selector), { state: "visible", timeout: 15000 });
-				await page.fill(String(body.selector), String(body.text ?? ""));
-				if (body.submit) await page.press(String(body.selector), "Enter");
-				return send(res, 200, { ok: true });
-			}
-			case "/content": {
-				const page = await getPage(session);
-				const text = body.selector
-					? await page.locator(String(body.selector)).first().textContent({ timeout: 15000 }).catch(() => null)
-					: await page.evaluate(() => (document.body ? document.body.innerText : ""));
-				return send(res, 200, { ok: true, text: String(text ?? "") });
-			}
-			case "/screenshot": {
-				const page = await getPage(session);
-				const safe = String(body.name ?? "").replace(/[^a-zA-Z0-9._-]/g, "") || `shot-${Date.now()}.png`;
-				const file = path.join(shotsDir, safe.endsWith(".png") ? safe : `${safe}.png`);
-				await page.screenshot({ path: file });
-				return send(res, 200, { ok: true, path: file });
 			}
 			case "/eval": {
 				if (typeof body.script !== "string") return send(res, 400, { error: "script required" });
