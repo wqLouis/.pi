@@ -216,13 +216,13 @@ subagent) gets its own session/page, so parallel subagents don't collide.
 | Tool | Purpose |
 |------|---------|
 | `browser_open { url }` | Navigate (http/https/file), returns URL + title |
-| `browser_click { selector }` | Click by CSS selector (waits up to 15s for visibility) |
-| `browser_type { selector, text, submit? }` | Fill an input, optional Enter to submit |
-| `browser_content { selector? }` | Extract visible text (page or element) |
-| `browser_eval { script }` | Run JS in the page, get stringified result |
-| `browser_screenshot { name? }` | PNG to `~/.pi/agent/browser/shots/` — returns the path to read |
-| `browser_status` | Sessions + current URL/title |
+| `browser_eval { script }` | Run JS in the page, get stringified result — the main way to drive a page (read text, query the DOM, click, fill inputs, scroll) |
 | `browser_close` | Close this session's page (daemon stays up) |
+
+Only these three tools are exposed: the browser is a shared daemon, so the
+agent drives pages through `browser_eval` instead of a family of narrow tools.
+The daemon still implements `/click`, `/type`, `/content`, `/screenshot` and
+`/status` for scripted use and for re-exposing them later.
 
 Plus **`/playwright-setup`** — a user command that installs playwright +
 chromium (`bun add -g playwright && playwright install chromium`, with a

@@ -12,7 +12,6 @@ import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DAEMON_SPAWN_TIMEOUT_MS = 1500;
-const MAX_PAGE_TEXT_CHARS = 30_000;
 const SETUP_STATUS_LINE_CHARS = 90;
 const SETUP_NOTIFY_LINES = 12;
 const LAUNCH_PROBE_TIMEOUT_MS = 45_000;
@@ -428,7 +427,7 @@ export default function (pi: ExtensionAPI) {
 		name: "browser_open",
 		label: "Browser Open",
 		description:
-			"Open a URL in the shared browser (headless Chromium) and wait for the page to load. Returns the final URL and page title. The browser persists across turns, so later browser_* calls act on the same page. If the browser isn't set up yet, the user can run /playwright-setup.",
+			"Open a URL in the shared browser (headless Chromium) and wait for the page to load. Returns the final URL and page title. The browser persists across turns, so later browser_eval calls act on the same page. If the browser isn't set up yet, the user can run /playwright-setup.",
 		promptSnippet: "Open a web page in the browser",
 		parameters: Type.Object({
 			url: Type.String({ description: "The URL to open (http(s):// or file://)" }),
@@ -449,108 +448,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "browser_click",
-		label: "Browser Click",
-		description: "Click an element on the current page by CSS selector. Waits up to 15s for it to become visible.",
-		promptSnippet: "Click an element on the current page",
-		parameters: Type.Object({
-			selector: Type.String({ description: "CSS selector of the element to click" }),
-		}),
-		async execute(_toolCallId, params) {
-			const selector = requireText(params, "selector");
-			if (!selector) return toolError("Error: selector is required.");
-			try {
-				await daemonRequest("/click", { selector });
-				return { content: [{ type: "text", text: `Clicked ${selector}.` }], details: { selector } };
-			} catch (error) {
-				return toolError(error);
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "browser_type",
-		label: "Browser Type",
-		description:
-			"Type text into an input/textarea on the current page (replaces existing content). With submit: true, presses Enter afterwards (e.g. to submit a form or search).",
-		promptSnippet: "Type text into an input on the current page",
-		parameters: Type.Object({
-			selector: Type.String({ description: "CSS selector of the input element" }),
-			text: Type.String({ description: "Text to type" }),
-			submit: Type.Optional(Type.Boolean({ description: "Press Enter after typing (default false)" })),
-		}),
-		async execute(_toolCallId, params) {
-			const selector = requireText(params, "selector");
-			if (!selector) return toolError("Error: selector is required.");
-			try {
-				await daemonRequest("/type", { selector, text: String(params.text ?? ""), submit: !!params.submit });
-				return {
-					content: [{ type: "text", text: `Typed into ${selector}${params.submit ? " and submitted." : "."}` }],
-					details: { selector },
-				};
-			} catch (error) {
-				return toolError(error);
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "browser_content",
-		label: "Browser Content",
-		description:
-			"Extract the visible text of the current page (or of a specific element via selector). Use this to read page content after navigating.",
-		promptSnippet: "Read the text content of the current page",
-		parameters: Type.Object({
-			selector: Type.Optional(Type.String({ description: "Optional CSS selector to scope the extraction to one element" })),
-		}),
-		async execute(_toolCallId, params) {
-			try {
-				const data = await daemonRequest("/content", { selector: params.selector });
-				return {
-					content: [
-						{
-							type: "text",
-							text: data.text ? data.text.slice(0, MAX_PAGE_TEXT_CHARS) : "(no text content)",
-						},
-					],
-					details: { length: String(data.text ?? "").length },
-				};
-			} catch (error) {
-				return toolError(error);
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "browser_screenshot",
-		label: "Browser Screenshot",
-		description:
-			"Take a screenshot of the current page and save it to a PNG file. Returns the file path — read that file to view the screenshot.",
-		promptSnippet: "Screenshot the current page",
-		parameters: Type.Object({
-			name: Type.Optional(Type.String({ description: "Optional file name (no extension needed); default: auto timestamp" })),
-		}),
-		async execute(_toolCallId, params) {
-			try {
-				const data = await daemonRequest("/screenshot", { name: params.name });
-				return {
-					content: [
-						{ type: "text", text: `Screenshot saved to ${data.path}. Read this file to view it.` },
-					],
-					details: { path: data.path },
-				};
-			} catch (error) {
-				return toolError(error);
-			}
-		},
-	});
-
-	pi.registerTool({
 		name: "browser_eval",
 		label: "Browser Eval",
 		description:
-			"Evaluate a JavaScript expression in the current page and return its result (stringified). For page state, DOM queries, or extracting structured data.",
-		promptSnippet: "Run JavaScript in the current page",
+			"Evaluate a JavaScript expression in the current page and return its result (stringified). This is the main way to drive a page: read text (document.body.innerText), query the DOM (document.querySelector), click (el.click()), fill inputs (el.value = 'x'; el.dispatchEvent(new Event('input', { bubbles: true }))), scroll, and extract structured data. Use browser_open first to load a page.",
+		promptSnippet: "Run JavaScript in the current page (click, type, read)",
 		parameters: Type.Object({
 			script: Type.String({ description: "JavaScript expression to evaluate in the page" }),
 		}),
@@ -563,26 +465,6 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text", text: String(data.result ?? "(no result)") }],
 					details: {},
 				};
-			} catch (error) {
-				return toolError(error);
-			}
-		},
-	});
-
-	pi.registerTool({
-		name: "browser_status",
-		label: "Browser Status",
-		description: "Show the current browser session state: which pages/sessions are open, and this session's current URL + title.",
-		promptSnippet: "Check the browser session state",
-		parameters: Type.Object({}),
-		async execute() {
-			try {
-				const data = await daemonRequest("/status", {});
-				const parts = [
-					`Sessions: ${(data.sessions ?? []).join(", ") || "(none)"}`,
-					data.url ? `Current: ${data.url} — ${data.title ?? ""}` : "No page open in this session yet.",
-				];
-				return { content: [{ type: "text", text: parts.join("\n") }], details: { url: data.url } };
 			} catch (error) {
 				return toolError(error);
 			}
