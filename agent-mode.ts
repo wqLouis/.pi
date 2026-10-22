@@ -18,6 +18,8 @@ type AgentMode = "token-maxing" | "single-agent";
 
 const CUSTOM_TYPE = "agent-mode";
 const TOKEN_MAXING_MARKER = "## TOKEN MAXING MODE — ORCHESTRATE, REVIEW, MERGE";
+/** Section name in the structured system prompt (lowercase, per pi's rules). */
+const SECTION_NAME = "token_maxing";
 
 const MODE_LABELS: Record<AgentMode, string> = {
 	"token-maxing": "TOKEN MAXING — delegate all work to subagents; review and merge patches",
@@ -164,8 +166,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event) => {
 		if (IS_SUBAGENT) return undefined;
 		if (mode !== "token-maxing") return undefined;
-		if (event.systemPrompt.includes(TOKEN_MAXING_MARKER)) return undefined;
-		return { systemPrompt: `${event.systemPrompt}\n\n${TOKEN_MAXING_PROMPT}` };
+		// A structured section, not a forced prompt: the rest of the prompt keeps
+		// pi's section machinery (and the prompt cache) intact.
+		const sections = event.systemPromptOptions.sections;
+		if (sections[SECTION_NAME] === TOKEN_MAXING_PROMPT) return undefined;
+		sections[SECTION_NAME] = TOKEN_MAXING_PROMPT;
+		return undefined;
 	});
 
 	pi.registerCommand("mode", {

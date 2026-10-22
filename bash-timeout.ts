@@ -19,7 +19,11 @@ export default function (pi: ExtensionAPI) {
 
 
 	pi.on("before_agent_start", (event) => {
-		if (event.systemPrompt.includes(GUIDELINE)) return undefined;
-		return { systemPrompt: `${event.systemPrompt}\n\n${GUIDELINE}` };
+		// A structured guideline, not a forced prompt: the rest of pi's system
+		// prompt keeps its section machinery (and the prompt cache) intact.
+		const guidelines = event.systemPromptOptions.promptGuidelines;
+		if (guidelines.includes(GUIDELINE)) return undefined;
+		guidelines.push(GUIDELINE);
+		return undefined;
 	});
 }

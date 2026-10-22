@@ -26,7 +26,8 @@ Notes:
 - 
 `;
 
-const GUIDELINE_MARKER = "A shared task board is available as `TASK.md`.";
+/** Section name in the structured system prompt (lowercase, per pi's rules). */
+const TASK_SECTION_NAME = "task_board";
 const MAX_NOTIFY_CHARS = 2000;
 const TASK_FILE_NAME = "TASK.md";
 const TASK_TOOLS = new Set(["read", "write", "edit"]);
@@ -100,7 +101,7 @@ function ensureTaskFile(file: string): void {
 }
 
 const guidelineFor = () =>
-	`${GUIDELINE_MARKER} (plain markdown). Use the logical path TASK.md with read, write, or edit; the task extension routes it to this session's shared board. Track only substantial, multi-step work that will take more than one or two turns. Do not add trivial actions such as routine commits, quick checks, or other work that can be completed in one or two turns. Keep substantial tasks current: add them, mark progress, and move finished items to Done.`;
+	`A shared task board is available as \`TASK.md\` (plain markdown). Use the logical path TASK.md with read, write, or edit; the task extension routes it to this session's shared board. Track only substantial, multi-step work that will take more than one or two turns. Do not add trivial actions such as routine commits, quick checks, or other work that can be completed in one or two turns. Keep substantial tasks current: add them, mark progress, and move finished items to Done.`;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", (event, ctx) => {
@@ -110,9 +111,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event, ctx) => {
 		if (!isEnabled()) return undefined;
-		if (event.systemPrompt.includes(GUIDELINE_MARKER)) return undefined;
+		// A structured section, so pi's prompt sections (and the cache) stay intact.
+		const sections = event.systemPromptOptions.sections;
+		if (sections[TASK_SECTION_NAME] !== undefined) return undefined;
 		ensureTaskFile(taskFile(ctx));
-		return { systemPrompt: `${event.systemPrompt}\n\n${guidelineFor()}` };
+		sections[TASK_SECTION_NAME] = guidelineFor();
+		return undefined;
 	});
 
 	pi.registerCommand("task", {

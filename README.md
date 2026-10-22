@@ -28,6 +28,7 @@ self-managing, multi-agent system. Eight extensions, loaded from
 9. **codemode prompt patch** — the codemode tool prompt tells the model to prefer codemode over single tool calls.
 10. **system-prompt-view** — `/system` shows the live system prompt in gray TUI text plus an approximate token count.
 11. **web-search** — `web_search` / `web_fetch` backed by DeepSeek's Search & Fetch API or EXA.
+12. **pi-docs-section** — pi's `<docs>` system-prompt section only when the session works under a `.pi` path.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -408,6 +409,38 @@ the complete prompt to `/tmp/pi-system-prompt-<timestamp>.md`.
 The pinned provider is stored in `~/.pi/agent/web-search.json`; `auto` (the
 default) uses the first provider with a key, deepseek before exa.
 
+## 12. pi-docs-section — pi docs only where they belong
+
+pi's system prompt always carries a `<docs>` section pointing at pi's own
+documentation (README, `docs/`, `examples/`). In an ordinary project that is
+noise, so `pi-docs-section.ts` removes it from the request unless the working
+directory is under a `.pi` path (`~/.pi/agent/extensions`, a project with a
+`.pi/` directory, …).
+
+```text
+/pi-docs                # status: shown / hidden, mode, cwd
+/pi-docs always|never|auto
+```
+
+`auto` (the default) means "show it under a `.pi` path". `PI_DOCS_SECTION=always|never|auto`
+overrides it from the environment; the command stores the choice in
+`~/.pi/agent/pi-docs.json`.
+
+**How it works.** The extension transforms the request in the
+`context_with_system` hook and drops the `docs` entry from the system message's
+section map. The transcript keeps pi's structured sections untouched, so the
+tool-patch mechanism and the prompt cache keep working.
+
+This is also why the other extensions no longer force a system prompt: a
+forced prompt (`return { systemPrompt }`) replaces the whole header and would
+bring the docs section back. They now contribute structured parts instead:
+
+| Extension | Contribution |
+|---|---|
+| `bash-timeout` | a rule in the `rules` section (`systemPromptOptions.promptGuidelines`) |
+| `agent-tasks` | a `task_board` section |
+| `agent-mode` | a `token_maxing` section |
+
 ## Environment variables
 
 | Variable | Effect |
@@ -418,6 +451,7 @@ default) uses the first provider with a key, deepseek before exa.
 | `PI_CODEMODE_DEFAULT` | `0`/`false`/`no` disables automatic `codemode` activation |
 | `DEEPSEEK_API_KEY` | Key for the DeepSeek Search & Fetch API (falls back to the configured `deepseek` provider) |
 | `EXA_API_KEY` | Key for the EXA search and contents APIs |
+| `PI_DOCS_SECTION` | `always`/`never`/`auto` — when to include pi's docs section in the system prompt |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
 | `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`) |
 | `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |

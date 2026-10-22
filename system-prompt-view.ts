@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { shouldShowDocs, stripDocsSection } from "./subagent/pi-docs.ts";
 
 const WIDGET_KEY = "system-prompt";
 const PREVIEW_LINES = 6;
@@ -33,7 +34,10 @@ export default function (pi: ExtensionAPI) {
 
 	const snapshot = (ctx: ExtensionContext): void => {
 		try {
-			prompt = ctx.getSystemPrompt() ?? "";
+			const text = ctx.getSystemPrompt() ?? "";
+			// Show what the model actually receives: the docs section is removed
+			// from the request outside a .pi path.
+			prompt = shouldShowDocs(ctx.cwd) ? text : stripDocsSection(text);
 		} catch {
 			prompt = "";
 		}
