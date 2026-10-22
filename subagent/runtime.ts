@@ -290,6 +290,65 @@ export async function startBackground(
 }
 
 /**
+ * Stop a running subagent without delivering a message.
+ *
+ * Used by `subagent_forget`: the subagent is interrupted first (its in-flight
+ * turn is aborted over the RPC channel, so no tool call is left hanging) and
+ * only then are its files removed. The record is marked as intentionally
+ * stopped before the process goes down, so the completion handler neither
+ * finalizes it nor pushes an error notification to the main agent.
+ */
+export async function stopRunning(rec: SubagentRecord): Promise<void> {
+	const entry = running.get(rec.id);
+
+	if (!entry) {
+		// Orphan from an earlier pi process: no control channel, so stop it by pid.
+		if (isPidAlive(rec.pid)) {
+			rec.suspended = true;
+			saveRecord(rec);
+			await waitForPidExit(rec.pid, RESUME_WAIT_MS);
+			rec.suspended = false;
+			rec.pid = undefined;
+			if (loadRecord(rec.id)) saveRecord(rec);
+		}
+		return;
+	}
+
+	// Mark first: the completion handler must skip finalize/notify.
+	entry.interrupted = true;
+	rec.suspended = true;
+	saveRecord(rec);
+
+	if (entry.control && !entry.control.closed) {
+		try {
+			// Abort the in-flight turn (tool call, streaming) without a new prompt.
+			await entry.control.sendCommand({ type: "abort" });
+		} catch {
+			// The child may already be gone; the hard stop below still applies.
+		}
+	}
+
+	const escalate = setTimeout(() => {
+		try {
+			if (entry.proc.exitCode === null) entry.proc.kill("SIGKILL");
+		} catch {
+			// Already gone.
+		}
+	}, KILL_GRACE_MS);
+	try {
+		await Promise.race([entry.done, sleep(KILL_GRACE_MS + 1500)]);
+	} finally {
+		clearTimeout(escalate);
+	}
+	if (running.get(rec.id) === entry) running.delete(rec.id);
+	rec.suspended = false;
+	rec.pid = undefined;
+	// The record may already have been deleted (forget); only persist it when it
+	// still exists, so a forgotten subagent does not come back from the dead.
+	if (loadRecord(rec.id)) saveRecord(rec);
+}
+
+/**
  * Interrupt a running subagent so a message can be delivered right now.
  *
  * Preferred path: the child runs pi in RPC mode, so we issue a real `abort`

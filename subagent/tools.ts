@@ -29,7 +29,7 @@ import {
 	saveRecord,
 	uniqueName,
 } from "./records.ts";
-import { interruptRunning, running, startBackground } from "./runtime.ts";
+import { interruptRunning, running, startBackground, stopRunning } from "./runtime.ts";
 import { normalizeScope, writeScopeFile } from "./scope.ts";
 import { isSubagentProcess, recordFile, scopeFile, sessionFileForRecord, subagentDir } from "./state.ts";
 import type { SubagentDetails, SubagentRecord, TaskAssignment } from "./types.ts";
@@ -193,13 +193,13 @@ export function registerMainTools(pi: ExtensionAPI): void {
 		name: "subagent_spawn",
 		label: "Subagent Spawn",
 		description:
-			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one background subagent. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). All spawns are asynchronous: the tool returns immediately. Do NOT sleep, poll, or wait for a subagent to finish — the harness notifies you as soon as each one completes. Subagents run on pi by default; pass backend: \"opencode\" to run them on the OpenCode CLI instead. Models, thinking levels, efforts, cwd, and tools are user configuration (/subagent config) — this tool only chooses the tasks and the backend.",
+			"Spawn subagent(s) to work in isolated contexts (their own sessions). Pass task + name for one background subagent. Pass tasks (array of { task, name, scope? }) to spawn one background subagent per task. Provide exactly one of task or tasks, and a name for every subagent (names must be unique). All spawns are asynchronous: the tool returns immediately. Do NOT sleep, poll, or wait for a subagent to finish — if you need a result to continue, end your turn with a short status summary of what is in flight; the harness notifies you as soon as each one completes and wakes you up. Subagents run on pi by default; pass backend: \"opencode\" to run them on the OpenCode CLI instead. Models, thinking levels, efforts, cwd, and tools are user configuration (/subagent config) — this tool only chooses the tasks and the backend.",
 		promptSnippet: "Spawn isolated subagent(s) to delegate work to",
 		promptGuidelines: [
 			"Always give every subagent a short unique name via name (single) or tasks[].name. The name is its handle in listings and notifications, and is what subagent_interrupt/subagent_result/subagent_forget use.",
 			"Pass tasks (array of { task, name?, scope? }) to run several independent subagents in parallel; each runs in the background with automatic completion notifications.",
 			"When multiple subagents need the same files, pass prefillReads (file paths): the files are read once and injected verbatim, identically, into every spawned subagent's context before the task — the subagents share that prompt-cache prefix instead of each issuing their own reads (better cache hits, fewer read calls).",
-			"Spawns are always asynchronous: the tool returns immediately and you are notified when each subagent finishes. Never sleep, poll, or wait for subagents — keep working on other tasks and let the harness wake you when a result arrives.",
+			"Spawns are always asynchronous: the tool returns immediately and you are notified when each subagent finishes. Never sleep, poll, or wait for a subagent. If the next step depends on a result, end your turn now with a short summary of what is in flight and what remains; the completion message wakes you up and you continue from there. Otherwise keep working on other tasks.",
 			"Give each task a narrow edit scope so the harness can block writes outside those files or directories — use this to keep parallel subagents from colliding on the same files.",
 			"To run a subagent on OpenCode instead of pi, pass backend: \"opencode\". OpenCode runs as a separate agent with its own tools, including OpenCode's free models; give it a self-contained task since its transcript is not pi's. Its model and effort are set by the user in /subagent config — do not try to pass them per spawn.",
 			"Use subagent_interrupt to steer a running subagent urgently — it kills the current turn and restarts it immediately with your message, keeping the subagent's full previous context.",
@@ -323,7 +323,7 @@ export function registerMainTools(pi: ExtensionAPI): void {
 							text:
 								`Spawned ${assignments.length} subagent(s) in the background; each will notify you when it finishes.\n` +
 								lines.join("\n") +
-								`\nDo not wait or poll for them — keep working; the harness notifies you when each finishes. Steer with subagent_interrupt, inspect with subagent_result, forget with subagent_forget.`,
+								`\nDo not wait or poll for them. If you need their results to continue, end your turn with a short summary of what is in flight; the harness notifies you when each finishes and wakes you up. Steer with subagent_interrupt, inspect with subagent_result, forget with subagent_forget.`,
 						},
 					],
 					details: {
@@ -416,7 +416,7 @@ export function registerMainTools(pi: ExtensionAPI): void {
 						text:
 							`Spawned subagent ${recordLabel(record)} in the background (model: ${record.model ?? "session model"}${record.thinkingLevel ? `, thinking: ${record.thinkingLevel}` : ""}${record.opencodeEffort ? `, effort: ${record.opencodeEffort}` : ""}).\n` +
 							(scope ? `Edit scope: ${scope.join(", ")} — writes outside are blocked.\n` : "") +
-							`You will be notified when it finishes. Do not sleep or poll for it — continue your own work; read its transcript with subagent_result or redirect it with subagent_interrupt.`,
+							`You will be notified when it finishes. Do not sleep or poll for it. If you need its result to continue, end your turn with a short summary of what is in flight and what remains — the completion message wakes you up. Otherwise continue your own work; read its transcript with subagent_result or redirect it with subagent_interrupt.`,
 					},
 				],
 				details: {
@@ -516,7 +516,7 @@ export function registerMainTools(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use subagent_interrupt to steer a subagent: it continues with its full previous context, and any in-flight turn is killed immediately so your message takes effect now.",
 			"When a subagent errors (you receive a subagent-error message or a failed result), resolve it by steering it with subagent_interrupt (it resumes with full context) or respawning with subagent_spawn; use subagent_result to inspect the transcript first.",
-			"After interrupting, the subagent keeps its full session history, so it can continue from where it was while following the new instruction. You do not need to wait for it — the harness notifies you when the new turn finishes.",
+			"After interrupting, the subagent keeps its full session history, so it can continue from where it was while following the new instruction. You do not need to wait for it — end your turn with a short status summary if you need the new result to continue; the harness notifies you when the new turn finishes and wakes you up.",
 		],
 		parameters: InterruptParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -686,15 +686,10 @@ export function registerMainTools(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-			const entry = running.get(record.id);
-			if (entry) {
-				try {
-					entry.proc.kill("SIGTERM");
-				} catch {
-					// Already gone.
-				}
-				running.delete(record.id);
-			}
+			// Interrupt first, delete afterwards: a running subagent is stopped
+			// cleanly (no error notification bubbling up to the main agent) and
+			// its files are removed once it is gone.
+			await stopRunning(record);
 			let removed = 0;
 			for (const file of [recordFile(record.id), sessionFileForRecord(record), scopeFile(record.id)]) {
 				try {

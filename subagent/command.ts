@@ -18,14 +18,12 @@ import { isOpencodeModel, isThinkingLevel } from "./models.ts";
 import {
 	countRunningSubagents,
 	findRecordByName,
-	isPidAlive,
 	loadRecord,
 	readTranscript,
 	recordLabel,
 	saveRecord,
-	waitForPidExit,
 } from "./records.ts";
-import { interruptRunning, running, startBackground } from "./runtime.ts";
+import { interruptRunning, running, startBackground, stopRunning } from "./runtime.ts";
 import { normalizeScope, writeScopeFile } from "./scope.ts";
 import { recordFile, scopeFile, sessionFileForRecord, subagentDir } from "./state.ts";
 import { showSubagentConfigUi } from "./ui/config-panel.ts";
@@ -313,23 +311,9 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Unknown subagent "${name}".`, "error");
 					return;
 				}
-				const entry = running.get(rec.id);
-				if (entry) {
-					entry.interrupted = true;
-					entry.rec.suspended = true;
-					try {
-						entry.proc.kill("SIGTERM");
-					} catch {
-						// Already gone.
-					}
-					running.delete(rec.id);
-				} else if (isPidAlive(rec.pid)) {
-					rec.suspended = true;
-					saveRecord(rec);
-					await waitForPidExit(rec.pid, 1500);
-					rec.suspended = false;
-					rec.pid = undefined;
-				}
+				// Interrupt first, delete afterwards: the subagent is stopped cleanly
+				// and no error notification bubbles up to the main agent.
+				await stopRunning(rec);
 				for (const file of [recordFile(rec.id), sessionFileForRecord(rec), scopeFile(rec.id)]) {
 					try {
 						fs.unlinkSync(file);

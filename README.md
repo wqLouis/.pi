@@ -78,7 +78,7 @@ The extension is a folder project (`subagent/`): `index.ts` (wiring), `tools.ts`
 | `subagent_scope { name, scope?, clear?, allowTmp? }` | Change a subagent's edit scope — **live**, even while it is running; `clear: true` restores unrestricted writes |
 | `subagent_list` | Running/finished subagents: name, model, usage, latest output |
 | `subagent_result { name }` | Full transcript: task, steering messages, tool activity, outputs |
-| `subagent_forget { name }` | Delete a subagent and its session |
+| `subagent_forget { name }` | Interrupt a subagent, then delete it and its session (no error is reported back) |
 | `subagent_config` | Effective config: backend, model, thinking level, OpenCode model/effort, system prompt, cwd, tools, per-pool limits + live usage |
 | `subagent_message { message }` | Bubble-up tool (only inside subagents): send progress, findings, questions, or blockers to the main agent |
 
@@ -86,7 +86,15 @@ Key behaviors:
 
 - **Never sleep for subagents** — `subagent_spawn` returns immediately and the
   harness auto-bubbles the completion; the tool description and guidelines
-  explicitly tell the agent not to sleep, poll, or wait for subagents.
+  explicitly tell the agent not to sleep, poll, or wait for subagents. When the
+  next step depends on a result, the agent is told to **end its turn** with a
+  short summary of what is in flight: the completion message wakes it up and it
+  continues from there. Sleeping or polling would only burn the main context.
+- **Forget is quiet** — `subagent_forget` (and `/subagent forget`) interrupts a
+  running subagent first (its in-flight turn is aborted over the RPC channel)
+  and deletes the files afterwards. The run is marked as intentionally stopped
+  before the process goes down, so no error notification bubbles up to the main
+  agent and the forgotten record does not come back from the dead.
 - **Per-task edit scope** — Every spawn can supply its own file or directory scope. The harness blocks `write` and `edit` calls outside the assigned scope, preventing parallel subagents from colliding.
 - **Session-scoped listing** — Subagent records and `subagent_list` are isolated to the current main session; one session cannot see another session's agents.
 - **Edit scope** — `scope` limits a subagent's writes to a directory or file
