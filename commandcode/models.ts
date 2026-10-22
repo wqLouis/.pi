@@ -16,6 +16,18 @@ export interface CommandCodeCost {
 	cacheWrite: number;
 }
 
+/** Best-effort prompt cache lifetime in seconds, per pi retention tier. */
+export interface CommandCodePromptCache {
+	short?: number;
+	long?: number;
+}
+
+/**
+ * Anthropic prompt caches live for five minutes by default; pi's long
+ * retention adds `cache_control.ttl: "1h"`, so the long tier lasts an hour.
+ */
+export const COMMANDCODE_ANTHROPIC_PROMPT_CACHE = { short: 300, long: 3600 } as const;
+
 /**
  * Claude models served through the Anthropic Messages API use adaptive
  * thinking (`thinking.type: "adaptive"` + `output_config.effort`). The
@@ -24,6 +36,8 @@ export interface CommandCodeCost {
  */
 export const COMMANDCODE_ANTHROPIC_COMPAT = {
 	forceAdaptiveThinking: true,
+	// Anthropic's extended cache is expressed as cache_control.ttl: "1h".
+	supportsLongCacheRetention: true,
 } as const;
 
 /** Compat settings shared by the OpenAI Chat Completions models. */
@@ -33,6 +47,10 @@ export const COMMANDCODE_OPENAI_COMPAT = {
 	maxTokensField: "max_tokens",
 	supportsReasoningEffort: true,
 	thinkingFormat: "openai",
+	// Long retention sends prompt_cache_retention: "24h" and, together with
+	// PI_PROMPT_CACHE_KEY, the prompt_cache_key that lets a subagent batch
+	// share one cached prefix.
+	supportsLongCacheRetention: true,
 } as const;
 
 /** Anthropic Messages base URL (`/v1/messages` is appended by the SDK). */
@@ -53,6 +71,20 @@ export interface CommandCodeModel {
 	contextWindow: number;
 	maxTokens: number;
 	compat?: typeof COMMANDCODE_OPENAI_COMPAT | typeof COMMANDCODE_ANTHROPIC_COMPAT;
+	promptCache?: CommandCodePromptCache;
+}
+
+/**
+ * The cache lifetime pi's cache warmer should assume for a model.
+ *
+ * Only the Anthropic path declares one. OpenAI-family endpoints do not publish
+ * a cache lifetime, and replaying a reasoning request with a one-token output
+ * cap is not guaranteed to be safe, so those models keep provider-side prefix
+ * caching (and the shared `prompt_cache_key` under long retention) but opt out
+ * of cache warming.
+ */
+export function commandCodePromptCache(api: CommandCodeModel["api"]): CommandCodePromptCache | undefined {
+	return api === "anthropic-messages" ? COMMANDCODE_ANTHROPIC_PROMPT_CACHE : undefined;
 }
 
 export const COMMANDCODE_MODELS: CommandCodeModel[] = [

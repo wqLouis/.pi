@@ -30,6 +30,7 @@ import {
 	COMMANDCODE_OPENAI_COMPAT,
 	COMMANDCODE_PROVIDER_BASE,
 	COMMANDCODE_V1_BASE,
+	commandCodePromptCache,
 	type CommandCodeModel,
 } from "./models.ts";
 
@@ -48,6 +49,17 @@ interface LiveModel {
 }
 
 const KNOWN_MODELS = new Map<string, CommandCodeModel>(COMMANDCODE_MODELS.map((model) => [model.id, model]));
+
+/**
+ * Declare the cache lifetime of models whose provider publishes one, so pi's
+ * cache warmer can keep their prefix alive across idle gaps. Command Code
+ * bills cache reads and writes, so a warm cache is cheaper than re-writing the
+ * prompt; OpenAI-family models keep provider-side caching instead.
+ */
+const BUNDLED_MODELS: ProviderModelConfig[] = COMMANDCODE_MODELS.map((model) => ({
+	...model,
+	promptCache: model.promptCache ?? commandCodePromptCache(model.api),
+}));
 
 /** Pick the wire protocol from the routes the model is served on. */
 function apiFor(model: LiveModel): CommandCodeModel["api"] {
@@ -85,6 +97,7 @@ function modelFromLive(model: LiveModel): ProviderModelConfig {
 			name: model.name ?? known.name,
 			contextWindow: model.context_length ?? known.contextWindow,
 			compat: compatFor(api),
+			promptCache: known.promptCache ?? commandCodePromptCache(api),
 		};
 	}
 	return {
@@ -98,6 +111,9 @@ function modelFromLive(model: LiveModel): ProviderModelConfig {
 		contextWindow: model.context_length ?? 128000,
 		maxTokens: api === "anthropic-messages" ? 64000 : 32000,
 		compat: compatFor(api),
+		// A discovered model has no bundled pricing or published cache lifetime,
+		// so pi's cache warmer leaves it alone until metadata is added.
+		promptCache: commandCodePromptCache(api),
 	};
 }
 
@@ -124,17 +140,17 @@ export default function commandCodeProvider(pi: ExtensionAPI) {
 		baseUrl: COMMANDCODE_V1_BASE,
 		api: "openai-completions",
 		apiKey: `$${API_KEY_ENV}`,
-		models: COMMANDCODE_MODELS,
+		models: BUNDLED_MODELS,
 		async refreshModels(context) {
 			if (!context.allowNetwork) {
 				// Offline: fall back to the bundled catalog snapshot.
-				return COMMANDCODE_MODELS;
+				return BUNDLED_MODELS;
 			}
 			try {
 				return await fetchLiveModels(context.signal);
 			} catch {
 				// Keep the last known catalog when the network or upstream fails.
-				return COMMANDCODE_MODELS;
+				return BUNDLED_MODELS;
 			}
 		},
 	} satisfies ProviderConfig);

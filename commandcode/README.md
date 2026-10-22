@@ -37,6 +37,31 @@ other provider credential.
 The model picker also groups every model under the **Command Code** provider once
 authentication is configured.
 
+## Prompt caching
+
+Claude models declare a `promptCache` lifetime, so pi's cache warmer knows
+when a cached prefix is still alive, and they receive Anthropic
+`cache_control` markers on every request:
+
+| Model family | Short tier | Long tier | Wire format |
+|---|---|---|---|
+| Claude (`anthropic-messages`) | 5 minutes | 1 hour | `cache_control: {type: "ephemeral", ttl: "1h"}` with long retention |
+| Everything else (`openai-completions`) | not declared | not declared | `prompt_cache_retention: "24h"` with long retention; provider-side prefix caching |
+
+Long retention also makes pi send `prompt_cache_key`, which is what lets a
+batch of subagents share one cached prefix: the subagent extension starts every
+child with the same `PI_PROMPT_CACHE_KEY` (see the `PI_PROMPT_CACHE_KEY` patch
+in the repository README). The key falls back to the session id when unset.
+
+OpenAI-compatible models deliberately declare no lifetime: their providers do
+not publish a cache TTL, and replaying a reasoning request with a one-token
+output cap is not guaranteed to be safe. They still benefit from the prefix
+cache and the shared key.
+
+Cache warming is pi's decision, not the provider's: it only refreshes when the
+model declares a lifetime and the expected savings exceed $0.05. Turn it off
+with `"cacheWarming": "off"` in `~/.pi/agent/settings.json`.
+
 ## How it maps to the API
 
 | Model family | Endpoint | pi `api` | Base URL |

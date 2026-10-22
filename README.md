@@ -284,18 +284,32 @@ add routine commits, quick checks, or tasks that fit in one or two turns.
 `/task` shows the board (or `/task init` recreates it). Override the backing root
 with `PI_TASK_DIR` (default `/tmp`).
 
-## 5. command-code-provider — Command Code models
+## 5. commandcode — Command Code models
 
-`command-code-provider.ts` registers Command Code as the `command-code` provider:
+`commandcode/index.ts` registers Command Code as the `commandcode` provider:
 
 - OpenAI-compatible models use `https://api.commandcode.ai/provider/v1/chat/completions`.
-- Claude models use the Anthropic-compatible `/messages` endpoint automatically.
-- The model catalog is refreshed from `https://api.commandcode.ai/provider/v1/models`.
+- Claude models use the Anthropic-compatible `https://api.commandcode.ai/provider/v1/messages`
+  endpoint automatically.
+- The bundled catalog (`commandcode/models.ts`) is refreshed at runtime from
+  `https://api.commandcode.ai/provider/v1/models`, so newly published models
+  appear without an update.
 
-Set `CMD_API_KEY` before starting pi, then select a model such as
-`command-code/gpt-5.6-luna` with `/model`. The provider also honors
-`CMD_ZDR=1` by sending the `x-cmd-zdr: 1` request header. API keys are never
-stored in this repository.
+Set `COMMAND_CODE_API_KEY` before starting pi (or use `/login`), then select a
+model such as `commandcode/claude-sonnet-5-5` or
+`commandcode/gpt-5.6-luna` with `/model`. API keys are never stored in this
+repository.
+
+**Prompt caching.** Claude models declare a `promptCache` lifetime
+(5 minutes short, 1 hour long) and receive Anthropic `cache_control` markers,
+so pi's cache warmer can keep their prefix alive between requests. On the
+OpenAI-compatible path, long retention sends `prompt_cache_retention: "24h"`
+and, via the `PI_PROMPT_CACHE_KEY` patch in section 9, the `prompt_cache_key`
+that lets a subagent batch share one cached prefix; those models keep
+provider-side prefix caching rather than declaring a lifetime, because their
+cache lifetime is unpublished and a one-token replay is not safe for every
+reasoning model. Cache warming only spends tokens when pi expects to save at
+least $0.05; disable it with `"cacheWarming": "off"` in settings.
 
 ## 6. codemode-default — codemode on by default, and recommended
 
@@ -509,8 +523,7 @@ bring the docs section back. They now contribute structured parts instead:
 
 | Variable | Effect |
 |----------|--------|
-| `CMD_API_KEY` | Command Code Provider API key |
-| `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
+| `COMMAND_CODE_API_KEY` | Command Code Provider API key |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
 | `PI_CODEMODE_DEFAULT` | `0`/`false`/`no` disables automatic `codemode` activation |
 | `DEEPSEEK_API_KEY` | Key for the DeepSeek Search & Fetch API (falls back to the configured `deepseek` provider) |
