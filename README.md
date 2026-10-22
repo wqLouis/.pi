@@ -14,7 +14,7 @@ pi's TUI: `/subagent`, `/playwright-setup`.
 ## Extensions
 
 A set of extensions that turn the [pi coding agent](https://github.com/earendil-works/pi) into a
-self-managing, multi-agent system. Five extensions, loaded from
+self-managing, multi-agent system. Eight extensions, loaded from
 `~/.pi/agent/extensions/`:
 
 1. **subagent** — the agent spawns, steers, and scopes subagents that work for it.
@@ -22,6 +22,9 @@ self-managing, multi-agent system. Five extensions, loaded from
 3. **playwright-browser** — the agent (and its subagents) drive a real browser.
 4. **agent-tasks** — a plain-markdown task board per session.
 5. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
+6. **codemode-default** — `codemode` is active in every session by default.
+7. **agent-mode** — pick TOKEN MAXING (delegate to subagents) or SINGLE AGENT at startup and after compaction.
+8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); changes are injected without replacing the cached system prompt.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -164,14 +167,22 @@ Key behaviors:
   and `config`. `/subagent config` with no arguments opens an interactive panel
   where every change **saves immediately** (no Ctrl+S): backend (`auto|pi|opencode`),
   pi model picker (Tab toggles scoped models), thinking level for the selected model,
-  OpenCode model + effort (probed live from the CLI), `maxSubagents`,
-  `maxOpencodeSubagents` (the opencode pool), `allowTmp`, `autoResume`,
-  `maxAutoResumes`, plus the current cwd/scope. The same keys are
-  settable non-interactively: `backend`, `opencodeModel`, `opencodeEffort`,
-  `thinkingLevel`, `maxSubagents`, `maxOpencodeSubagents`, `autoResume`,
-  `maxAutoResumes`, `scope`, `allowTmp`.
+  OpenCode model + effort (probed live from the CLI), a **Subagent tools**
+  checklist, `maxSubagents`, `maxOpencodeSubagents` (the opencode pool),
+  `allowTmp`, `autoResume`, `maxAutoResumes`, plus the current cwd/scope. The
+  same keys are settable non-interactively: `backend`, `opencodeModel`,
+  `opencodeEffort`, `thinkingLevel`, `tools`, `maxSubagents`,
+  `maxOpencodeSubagents`, `autoResume`, `maxAutoResumes`, `scope`, `allowTmp`.
   Subagents are spawned by the agent through the `subagent_spawn` tool, not from this
   command.
+- **Per-subagent tools** — `/subagent config` includes a **Subagent tools**
+  checklist (also `/subagent config tools read,bash,edit`, `tools core`, `tools all`, or `tools reset`).
+  The comma-separated list is stored as `tools` in `subagent-config.json`,
+  passed to pi-backed children as `--tools`, and reported by `subagent_config`.
+  Unset means the child inherits its normal default tools. Changes apply to
+  newly spawned subagents. OpenCode has its own tool names, so the list is sent
+  there as a preference in the first-turn preamble rather than as a hard
+  allowlist.
 - **Session-based context + auto-resume** — each subagent's private pi session file is
   the durable store of its context. Records are scoped to the owning main session and
   record that session's file, so when the main session is resumed (`--continue`/`--resume`
@@ -244,6 +255,71 @@ Set `CMD_API_KEY` before starting pi, then select a model such as
 `CMD_ZDR=1` by sending the `x-cmd-zdr: 1` request header. API keys are never
 stored in this repository.
 
+## 6. codemode-default — codemode on by default
+
+pi registers `codemode` inactive. `codemode-default.ts` activates it on every
+`session_start` (including `/reload`), so scripts can call the other tools,
+run calls in parallel, and reach classifier/image models without extra flags.
+It is idempotent, respects explicit `--tools`/`--no-tools` selections and plain `defaultTools` lists that omit it, and can be disabled for one process with `PI_CODEMODE_DEFAULT=0`.
+
+The canonical setting is also present in `~/.pi/agent/settings.json`:
+
+```json
+{ "defaultTools": ["+codemode"] }
+```
+
+## 7. agent-mode — system-prompt templates at session/compaction boundaries
+
+`agent-mode.ts` asks which system prompt the main agent should use:
+
+| Mode | Behavior |
+|---|---|
+| **TOKEN MAXING** | The main agent decomposes the request, dispatches subagents with narrow scopes, requires patches under `/tmp/pi-patches/<name>/`, reviews every diff, and merges only reviewed work. It must not explore or implement on its own. |
+| **SINGLE AGENT** | pi's normal system prompt, unchanged. |
+
+The picker appears when a new session starts (`startup`, `/new`, or fork) and
+after every compaction (manual, threshold, or overflow recovery). Resuming a
+session restores the persisted choice without asking. The choice is stored as
+an `agent-mode` custom session entry, so it follows the active branch.
+
+Commands:
+
+```text
+/mode                    # picker
+/mode token-maxing       # alias: tokenmax, token, max, tm
+/mode single-agent       # alias: single, agent, normal, sa
+/mode status
+```
+
+The footer shows `mode:token-maxing` or `mode:single`.
+
+## 8. tool-loadout — per-session tool selection without cache churn
+
+`tool-loadout.ts` opens a checklist at the start of each new session (startup,
+`/new`, or fork), just like the agent-mode picker. Enter applies the checked
+set; Escape keeps the restored/default set. Resuming or reloading a session
+restores the persisted choice without asking. `/tools` changes it later.
+
+```text
+/tools                         # interactive checklist
+/tools read,bash,edit          # set an explicit list
+/tools core                    # read, bash, edit, write, codemode
+/tools readonly                # read, grep, find, ls
+/tools all | none              # every declarable tool / no tools
+/tools show                    # current selection + available tools
+```
+
+**Cache safety and interruptions.** Changing tools with
+`pi.setActiveTools()` makes pi record a system-prompt *patch*
+(`toolsAdded` / `toolsRemoved`) in the transcript; it does not replace the
+already-cached prompt prefix. The extension never returns a replacement
+`systemPrompt`. When the selection changes while the agent is streaming,
+`/tools` aborts the in-flight turn, waits for idle, and starts a new turn with
+a compact tool-loadout message injected into the conversation — the same
+interrupt-then-continue idea as `subagent_interrupt`. When the agent is idle,
+the message is injected with the next prompt. The selected set is persisted per
+session branch and re-applied before every run.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -251,10 +327,12 @@ stored in this repository.
 | `CMD_API_KEY` | Command Code Provider API key |
 | `CMD_ZDR` | Set to `1` to request zero-data retention from Command Code |
 | `PI_BASH_DEFAULT_TIMEOUT` | Default bash timeout in seconds (default `10`) |
+| `PI_CODEMODE_DEFAULT` | `0`/`false`/`no` disables automatic `codemode` activation |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
 | `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`) |
 | `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |
 | `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
+| `PI_SUBAGENT_TOOLS_SET` | Set by the parent when a subagent has an explicit tools list; skips default `codemode` activation in the child |
 | `PI_OPENCODE_BIN` | Path to the `opencode` CLI for opencode-backed subagents (default: `opencode` on `PATH`) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
 | `PI_PLAYWRIGHT_IMPORT` | Absolute path to a playwright entry file (override) |

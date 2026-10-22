@@ -117,7 +117,9 @@ export function buildOpencodeFirstPrompt(rec: SubagentRecord, userText: string):
 		);
 	}
 	if (rec.tools) {
-		context.push(`Prefer these tools when possible: ${rec.tools}.`);
+		context.push(
+			`Preferred tools from the user's configuration: ${rec.tools}. Use the equivalent OpenCode tool if a name differs.`,
+		);
 	}
 	sections.push(`[subagent context]\n${context.join("\n")}`);
 	sections.push(userText);

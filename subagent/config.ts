@@ -18,6 +18,18 @@ import {
 import { isThinkingLevel, isOpencodeCliModel, isOpencodeModel, modelKnownToPi } from "./models.ts";
 import type { SubagentBackend, SubagentConfig } from "./types.ts";
 
+/** Parse the comma/space-separated tools setting into a list of names or modifiers. */
+export function parseToolList(value?: string): string[] {
+	if (!value) return [];
+	return [...new Set(value.split(/[,\s]+/).map((name) => name.trim()).filter(Boolean))];
+}
+
+/** Store a tool selection as the comma-separated form `--tools` accepts. Empty means inherit defaults. */
+export function formatToolList(names: string[]): string | undefined {
+	const unique = [...new Set(names.map((name) => name.trim()).filter(Boolean))];
+	return unique.length > 0 ? unique.join(",") : undefined;
+}
+
 export function configFile(): string {
 	return path.join(getAgentDir(), "subagent-config.json");
 }

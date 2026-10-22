@@ -37,6 +37,7 @@ export async function spawnSubagentProcess(
 	const args: string[] = ["--mode", "rpc", "--session", sessionFileForRecord(rec)];
 	if (rec.model) args.push("--model", rec.model);
 	if (rec.thinkingLevel) args.push("--thinking", rec.thinkingLevel);
+	if (rec.tools) args.push("--tools", rec.tools);
 
 	writeScopeFile(rec);
 
@@ -95,6 +96,7 @@ export async function spawnSubagentProcess(
 		if (rec.scope && rec.scope.length > 0) {
 			env.PI_SUBAGENT_SCOPE = JSON.stringify(rec.scope);
 		}
+		if (rec.tools) env.PI_SUBAGENT_TOOLS_SET = "1";
 		if (taskBase) env.PI_TASK_BASE = taskBase;
 		if (rec.allowTmp === false) env.PI_SUBAGENT_SCOPE_BLOCK_TMP = "1";
 		proc = spawn(invocation.command, invocation.args, {

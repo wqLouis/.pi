@@ -6,7 +6,14 @@
 import * as fs from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_OPENCODE_MODEL } from "./constants.ts";
-import { getMaxOpencodeSubagents, getMaxSubagents, loadConfig, saveConfig } from "./config.ts";
+import {
+	formatToolList,
+	getMaxOpencodeSubagents,
+	getMaxSubagents,
+	loadConfig,
+	parseToolList,
+	saveConfig,
+} from "./config.ts";
 import { isOpencodeModel, isThinkingLevel } from "./models.ts";
 import {
 	countRunningSubagents,
@@ -22,6 +29,8 @@ import { interruptRunning, running, startBackground } from "./runtime.ts";
 import { normalizeScope, writeScopeFile } from "./scope.ts";
 import { recordFile, scopeFile, sessionFileForRecord, subagentDir } from "./state.ts";
 import { showSubagentConfigUi } from "./ui/config-panel.ts";
+import { ToolChecklistComponent } from "./ui/tool-picker.ts";
+import { initialSubagentToolSelection, listSubagentTools } from "./tool-options.ts";
 import { showModelPicker } from "./ui/model-selector.ts";
 import { showSubagentView } from "./ui/subagent-view.ts";
 import type { SubagentRecord } from "./types.ts";
@@ -61,7 +70,7 @@ function listAllRecords(): SubagentRecord[] {
 }
 
 const CONFIG_USAGE =
-	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default>] — no args opens the settings panel.";
+	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|core|readonly|reset>] — no args opens the settings panel.";
 
 export function registerSubagentCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("subagent", {
@@ -193,11 +202,75 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Thinking level set to ${v}.`, "info");
 					return;
 				}
+				if (key === "tools") {
+					const value = parts.slice(2).join(" ").trim();
+					const tools = listSubagentTools(pi);
+					if (!value) {
+						if (ctx.mode !== "tui") {
+							ctx.ui.notify(
+								`Subagent tools: ${cfg.tools ?? "(inherit child defaults)"}. Use /subagent config tools <names|all|core|readonly|reset>.`,
+								"info",
+							);
+							return;
+						}
+						await ctx.ui.custom<void>((_tui, theme, _kb, done) =>
+							new ToolChecklistComponent({
+								title: "Subagent tools",
+								theme,
+								tools,
+								selected: initialSubagentToolSelection(pi, cfg.tools, tools),
+								onDone: (picked) => {
+									if (picked !== undefined) {
+										cfg.tools = formatToolList(picked);
+										saveConfig(cfg);
+										ctx.ui.notify(
+											cfg.tools
+												? `Subagent tools set to: ${cfg.tools}.`
+												: "Subagent tools reset to child defaults.",
+											"info",
+										);
+									}
+									done(undefined);
+								},
+							}),
+						);
+						return;
+					}
+					if (["reset", "default", "clear", "none"].includes(value.toLowerCase())) {
+						cfg.tools = undefined;
+						saveConfig(cfg);
+						ctx.ui.notify("Subagent tools reset to child defaults.", "info");
+						return;
+					}
+					const preset = value.toLowerCase();
+					const names =
+						preset === "all"
+							? tools.map((tool) => tool.name)
+							: preset === "core"
+								? ["read", "bash", "edit", "write", "codemode"]
+								: preset === "readonly"
+									? ["read", "grep", "find", "ls"]
+									: parseToolList(value);
+					const known = new Set(tools.map((tool) => tool.name));
+					const isPreset = preset === "all" || preset === "core" || preset === "readonly";
+					const unknown = isPreset ? [] : names.filter((name) => !known.has(name));
+					if (unknown.length > 0) {
+						ctx.ui.notify(`Unknown or non-declarable tools: ${unknown.join(", ")}`, "warning");
+						return;
+					}
+					cfg.tools = formatToolList(names.filter((name) => known.has(name)));
+					saveConfig(cfg);
+					ctx.ui.notify(
+						cfg.tools ? `Subagent tools set to: ${cfg.tools}.` : "Subagent tools reset to child defaults.",
+						"info",
+					);
+					return;
+				}
 				if (key) {
 					ctx.ui.notify(CONFIG_USAGE, "info");
 					return;
 				}
-				await showSubagentConfigUi(ctx);
+				await showSubagentConfigUi(pi, ctx);
 				return;
 			}
 

@@ -15,6 +15,7 @@
 import {
 	DynamicBorder,
 	getSettingsListTheme,
+	type ExtensionAPI,
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -28,7 +29,16 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { OPENCODE_DEFAULT_EFFORT } from "../backends/opencode.ts";
-import { configFile, getMaxAutoResumes, getMaxOpencodeSubagents, getMaxSubagents, loadConfig, saveConfig } from "../config.ts";
+import {
+	configFile,
+	formatToolList,
+	getMaxAutoResumes,
+	getMaxOpencodeSubagents,
+	getMaxSubagents,
+	loadConfig,
+	parseToolList,
+	saveConfig,
+} from "../config.ts";
 import { DEFAULT_OPENCODE_MODEL, SETTINGS_MAX_VISIBLE } from "../constants.ts";
 import { THINKING_LEVEL_DESCRIPTIONS, isThinkingLevel, supportedThinkingLevels } from "../models.ts";
 import { countRunningSubagents } from "../records.ts";
@@ -36,6 +46,8 @@ import type { SubagentBackend, SubagentConfig } from "../types.ts";
 import { ListPickerComponent, type UiTheme } from "./list-picker.ts";
 import { makeModelSelector } from "./model-selector.ts";
 import { OpencodePickerComponent, type OpencodeChoice } from "./opencode-picker.ts";
+import { ToolChecklistComponent } from "./tool-picker.ts";
+import { initialSubagentToolSelection, listSubagentTools } from "../tool-options.ts";
 
 const FOOTER_HINT = "↑/↓ navigate · Enter to change · type a number to set a limit · Esc close";
 const SAVED_FLASH_MS = 2000;
@@ -48,6 +60,7 @@ function notifyConfigSummary(ctx: ExtensionCommandContext): void {
 		`backend: ${cfg.backend ?? "auto (infer from model)"} · model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
 			`thinking level: ${cfg.thinkingLevel ?? "(model default)"}\n` +
 			`opencode model: ${cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL}${cfg.opencodeEffort && cfg.opencodeEffort !== OPENCODE_DEFAULT_EFFORT ? ` · effort: ${cfg.opencodeEffort}` : ""}\n` +
+			`tools: ${cfg.tools ?? "(inherit child defaults)"}\n` +
 			`maxSubagents: ${getMaxSubagents()} (pi running ${countRunningSubagents("pi")}) · maxOpencodeSubagents: ${getMaxOpencodeSubagents()} (opencode running ${countRunningSubagents("opencode")})\n` +
 			`scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none)"} · allowTmp: ${cfg.allowTmp === false ? "no" : "yes"}\n` +
 			`autoResume: ${cfg.autoResume === false ? "no" : "yes"} (limit ${getMaxAutoResumes()})\n` +
@@ -56,7 +69,7 @@ function notifyConfigSummary(ctx: ExtensionCommandContext): void {
 	);
 }
 
-export async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promise<void> {
+export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") {
 		notifyConfigSummary(ctx);
 		return;
@@ -66,6 +79,7 @@ export async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promis
 		const draft: SubagentConfig = { ...loadConfig() };
 		const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 		const sessionModelText = sessionModel ?? "(none)";
+		const selectableTools = listSubagentTools(pi);
 		let savedAt = 0;
 		let closed = false;
 		let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -102,6 +116,12 @@ export async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promis
 				draft.opencodeEffort && draft.opencodeEffort !== OPENCODE_DEFAULT_EFFORT ? draft.opencodeEffort : undefined;
 			return effort ? `${model} · ${effort}` : model;
 		};
+		const toolsValue = () => {
+			const names = parseToolList(draft.tools);
+			if (names.length === 0) return "inherit (child defaults)";
+			return names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4}`;
+		};
+		const initialToolSelection = () => initialSubagentToolSelection(pi, draft.tools, selectableTools);
 
 		const finish = () => {
 			if (closed) return;
@@ -202,6 +222,29 @@ export async function showSubagentConfigUi(ctx: ExtensionCommandContext): Promis
 							draft.opencodeEffort = choice.effort;
 							autoSave();
 							subDone(choice.effort ? `${choice.model} · ${choice.effort}` : choice.model);
+						},
+					}),
+			},
+			{
+				id: "tools",
+				label: "Subagent tools",
+				description:
+					"Tools declared to spawned pi subagents (passed as --tools). Enter to pick; leaving everything unchecked inherits the child's defaults. OpenCode receives the list as a preference.",
+				currentValue: toolsValue(),
+				submenu: (_current, subDone) =>
+					new ToolChecklistComponent({
+						title: "Subagent tools",
+						theme,
+						tools: selectableTools,
+						selected: initialToolSelection(),
+						onDone: (value) => {
+							if (value === undefined) {
+								subDone(undefined);
+								return;
+							}
+							draft.tools = formatToolList(value);
+							autoSave();
+							subDone(toolsValue());
 						},
 					}),
 			},

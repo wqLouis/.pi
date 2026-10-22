@@ -44,6 +44,7 @@ export interface SubagentRecord {
 	pendingMessages?: string[];
 	systemPrompt: string;
 	cwd: string;
+	/** Tool allowlist passed to this run (`--tools`), fixed at spawn time. */
 	tools?: string;
 
 	/** Which runtime executes this subagent: the pi CLI (default) or the opencode CLI. */
@@ -101,6 +102,7 @@ export interface SubagentConfig {
 	opencodeEffort?: string;
 	systemPrompt?: string;
 	cwd?: string;
+	/** Comma-separated tool allowlist passed to pi children as `--tools`; unset = child defaults. */
 	tools?: string;
 
 	maxSubagents?: number;
