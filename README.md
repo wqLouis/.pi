@@ -352,6 +352,20 @@ The tool's own description says the same (see section 9).
 | **TOKEN MAXING** | The main agent decomposes the request, dispatches subagents with narrow scopes, requires patches under `/tmp/pi-patches/<name>/`, reviews every diff, and merges only reviewed work. It must not explore or implement on its own. |
 | **SINGLE AGENT** | pi's normal system prompt, unchanged. |
 
+**The preset adapts to the session's tools.** It is assembled at run time from
+the active tool set, so it never names a tool the session cannot reach:
+
+- **codemode is the main agent's only tool path.** All of its own work goes
+  through one codemode script per step — chaining calls and filtering their
+  output — so diffs, test logs and file contents never flood the main context.
+  It reviews a patch through a script that returns only the hunks it has to
+  judge, and it never calls `read`, `bash`, `edit` or `write` directly.
+- **Long commands run as background jobs.** Builds, test suites and other slow
+  commands go through `bgjob_start`; the completion calls the agent back with
+  the exit code and the output tail, so the main agent never blocks or polls.
+- Without codemode (or without the bgjobs extension) those rules are simply
+  left out, and the preset falls back to the direct-tool wording.
+
 The picker appears when a new session starts (`startup`, `/new`, or fork) and
 after every compaction (manual, threshold, or overflow recovery). Resuming a
 session restores the persisted choice without asking. The choice is stored as
