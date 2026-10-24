@@ -29,6 +29,7 @@ self-managing, multi-agent system. Eight extensions, loaded from
 10. **system-prompt-view** — `/system` shows the live system prompt in gray TUI text plus an approximate token count.
 11. **web-search** — `web_search` / `web_fetch` backed by DeepSeek's Search & Fetch API or EXA.
 12. **pi-docs-section** — pi's `<docs>` system-prompt section only when the session works under a `.pi` path.
+13. **bgjobs** — long shell commands run in the background and call the agent back when they finish.
 
 Each extension auto-loads on pi start (or `/reload`); every tool below is
 available to the main agent, and subagents get the browser + bash-timeout
@@ -46,6 +47,9 @@ automatically:
   Do not sleep or poll for subagents; the harness wakes the agent when each finishes.
 - `subagent_interrupt` — steering is immediate: it kills the subagent's in-flight turn
   and restarts it with your message; keep working and get pinged when it finishes.
+- `bgjob_start` — run a long command in the background (build, test suite, dev server);
+  the tool returns immediately and the completion **auto-bubbles** as a real message with
+  the exit code and the tail of the output. Do not sleep or poll for a job.
 - **Idle timers** re-deliver anything that was missed (reloads, busy turns)
   at session start / turn end / every 30s — no notification is ever lost.
 - Busy-safe pushes: every notification passes `deliverAs: "steer"`, so it
@@ -519,6 +523,43 @@ bring the docs section back. They now contribute structured parts instead:
 | `agent-tasks` | a `task_board` section |
 | `agent-mode` | a `token_maxing` section |
 
+## 13. bgjobs — background jobs that call back
+
+`bgjobs/` runs shell commands in the background and **calls the agent back**
+when they finish: the completion arrives as a real user message with the exit
+code and the tail of the output, so the agent never has to poll a long command.
+
+| Tool | Purpose |
+|---|---|
+| `bgjob_start { command, name?, cwd?, timeout? }` | Start a background job; returns immediately with a job id. The harness notifies the agent when it ends |
+| `bgjob_list {}` | The session's jobs: name, id, state, exit code, runtime |
+| `bgjob_output { job, lines? }` | The tail of a job's log (stdout + stderr), also while it runs |
+| `bgjob_kill { job }` | Stop a running job (its whole process group) |
+
+```text
+/bgjobs              # list all jobs
+/bgjobs show <job>   # show a job's output
+/bgjobs kill <job>   # stop a running job
+/bgjobs kill-all     # stop every running job
+```
+
+Key behaviors:
+
+- **Never poll** — `bgjob_start` returns immediately; the completion callback
+  carries the exit code and the output tail. A missed callback (reload, busy
+  turn) is re-delivered by the idle timer, so no result is ever lost.
+- **Jobs outlive pi** — each job runs in its own process group with stdout and
+  stderr redirected straight into its log file, so it keeps running (and keeps
+  logging) when pi quits. A later session **adopts** the jobs that are still
+  running and reports them when they end.
+- **Exit codes survive** — the job runs through a small wrapper script that
+  records the command's exit code in a file, so even a job that outlived its
+  pi process reports *how* it ended (the agent sees `failed (exit code 3)`).
+- **Session-scoped** — records, logs and exit files live in
+  `~/.pi/agent/bgjobs/<session>/`; one session never sees another's jobs.
+- **Safety nets** — an optional `timeout` kills a job that never ends
+  (`timed out after 60s`), and `bgjob_kill` stops a whole process group.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -538,6 +579,7 @@ bring the docs section back. They now contribute structured parts instead:
 | `PI_PROMPT_CACHE_KEY` | Prompt-cache key for child processes: the harness sets one key per main session so a batch shares a cache slot (needs the patch from section 9) |
 | `PI_OPENCODE_BIN` | Path to the `opencode` CLI for opencode-backed subagents (default: `opencode` on `PATH`) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
+| `PI_BGJOBS_DIR` | Root directory for background-job records, logs and exit files (default `~/.pi/agent/bgjobs`) |
 | `PI_PLAYWRIGHT_IMPORT` | Absolute path to a playwright entry file (override) |
 | `PI_BROWSER_DAEMON_FILE` | Absolute path to `browser-server.mjs` |
 | `PI_PLAYWRIGHT_GLOBAL_DIR` | Extra global node_modules dir to scan for playwright |
