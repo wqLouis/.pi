@@ -49,30 +49,41 @@ export function saveConfig(cfg: SubagentConfig): void {
 	fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
+/**
+ * Concurrent pi-backed subagents allowed. 0 disables the pool: spawning a pi
+ * subagent is refused, while opencode subagents keep their own independent limit.
+ */
 export function getMaxSubagents(): number {
 	const cfg = loadConfig();
-	if (typeof cfg.maxSubagents === "number" && Number.isFinite(cfg.maxSubagents) && cfg.maxSubagents >= 1)
+	if (typeof cfg.maxSubagents === "number" && Number.isFinite(cfg.maxSubagents) && cfg.maxSubagents >= 0)
 		return Math.floor(cfg.maxSubagents);
-	const env = Number(process.env.PI_SUBAGENT_MAX_SUBAGENTS);
-	if (Number.isFinite(env) && env >= 1) return Math.floor(env);
+	const env = process.env.PI_SUBAGENT_MAX_SUBAGENTS;
+	if (env !== undefined && env !== "") {
+		const parsed = Number(env);
+		if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+	}
 	return DEFAULT_MAX_SUBAGENTS;
 }
 
 /**
  * Concurrent opencode-backed subagents allowed. This is an independent pool:
  * the pi backend is governed by maxSubagents, the opencode backend by this
- * limit, so both can run up to their own maximum at the same time.
+ * limit, so both can run up to their own maximum at the same time. 0 disables
+ * the pool entirely.
  */
 export function getMaxOpencodeSubagents(): number {
 	const cfg = loadConfig();
 	if (
 		typeof cfg.maxOpencodeSubagents === "number" &&
 		Number.isFinite(cfg.maxOpencodeSubagents) &&
-		cfg.maxOpencodeSubagents >= 1
+		cfg.maxOpencodeSubagents >= 0
 	)
 		return Math.floor(cfg.maxOpencodeSubagents);
-	const env = Number(process.env.PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS);
-	if (Number.isFinite(env) && env >= 1) return Math.floor(env);
+	const env = process.env.PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS;
+	if (env !== undefined && env !== "") {
+		const parsed = Number(env);
+		if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+	}
 	return DEFAULT_MAX_OPENCODE_SUBAGENTS;
 }
 
@@ -110,9 +121,10 @@ export interface ResolvedSpawnOptions {
 }
 
 /**
- * Resolve the user's configuration into spawn options. The spawn tool may only
- * choose the backend (`params.backend`); models, thinking levels, efforts,
- * system prompt, cwd, and tools are all user configuration.
+ * Resolve the user's configuration into spawn options. Each spawn tool passes
+ * its backend explicitly (`subagent_spawn` = pi, `subagent_spawn_opencode` =
+ * OpenCode); models, thinking levels, efforts, system prompt, cwd, and tools
+ * are all user configuration.
  */
 export function resolveSpawnOptions(ctx: ExtensionContext, params: SpawnOptionsInput = {}): ResolvedSpawnOptions {
 	const cfg = loadConfig();
@@ -122,8 +134,9 @@ export function resolveSpawnOptions(ctx: ExtensionContext, params: SpawnOptionsI
 	// namespace *and* pi has no provider entry for it (opencode-go/... is pi's own).
 	const opencodeCliModel = (m?: string) => isOpencodeCliModel(m) && !modelKnownToPi(ctx, m);
 
-	// Precedence: an explicit backend param wins; otherwise the configured backend;
-	// otherwise an opencode/-namespaced config model selects the opencode backend.
+	// Precedence: the spawn tool's explicit backend wins; the legacy configured
+	// backend and an opencode/-namespaced config model are fallbacks for callers
+	// that do not pass one.
 	const backend: SubagentBackend = params.backend ?? cfg.backend ?? (opencodeCliModel(cfg.model) ? "opencode" : "pi");
 	const model =
 		backend === "opencode"

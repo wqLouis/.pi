@@ -13,6 +13,13 @@
  *    (one unit each, holding all their tools),
  *  - any other path is the extension file that registered the tool (one unit
  *    holding all of its tools).
+ *
+ * An extension can split itself into separately selectable registries by giving
+ * a tool a `namespace`: its unit id becomes `<path>#<namespace>` and its label
+ * the namespace name. The subagent extension uses this to expose the pi and
+ * OpenCode spawn tools as two units (`subagent-pi`, `subagent-opencode`), so a
+ * session enables only the backend it uses. Selecting such a sub-unit also
+ * selects its extension's base unit, which holds the shared tools.
  */
 
 import { getKeybindings, matchesKey, truncateToWidth, type Component } from "@earendil-works/pi-tui";
@@ -22,7 +29,7 @@ import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 const BUILTIN_EXTENSIONS = new Set(["codemode", "tool-search"]);
 
 export interface ToolUnit {
-	/** Stable id: `tool:<name>` for a core tool, the extension path otherwise. */
+	/** Stable id: `tool:<name>` for a core tool, `<path>` for an extension, `<path>#<namespace>` for a named registry. */
 	id: string;
 	/** Display name. */
 	label: string;
@@ -30,8 +37,10 @@ export interface ToolUnit {
 	kind: "tool" | "group";
 	/** Tool names in the unit. */
 	tools: string[];
-	/** Description of a single core tool. */
+	/** Description of a single core tool or of a namespaced registry. */
 	description?: string;
+	/** For a namespaced sub-unit, the extension path it belongs to. */
+	parentId?: string;
 }
 
 /** The minimal theme API the checklist needs. */
@@ -75,12 +84,23 @@ export function toolUnits(tools: ToolInfo[]): ToolUnit[] {
 				description = tool.description;
 			}
 		} else {
-			id = path;
-			label = basenameLabel(path);
-			kind = "group";
+			const namespace = tool.namespace?.name?.trim();
+			if (namespace) {
+				// A named registry inside the extension: selectable on its own, with
+				// the extension's base unit (its shared tools) kept alongside it.
+				id = `${path}#${namespace}`;
+				label = namespace;
+				kind = "group";
+				description = tool.namespace?.description;
+			} else {
+				id = path;
+				label = basenameLabel(path);
+				kind = "group";
+			}
 		}
 
 		const unit = units.get(id) ?? { id, label, kind, tools: [], description };
+		if (unit.id.includes("#")) unit.parentId = unit.id.slice(0, unit.id.indexOf("#"));
 		unit.tools.push(tool.name);
 		units.set(id, unit);
 	}
@@ -99,6 +119,20 @@ export function toolsOfUnits(units: ToolUnit[], ids: string[]): string[] {
 		if (wanted.has(unit.id)) names.push(...unit.tools);
 	}
 	return names;
+}
+
+/**
+ * Add the base unit of every namespaced sub-unit: a backend registry needs its
+ * extension's shared tools, so selecting one never leaves it half-installed.
+ */
+export function withParentUnits(units: ToolUnit[], ids: string[]): string[] {
+	const known = new Set(units.map((unit) => unit.id));
+	const out = [...ids];
+	for (const unit of units) {
+		if (!ids.includes(unit.id) || !unit.parentId || !known.has(unit.parentId)) continue;
+		out.push(unit.parentId);
+	}
+	return [...new Set(out)];
 }
 
 /**
@@ -163,8 +197,18 @@ export class ToolUnitChecklist implements Component {
 	private toggle(): void {
 		const unit = this.opts.units[this.index];
 		if (!unit) return;
-		if (this.selected.has(unit.id)) this.selected.delete(unit.id);
-		else this.selected.add(unit.id);
+		if (this.selected.has(unit.id)) {
+			// A shared base unit stays on while one of its registries is on.
+			const hasSelectedChild = this.opts.units.some(
+				(candidate) => candidate.parentId === unit.id && this.selected.has(candidate.id),
+			);
+			if (hasSelectedChild) return;
+			this.selected.delete(unit.id);
+		} else {
+			// Enabling a registry keeps its extension's shared tools enabled too.
+			this.selected.add(unit.id);
+			if (unit.parentId) this.selected.add(unit.parentId);
+		}
 		this.invalidate();
 	}
 

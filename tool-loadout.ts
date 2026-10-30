@@ -4,25 +4,24 @@
  * At the start of a new session the user picks the tools for that session.
  * Core tools (read, bash, edit, write, …) toggle individually; everything an
  * extension registers is one unit, so an extension's tools are enabled or
- * disabled as a whole. `/tools` changes the selection later. Resuming or
- * reloading a session restores the persisted choice. The chosen set is
- * enforced before every run.
+ * disabled as a whole. An extension can expose named registries as sub-units
+ * (the subagent extension splits its pi and OpenCode spawn tools this way), so
+ * only the backend a session uses is declared. `/tools` changes the selection.
+ * Resuming or reloading a session restores the persisted choice.
  *
- * Cache safety: the extension never returns a replacement `systemPrompt`.
- * `pi.setActiveTools()` records the tool delta as a system-prompt patch
- * (`toolsAdded` / `toolsRemoved`), leaving the already-cached prefix intact.
- * On an in-flight change the current turn is aborted (the same "interrupt then
- * continue" model as `subagent_interrupt`) and a compact loadout message is
- * injected into the conversation, rather than editing the existing system
- * prompt in place.
+ * The loadout is fixed on the first turn: it is applied before the first run
+ * and then locked, so a mid-session change cannot churn the prompt. The
+ * session-start system prompt already declares the selected tools (pi renders
+ * them into its `<tools>` section), so no loadout message is ever injected —
+ * the extension never returns a replacement `systemPrompt` either. After a
+ * compaction the prompt is rebuilt anyway, so `/tools` is allowed again for
+ * the rest of that session.
  */
 
 import type {
 	ExtensionAPI,
-	ExtensionCommandContext,
 	ExtensionContext,
 	SessionStartEvent,
-	Theme,
 	ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -31,12 +30,12 @@ import {
 	toolsOfUnits,
 	unitsForTools,
 	unitsOfActiveTools,
+	withParentUnits,
 	type ToolUnit,
 } from "./subagent/tool-groups.ts";
 import { loadSelection, saveSelection, selectionFile } from "./subagent/tool-selection.ts";
 
 const CUSTOM_TYPE = "tool-loadout";
-const MAX_PROMPT_CHARS = 8_000;
 
 /**
  * Tools that are always active. `codemode` is the harness's scripting layer:
@@ -69,10 +68,23 @@ function readState(ctx: ExtensionContext): LoadoutState | undefined {
 	return undefined;
 }
 
+/** Whether this branch already has conversation (a prompt has been built). */
+function branchStarted(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager.getBranch().some((entry) => entry.type === "message");
+}
+
+/** Whether this branch was compacted, which rebuilds the prompt and reopens the loadout. */
+function branchCompacted(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager.getBranch().some((entry) => entry.type === "compaction");
+}
+
 export default function (pi: ExtensionAPI) {
 	/** Enabled unit ids; undefined until the user picks (or a session restores one). */
 	let selectedUnits: string[] | undefined;
-	let pendingInjection: string | undefined;
+	/** Changes are refused while locked: the loadout is fixed on the first turn. */
+	let locked = false;
+	/** A compaction rebuilds the prompt, so changes are allowed again for this session. */
+	let compacted = false;
 
 	/** The tools the user picks between. The always-on tools are not part of it. */
 	const declarableTools = (): ToolInfo[] =>
@@ -116,36 +128,10 @@ export default function (pi: ExtensionAPI) {
 		const theme = ctx.ui.theme;
 		const all = units();
 		const label =
-			selectedUnits === undefined ? "tools:auto" : `tools:${selectedUnits.length}/${all.length}`;
+			selectedUnits === undefined
+				? "tools:auto"
+				: `tools:${selectedUnits.length}/${all.length}${locked ? " 🔒" : ""}`;
 		ctx.ui.setStatus("tool-loadout", theme.fg("accent", label));
-	};
-
-	const buildLoadoutPrompt = (next: string[], previous: string[]): string => {
-		const all = units();
-		const enabled = all.filter((unit) => unit.tools.some((name) => next.includes(name)));
-		const disabled = all.filter((unit) => !unit.tools.some((name) => next.includes(name)));
-		const added = next.filter((name) => !previous.includes(name));
-		const removed = previous.filter((name) => !next.includes(name));
-
-		const lines = [
-			"[TOOL LOADOUT — ACTIVE TOOLS]",
-			`Enabled: ${enabled.length > 0 ? enabled.map((unit) => unit.label).join(", ") : "(none)"}.`,
-			"Core tools are enabled one by one; an extension's tools are enabled or disabled as a whole. Use only the enabled tools. If you need a tool that is not enabled, ask the user to enable it with /tools.",
-			"codemode is always enabled and is not part of this selection: do the tool work through codemode scripts instead of calling the tools one by one.",
-		];
-		if (added.length > 0) lines.push(`Newly available: ${added.join(", ")}.`);
-		if (removed.length > 0) lines.push(`No longer available: ${removed.join(", ")}.`);
-		if (disabled.length > 0) {
-			lines.push(`Disabled: ${disabled.map((unit) => unit.label).join(", ")}.`);
-		}
-		lines.push(
-			"If this update interrupted your previous turn, continue the interrupted task using the new tool set.",
-		);
-
-		const text = lines.join("\n");
-		return text.length > MAX_PROMPT_CHARS
-			? `${text.slice(0, MAX_PROMPT_CHARS)}\n\n(Loadout details truncated.)`
-			: text;
 	};
 
 	/** Accept unit ids as well as plain tool names, and map both to unit ids. */
@@ -169,7 +155,8 @@ export default function (pi: ExtensionAPI) {
 
 	const applySelection = (ctx: ExtensionContext, unitIds: string[]): boolean => {
 		const all = units();
-		const valid = resolveUnitIds(all, unitIds);
+		// A backend sub-unit keeps its extension's shared tools enabled.
+		const valid = withParentUnits(all, resolveUnitIds(all, unitIds));
 		const previous = selectedUnits !== undefined ? effectiveToolNames() : pi.getActiveTools();
 		const known = new Set(declarableTools().map((tool) => tool.name));
 		const next = unique([
@@ -179,10 +166,7 @@ export default function (pi: ExtensionAPI) {
 
 		const changed = !sameTools(previous, next);
 		selectedUnits = valid;
-		if (changed) {
-			pi.setActiveTools(next);
-			pendingInjection = buildLoadoutPrompt(next, previous);
-		}
+		if (changed) pi.setActiveTools(next);
 		persist();
 		updateStatus(ctx);
 		return changed;
@@ -217,41 +201,13 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	/**
-	 * Apply a pending loadout message. If the agent is streaming, abort the
-	 * in-flight turn and start a fresh one with the loadout injected. If it is
-	 * idle, leave the message for the next user prompt.
-	 */
-	const deliver = async (ctx: ExtensionCommandContext): Promise<void> => {
-		const message = pendingInjection;
-		if (!message) return;
-
-		if (ctx.isIdle()) {
-			ctx.ui.notify("Tool loadout updated; it will be injected with your next prompt.", "info");
-			return;
-		}
-
-		ctx.ui.notify("Interrupting the current turn to apply the new tool loadout...", "warning");
-		ctx.abort();
-		await ctx.waitForIdle();
-		if (!ctx.isIdle()) {
-			ctx.ui.notify("Could not interrupt the turn; the loadout will apply on the next prompt.", "warning");
-			return;
-		}
-
-		pendingInjection = undefined;
-		pi.sendMessage(
-			{ customType: CUSTOM_TYPE, content: message, display: false },
-			{ triggerTurn: true },
-		);
-	};
-
 	const notifyCurrent = (ctx: ExtensionContext): void => {
 		const all = units();
 		const enabled = all.filter((unit) => selectedUnits?.includes(unit.id));
 		const available = all.filter((unit) => !selectedUnits?.includes(unit.id));
 		ctx.ui.notify(
-			`Enabled (${enabled.length}): ${enabled.map((unit) => unit.label).join(", ") || "(none)"}\n` +
+			`${locked ? "Locked (fixed on the first turn; /tools reopens after a compaction)" : "Open (applies to the next prompt)"}\n` +
+				`Enabled (${enabled.length}): ${enabled.map((unit) => unit.label).join(", ") || "(none)"}\n` +
 				`Available (${available.length}): ${available.map((unit) => unit.label).join(", ") || "(none)"}\n` +
 				`Active tools: ${effectiveToolNames().join(", ") || "(none)"}\n` +
 				`Always on (not selectable): ${alwaysOnToolNames().join(", ")} · remembered in ${selectionFile()}`,
@@ -280,17 +236,20 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
+	/** A branch switch restores that branch's choice; it is locked if it already ran. */
 	const restore = (ctx: ExtensionContext): void => {
 		selectedUnits = restoredUnitIds(ctx) ?? unitsOfActiveTools(units(), pi.getActiveTools());
-		pendingInjection = undefined;
+		compacted = branchCompacted(ctx);
+		locked = !compacted && branchStarted(ctx);
 		persist();
 		updateStatus(ctx);
 	};
 
 	const chooseAtSessionStart = async (event: SessionStartEvent, ctx: ExtensionContext): Promise<void> => {
-		const restored = restoredUnitIds(ctx);
-		selectedUnits = restored;
-		pendingInjection = undefined;
+		selectedUnits = restoredUnitIds(ctx);
+		// A resumed/reloaded branch already has its prompt; a fresh one is open.
+		compacted = branchCompacted(ctx);
+		locked = !compacted && branchStarted(ctx);
 
 		// Like the system-prompt mode picker: ask on a new session, but restore
 		// silently on resume/reload.
@@ -320,9 +279,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", chooseAtSessionStart);
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (_event, ctx) => {
+		// A compaction rebuilds the prompt, so the loadout may change again.
+		compacted = true;
+		locked = false;
 		// Keep the choice after the compaction boundary so a later resume restores it.
 		if (selectedUnits !== undefined) persist();
+		updateStatus(ctx);
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
@@ -330,15 +293,10 @@ export default function (pi: ExtensionAPI) {
 			selectedUnits = unitsOfActiveTools(units(), pi.getActiveTools());
 			persist();
 		}
-		updateStatus(ctx);
 
-		let injection = pendingInjection;
-		pendingInjection = undefined;
-
-		// Re-apply the chosen loadout before the request. Pi records tool changes
-		// as a system-prompt patch, so the existing cached prefix is preserved.
-		// Keep tools that codemode/tool_search loaded dynamically, so this
-		// extension does not undo them on the next run.
+		// Re-apply the chosen loadout before the request. Keep tools that
+		// codemode/tool_search loaded dynamically, so this extension does not
+		// undo them on the next run.
 		const toolInfo = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 		const known = new Set(declarableTools().map((tool) => tool.name));
 		const keepDynamic = selectedToolNames().includes("tool_search") || selectedToolNames().includes("codemode");
@@ -354,29 +312,35 @@ export default function (pi: ExtensionAPI) {
 			...dynamic,
 		]);
 		const active = pi.getActiveTools();
-		if (!sameTools(active, desired)) {
-			pi.setActiveTools(desired);
-			injection ??= buildLoadoutPrompt(desired, active);
-		}
+		if (!sameTools(active, desired)) pi.setActiveTools(desired);
 
-		if (injection) {
-			return {
-				message: {
-					customType: CUSTOM_TYPE,
-					content: injection,
-					display: false,
-				},
-			};
-		}
+		// The run that follows builds its prompt with this loadout, so the
+		// selection is now fixed until the next compaction.
+		if (!compacted) locked = true;
+		updateStatus(ctx);
 		return undefined;
 	});
 
 	pi.registerCommand("tools", {
 		description:
-			"Pick the enabled tools. /tools (checklist), /tools all|none, /tools <names> (replace), /tools +name / -name (add/remove), /tools show.",
+			"Pick the enabled tools. /tools (checklist), /tools all|none, /tools <names> (replace), /tools +name / -name (add/remove), /tools show. The loadout is fixed on the first turn and reopens after a compaction.",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/[\s,]+/).filter(Boolean);
 			const first = parts[0]?.toLowerCase();
+
+			if (first === "show" || first === "list" || first === "status") {
+				notifyCurrent(ctx);
+				return;
+			}
+
+			if (locked) {
+				ctx.ui.notify(
+					"Tool loadout is locked for this session: it is fixed on the first turn. It reopens after a compaction, or start a new session to change it.",
+					"warning",
+				);
+				return;
+			}
+
 			const all = units();
 
 			if (!first || first === "pick" || first === "select") {
@@ -390,17 +354,8 @@ export default function (pi: ExtensionAPI) {
 				const current = selectedUnits ?? unitsOfActiveTools(all, pi.getActiveTools());
 				const picked = await pickUnits(ctx, "Select tools", current);
 				if (!picked) return;
-				const changed = applySelection(ctx, picked);
-				if (!changed) {
-					ctx.ui.notify("Tool loadout unchanged.", "info");
-					return;
-				}
-				await deliver(ctx);
-				return;
-			}
-
-			if (first === "show" || first === "list" || first === "status") {
-				notifyCurrent(ctx);
+				if (applySelection(ctx, picked)) ctx.ui.notify("Tool loadout updated; it applies to the next prompt.", "info");
+				else ctx.ui.notify("Tool loadout unchanged.", "info");
 				return;
 			}
 
@@ -456,12 +411,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const changed = applySelection(ctx, unitIds);
-			if (!changed) {
+			if (!applySelection(ctx, unitIds)) {
 				ctx.ui.notify("Tool loadout unchanged.", "info");
 				return;
 			}
-			await deliver(ctx);
+			ctx.ui.notify("Tool loadout updated; it applies to the next prompt.", "info");
 		},
 	});
 }

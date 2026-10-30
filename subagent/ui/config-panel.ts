@@ -42,7 +42,7 @@ import {
 import { DEFAULT_OPENCODE_MODEL, SETTINGS_MAX_VISIBLE } from "../constants.ts";
 import { THINKING_LEVEL_DESCRIPTIONS, isThinkingLevel, supportedThinkingLevels } from "../models.ts";
 import { countRunningSubagents } from "../records.ts";
-import type { SubagentBackend, SubagentConfig } from "../types.ts";
+import type { SubagentConfig } from "../types.ts";
 import { ListPickerComponent, type UiTheme } from "./list-picker.ts";
 import { makeModelSelector } from "./model-selector.ts";
 import { OpencodePickerComponent, type OpencodeChoice } from "./opencode-picker.ts";
@@ -52,16 +52,21 @@ import { ToolUnitChecklist, toolsOfUnits } from "../tool-groups.ts";
 const FOOTER_HINT = "↑/↓ navigate · Enter to change · type a number to set a limit · Esc close";
 const SAVED_FLASH_MS = 2000;
 
+/** Format a pool limit for display; 0 means the pool is disabled. */
+function formatPoolLimit(limit: number): string {
+	return limit === 0 ? "0 (disabled)" : String(limit);
+}
+
 /** Summary for non-interactive mode (no TUI). */
 function notifyConfigSummary(ctx: ExtensionCommandContext): void {
 	const cfg = loadConfig();
 	const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 	ctx.ui.notify(
-		`backend: ${cfg.backend ?? "auto (infer from model)"} · model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
+		`spawn tools: subagent_spawn = pi · subagent_spawn_opencode = OpenCode (enable one with /tools) · model: ${cfg.model ?? "(inherit)"} (session: ${sessionModel})\n` +
 			`thinking level: ${cfg.thinkingLevel ?? "(model default)"}\n` +
 			`opencode model: ${cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL}${cfg.opencodeEffort && cfg.opencodeEffort !== OPENCODE_DEFAULT_EFFORT ? ` · effort: ${cfg.opencodeEffort}` : ""}\n` +
 			`tools: ${cfg.tools ?? "(inherit child defaults)"}\n` +
-			`maxSubagents: ${getMaxSubagents()} (pi running ${countRunningSubagents("pi")}) · maxOpencodeSubagents: ${getMaxOpencodeSubagents()} (opencode running ${countRunningSubagents("opencode")})\n` +
+			`maxSubagents: ${formatPoolLimit(getMaxSubagents())} (pi running ${countRunningSubagents("pi")}) · maxOpencodeSubagents: ${formatPoolLimit(getMaxOpencodeSubagents())} (opencode running ${countRunningSubagents("opencode")})\n` +
 			`scope: ${cfg.scope ? (Array.isArray(cfg.scope) ? cfg.scope.join(", ") : cfg.scope) : "(none)"} · allowTmp: ${cfg.allowTmp === false ? "no" : "yes"}\n` +
 			`autoResume: ${cfg.autoResume === false ? "no" : "yes"} (limit ${getMaxAutoResumes()})\n` +
 			`file: ${configFile()}`,
@@ -88,12 +93,12 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 		/** Numeric rows: bounds, the effective value (config ?? env ?? default), and the draft setter. */
 		const numericSpecs: Record<string, { min: number; effective: () => number; set: (n: number) => void }> = {
 			maxSubagents: {
-				min: 1,
+				min: 0,
 				effective: () => draft.maxSubagents ?? getMaxSubagents(),
 				set: (n) => (draft.maxSubagents = n),
 			},
 			maxOpencodeSubagents: {
-				min: 1,
+				min: 0,
 				effective: () => draft.maxOpencodeSubagents ?? getMaxOpencodeSubagents(),
 				set: (n) => (draft.maxOpencodeSubagents = n),
 			},
@@ -107,7 +112,6 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 		const maxSubagentsValue = () => numericValue("maxSubagents");
 		const maxOpencodeValue = () => numericValue("maxOpencodeSubagents");
 		const maxAutoResumesValue = () => numericValue("maxAutoResumes");
-		const backendValue = () => draft.backend ?? "auto";
 		const modelValue = () => draft.model ?? `inherit (${sessionModelText})`;
 		const thinkingValue = () => draft.thinkingLevel ?? "default (model)";
 		const opencodeValue = () => {
@@ -145,14 +149,6 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 
 		// --- rows ----------------------------------------------------------
 		const items: SettingItem[] = [
-			{
-				id: "backend",
-				label: "Backend",
-				description:
-					"Runtime for new subagents. 'auto' infers it from the model (an opencode/... model uses the OpenCode CLI). Enter to cycle.",
-				currentValue: backendValue(),
-				values: ["auto", "pi", "opencode"],
-			},
 			{
 				id: "model",
 				label: "Model",
@@ -251,14 +247,15 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 			{
 				id: "maxSubagents",
 				label: "Concurrent subagents",
-				description: "Maximum pi-backed subagents running at once. Type a number directly, then Enter.",
+				description:
+					"Maximum pi-backed subagents running at once; 0 disables pi subagents. Type a number directly, then Enter.",
 				currentValue: maxSubagentsValue(),
 			},
 			{
 				id: "maxOpencodeSubagents",
 				label: "OpenCode subagents",
 				description:
-					"Maximum opencode-backed subagents running at once — an independent pool, on top of the pi limit above. Type a number directly, then Enter.",
+					"Maximum opencode-backed subagents running at once; 0 disables opencode subagents. An independent pool, on top of the pi limit above. Type a number directly, then Enter.",
 				currentValue: maxOpencodeValue(),
 			},
 			{
@@ -315,9 +312,7 @@ export async function showSubagentConfigUi(pi: ExtensionAPI, ctx: ExtensionComma
 			(id, newValue) => {
 				// Submenu rows (`model`, `thinking`, `opencode`) mutate the draft inside
 				// their submenu callbacks; their onChange is a no-op here.
-				if (id === "backend") {
-					draft.backend = newValue === "auto" ? undefined : (newValue as SubagentBackend);
-				} else if (id === "allowTmp") {
+				if (id === "allowTmp") {
 					draft.allowTmp = newValue === "yes";
 				} else if (id === "autoResume") {
 					draft.autoResume = newValue === "yes";

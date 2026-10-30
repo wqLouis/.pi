@@ -5,7 +5,6 @@
 
 import * as fs from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_OPENCODE_MODEL } from "./constants.ts";
 import {
 	formatToolList,
 	getMaxOpencodeSubagents,
@@ -14,7 +13,7 @@ import {
 	parseToolList,
 	saveConfig,
 } from "./config.ts";
-import { isOpencodeModel, isThinkingLevel } from "./models.ts";
+import { isOpencodeCliModel, isOpencodeModel, isThinkingLevel } from "./models.ts";
 import {
 	countRunningSubagents,
 	findRecordByName,
@@ -68,12 +67,12 @@ function listAllRecords(): SubagentRecord[] {
 }
 
 const CONFIG_USAGE =
-	"Usage: /subagent config [maxSubagents <n> | maxOpencodeSubagents <n> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | autoPrefill yes|no | backend pi|opencode|auto | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|reset>] — no args opens the settings panel.";
+	"Usage: /subagent config [maxSubagents <n|0> | maxOpencodeSubagents <n|0> | autoResume yes|no | maxAutoResumes <n> | scope <path> | allowTmp yes|no | autoPrefill yes|no | opencodeModel <id> | opencodeEffort <variant|default> | thinkingLevel <level|default> | tools <names|all|reset>] — no args opens the settings panel. A pool limit of 0 disables that pool. The backend is chosen by which spawn tool is enabled (subagent_spawn = pi, subagent_spawn_opencode = OpenCode), not by this config.";
 
 export function registerSubagentCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("subagent", {
 		description:
-			"Manage subagents: /subagent list | view [name] | result <name> | interrupt <name> <msg> | scope <name> <path|none> | forget <name> | model [provider/id] | config (agents spawn subagents via the subagent_spawn tool)",
+			"Manage subagents: /subagent list | view [name] | result <name> | interrupt <name> <msg> | scope <name> <path|none> | forget <name> | model [provider/id] | config (agents spawn subagents via the enabled spawn tool: subagent_spawn = pi, subagent_spawn_opencode = OpenCode)",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const first = parts[0];
@@ -83,6 +82,13 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 				const modelArg = parts[1];
 
 				const setModel = (label: string) => {
+					// An OpenCode-CLI model is that backend's model; pi models stay pi's.
+					if (isOpencodeCliModel(label)) {
+						cfg.opencodeModel = label;
+						saveConfig(cfg);
+						ctx.ui.notify(`OpenCode subagent model set to ${label}.`, "info");
+						return;
+					}
 					cfg.model = label;
 					saveConfig(cfg);
 					ctx.ui.notify(`Subagent model set to ${label}.`, "info");
@@ -111,14 +117,18 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 				const key = parts[1];
 				if (key === "maxSubagents" || key === "maxOpencodeSubagents" || key === "maxAutoResumes") {
 					const val = Number(parts[2]);
-					const min = key === "maxAutoResumes" ? 0 : 1;
-					if (!Number.isFinite(val) || val < min) {
-						ctx.ui.notify(`Usage: /subagent config ${key} <${min === 0 ? "non-negative" : "positive"} integer>`, "info");
+					if (!Number.isFinite(val) || val < 0) {
+						ctx.ui.notify(`Usage: /subagent config ${key} <non-negative integer>`, "info");
 						return;
 					}
 					cfg[key] = Math.floor(val);
 					saveConfig(cfg);
-					ctx.ui.notify(`${key} set to ${cfg[key]}.`, "info");
+					ctx.ui.notify(
+						key === "maxAutoResumes" || cfg[key] > 0
+							? `${key} set to ${cfg[key]}.`
+							: `${key} set to 0 — that subagent pool is disabled.`,
+						"info",
+					);
 					return;
 				}
 				if (key === "scope") {
@@ -157,24 +167,6 @@ export function registerSubagentCommand(pi: ExtensionAPI): void {
 					cfg[key] = v === "yes";
 					saveConfig(cfg);
 					ctx.ui.notify(`${key} set to ${cfg[key] ? "yes" : "no"}.`, "info");
-					return;
-				}
-				if (key === "backend") {
-					const v = parts[2]?.toLowerCase();
-					if (v !== "pi" && v !== "opencode" && v !== "auto") {
-						ctx.ui.notify("Usage: /subagent config backend pi|opencode|auto", "info");
-						return;
-					}
-					cfg.backend = v === "auto" ? undefined : v;
-					saveConfig(cfg);
-					ctx.ui.notify(
-						v === "auto"
-							? "Subagent backend set to auto (inferred from the model)."
-							: v === "opencode"
-								? `Subagent backend set to opencode (model: ${cfg.opencodeModel ?? DEFAULT_OPENCODE_MODEL}). Needs the opencode CLI on PATH.`
-								: "Subagent backend set to pi.",
-						"info",
-					);
 					return;
 				}
 				if (key === "opencodeModel") {

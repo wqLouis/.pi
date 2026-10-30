@@ -24,7 +24,7 @@ self-managing, multi-agent system. Eight extensions, loaded from
 5. **command-code-provider** — Command Code's OpenAI/Anthropic-compatible provider endpoint.
 6. **codemode-default** — `codemode` is active in every session by default.
 7. **agent-mode** — pick TOKEN MAXING (delegate to subagents) or SINGLE AGENT at startup and after compaction.
-8. **tool-loadout** — pick the active tools at the start of each session (or with `/tools`); core tools toggle one by one, extension tools as a unit.
+8. **tool-loadout** — pick the active tools at the start of each session; core tools toggle one by one, extension tools as a unit, and the loadout is fixed on the first turn (reopened after a compaction).
 9. **codemode prompt patch** — the codemode tool prompt tells the model to prefer codemode over single tool calls.
 10. **system-prompt-view** — `/system` shows the live system prompt in gray TUI text plus an approximate token count.
 11. **web-search** — `web_search` / `web_fetch` backed by DeepSeek's Search & Fetch API or EXA.
@@ -42,7 +42,7 @@ should never idle waiting on something while it can still be doing work.
 Everything that takes time is pushed to the background and reports back
 automatically:
 
-- `subagent_spawn` — delegate and move on; **every spawn is asynchronous** and the
+- `subagent_spawn` / `subagent_spawn_opencode` — delegate and move on; **every spawn is asynchronous** and the
   completion **auto-bubbles** as a real message with the subagent's full final response.
   Do not sleep or poll for subagents; the harness wakes the agent when each finishes.
 - `subagent_interrupt` — steering is immediate: it kills the subagent's in-flight turn
@@ -68,27 +68,30 @@ each owning a private pi session file (or an OpenCode session, on the opencode
 backend). Every turn runs a one-shot pi/opencode process against that session,
 so steering truly continues its work with full history.
 
-The extension is a folder project (`subagent/`): `index.ts` (wiring), `tools.ts`,
-`command.ts`, `runtime.ts` (process registry, notify, resume), `config.ts` +
-`constants.ts` + `types.ts`, `models.ts` (backend inference, thinking levels),
-`records.ts` / `scope.ts` / `state.ts` (persistence + enforcement), `prompts.ts`,
-`usage.ts`, `child.ts` (in-subagent hooks), `backends/pi.ts` + `backends/opencode.ts`
-(process spawners, ACP probe), and `ui/` (settings panel, pickers).
+The extension is a folder project (`subagent/`): `index.ts` (wiring), `tools.ts`
+(shared management tools), `spawn.ts` (the two backend spawn registries),
+`tool-groups.ts` (loadout units), `command.ts`, `runtime.ts` (process registry,
+notify, resume), `config.ts` + `constants.ts` + `types.ts`, `models.ts` (backend
+inference, thinking levels), `records.ts` / `scope.ts` / `state.ts` (persistence
++ enforcement), `prompts.ts`, `usage.ts`, `child.ts` (in-subagent hooks),
+`backends/pi.ts` + `backends/opencode.ts` (process spawners, ACP probe), and
+`ui/` (settings panel, pickers).
 
 | Tool | Purpose |
 |------|---------|
-| `subagent_spawn { task?, name?, tasks?, backend?, prefillReads?, scope? }` | Spawn one background subagent (always async), or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent. `backend: "opencode"` runs on the OpenCode CLI; everything else (model, thinking level/effort, cwd, tools, system prompt) comes from the user's configuration |
+| `subagent_spawn { task?, name?, tasks?, prefillReads?, scope? }` | Spawn pi-backed subagent(s): one background subagent, or pass `tasks: [{ task, name, scope? }]` for parallel subagents. Provide **exactly one** of `task`/`tasks`, and a unique `name` for every subagent. Model, thinking level, cwd, tools, and system prompt come from the user's configuration |
+| `subagent_spawn_opencode { task?, name?, tasks?, prefillReads?, scope? }` | Same, but every subagent runs on the **OpenCode CLI** (its own agent loop, tools, and free models). Enable only the backend(s) you use with `/tools`: the pi and OpenCode spawn tools are separate registries (`subagent-pi`, `subagent-opencode`) |
 | `subagent_interrupt { name, message }` | Steer a subagent now: kills its in-flight turn (or starts a fresh turn if idle) and immediately restarts it with the message (full context preserved) |
 | `subagent_scope { name, scope?, clear?, allowTmp? }` | Change a subagent's edit scope — **live**, even while it is running; `clear: true` restores unrestricted writes |
 | `subagent_list` | Running/finished subagents: name, model, usage, latest output |
 | `subagent_result { name }` | Full transcript: task, steering messages, tool activity, outputs |
 | `subagent_forget { name }` | Interrupt a subagent, then delete it and its session (no error is reported back) |
-| `subagent_config` | Effective config: backend, model, thinking level, OpenCode model/effort, system prompt, cwd, tools, per-pool limits + live usage |
+| `subagent_config` | Effective config: model, thinking level, OpenCode model/effort, system prompt, cwd, tools, per-pool limits + live usage |
 | `subagent_message { message }` | Bubble-up tool (only inside subagents): send progress, findings, questions, or blockers to the main agent |
 
 Key behaviors:
 
-- **Never sleep for subagents** — `subagent_spawn` returns immediately and the
+- **Never sleep for subagents** — `subagent_spawn` (and `subagent_spawn_opencode`) returns immediately and the
   harness auto-bubbles the completion; the tool description and guidelines
   explicitly tell the agent not to sleep, poll, or wait for subagents. When the
   next step depends on a result, the agent is told to **end its turn** with a
@@ -142,9 +145,11 @@ Key behaviors:
   same as `--mode json`, so usage/output/bubbles are unchanged). The control
   channel is what makes graceful abort-and-continue possible; the child is shut
   down by closing stdin once a turn settles with no continuation queued.
-- **OpenCode backend** — pass `backend: "opencode"` (or a model id like
-  `opencode/big-pickle`) to run a subagent on the **OpenCode CLI** instead of pi.
-  The child is launched as `opencode acp` and driven over the Agent Client
+- **OpenCode backend** — enable the `subagent_spawn_opencode` tool (it is its
+ow unit, `subagent-opencode`, in `/tools`) to run subagents on the **OpenCode CLI**
+instead of pi. Disable `subagent_spawn` (`subagent-pi`) if you never use pi
+subagents; both tools can be enabled at once. The child is launched as
+`opencode acp` and driven over the Agent Client
   Protocol (newline-delimited JSON-RPC on stdio): `initialize` → `session/new`
   (or `session/load`) → `session/set_config_option` (model, effort, mode) →
   `session/prompt`, streaming `session/update` chunks back. This is how pi uses
@@ -157,15 +162,15 @@ Key behaviors:
   continues on the same session. Edit scope is conveyed to OpenCode in the
   first-turn preamble (OpenCode enforces its own permissions). The OpenCode
   model and effort are user configuration: set them in `/subagent config`
-  (backend, OpenCode model + effort, probed live from the CLI) or with
-  `/subagent config backend opencode`, `/subagent config opencodeModel <id>`,
-  and `/subagent config opencodeEffort <variant|default>` (default model:
-  `opencode/big-pickle`). A spawn only chooses the backend — pass
-  `backend: "opencode"`. Models from pi's own `opencode-go` provider stay on the
-  pi backend.
-- **Thinking levels & efforts are user-configured** — the spawn tool does not
-  take model/thinking/effort parameters; it only takes tasks and, optionally,
-  the backend. For pi subagents, `/subagent config` sets the **thinking level**
+  (OpenCode model + effort, probed live from the CLI) or with
+  `/subagent config opencodeModel <id>` and
+  `/subagent config opencodeEffort <variant|default>` (default model:
+  `opencode/big-pickle`). The spawn tool decides the backend (`subagent_spawn`
+  = pi, `subagent_spawn_opencode` = OpenCode). Models from pi's own
+  `opencode-go` provider stay on the pi backend.
+- **Thinking levels & efforts are user-configured** — the spawn tools do not
+  take model/thinking/effort parameters; they only take tasks (and prefill
+  reads / scope). For pi subagents, `/subagent config` sets the **thinking level**
   (`off` … `max`, passed to the child as `--thinking`); the panel lists only the
   levels the selected model supports (`getSupportedThinkingLevels` from
   `@earendil-works/pi-ai`). For opencode subagents it sets the model's **effort**
@@ -178,10 +183,12 @@ Key behaviors:
   `maxOpencodeSubagents` opencode subagents (default 2) at the same time, so
   running opencode work never blocks pi work. Configure with
   `/subagent config maxSubagents N` / `maxOpencodeSubagents N` (or the matching
-  keys in `subagent-config.json`).
+  keys in `subagent-config.json`). A limit of **0 disables that pool**: spawning
+  a subagent on that backend is refused (the other pool is unaffected).
 - **Limits visible to every agent** — `subagent_config` and `subagent_list`
   report each pool's live usage vs its limit (`maxSubagents` / `maxOpencodeSubagents`);
-  `subagent_spawn` refuses to exceed a pool with a clear reason.
+  the spawn tools refuse to exceed a pool with a clear reason, and a `0` limit
+  says the pool is disabled.
 - **Named subagents** — every spawn requires a short, unique `name` (single `name` or `tasks[].name`); it is the only handle used by users and agents, in listings, completion notifications, and `subagent_interrupt` / `subagent_result` / `subagent_forget` (exact name or unique prefix). The internal id is never shown and exists only for session-file management.
 - **Bubble channel** — `subagent_message` inside a child is
   emitted as `{"type":"subagent_bubble",...}` JSON lines on the child's
@@ -198,20 +205,22 @@ Key behaviors:
   `view [name]` (live, markdown-rendered transcript overlay with scrolling,
   tool-call cards, follow mode, and Esc to close), `result <name>`,
   `interrupt <name> <msg>`, `scope <name> <path|none>`, `forget <name>`,
-  `model [provider/id]` (pi's built-in model selector; also accepts `opencode/<id>`),
+  `model [provider/id]` (pi's built-in model selector; an `opencode/<id>` sets the OpenCode model instead),
   and `config`. `/subagent config` with no arguments opens an interactive panel
-  where every change **saves immediately** (no Ctrl+S): backend (`auto|pi|opencode`),
+  where every change **saves immediately** (no Ctrl+S):
   pi model picker (Tab toggles scoped models), thinking level for the selected model,
   OpenCode model + effort (probed live from the CLI), a **Subagent tools**
-  checklist, `maxSubagents`, `maxOpencodeSubagents` (the opencode pool),
+  checklist, `maxSubagents`, `maxOpencodeSubagents` (the opencode pool; both
+  accept `0` to disable the pool),
   `allowTmp`, `autoPrefill`, `autoResume`, `maxAutoResumes`, plus the current
   cwd/scope. The
-  same keys are settable non-interactively: `backend`, `opencodeModel`,
+  same keys are settable non-interactively: `opencodeModel`,
   `opencodeEffort`, `thinkingLevel`, `tools`, `maxSubagents`,
   `maxOpencodeSubagents`, `autoPrefill`, `autoResume`, `maxAutoResumes`,
   `scope`, `allowTmp`.
-  Subagents are spawned by the agent through the `subagent_spawn` tool, not from this
-  command.
+  Subagents are spawned by the agent through the spawn tools, not from this
+  command; which backend is enabled is a `/tools` decision (the `subagent-pi`
+  and `subagent-opencode` units).
 - **Per-subagent tools** — `/subagent config` includes a **Subagent tools**
   checklist (also `/subagent config tools read,bash,edit`, `tools all`, or
   `tools reset`). Core tools toggle one by one; an extension's tools are one
@@ -387,7 +396,9 @@ The footer shows `mode:token-maxing` or `mode:single`.
 `tool-loadout.ts` opens a checklist at the start of each new session (startup,
 `/new`, or fork), just like the agent-mode picker. Enter applies the checked
 set; Escape keeps the restored/default set. Resuming or reloading a session
-restores the persisted choice without asking. `/tools` changes it later.
+restores the persisted choice without asking. The loadout is **fixed on the
+first turn** and then locked; `/tools` reopens it after a compaction (or start a
+new session to change it).
 
 **The selection is remembered across sessions.** Every choice is also written to
 `~/.pi/agent/tool-loadout.json`, so the next session starts from the last
@@ -398,35 +409,48 @@ is left out of the checklist and of the remembered list.
 **Selection unit.** Core tools (`read`, `bash`, `edit`, `write`, `grep`,
 `find`, `ls`, `powershell`) toggle one by one — turning off `write` while
 keeping `read` is a normal wish. Everything an **extension** registers is one
-unit: the browser tools, the subagent tools and pi's built-in `codemode` /
-`tool_search` extensions are enabled or disabled as a whole, because half an
-extension is rarely useful. The unit id is the extension's file path, so a new
-tool added to an extension joins the unit automatically.
+unit: the browser tools, the subagent management tools and pi's built-in
+`codemode` / `tool_search` extensions are enabled or disabled as a whole,
+because half an extension is rarely useful. The unit id is the extension's file
+path, so a new tool added to an extension joins the unit automatically.
+
+An extension can declare **named registries** with a tool `namespace`; each
+becomes its own unit (`<path>#<namespace>`), and selecting it also selects the
+extension's base unit, which holds the shared tools. The subagent extension uses
+this for its backends: `subagent` (management tools), `subagent-pi`
+(`subagent_spawn`), and `subagent-opencode` (`subagent_spawn_opencode`). In a
+session that only uses OpenCode, check `subagent` + `subagent-opencode` and the
+pi spawn tool is never declared (and vice versa) — so you pay for one backend's
+tool schema, not both.
 
 ```text
 /tools                         # interactive checklist
 /tools read,bash,edit          # replace the selection with these
-/tools +subagent               # add a unit (or a single core tool)
+/tools +subagent-opencode      # add a registry (also enables its base unit)
 /tools -write                  # remove a unit (or a single core tool)
 /tools all | none              # every unit / only codemode (always on)
-/tools show                    # current selection + available units
+/tools show                    # current selection, lock state, available units
 ```
+
+Every mutating `/tools` call is refused while the loadout is locked (the status
+line shows a lock glyph). `/tools show` always works.
 
 Note: `codemode` does not bypass the loadout. A script can only call tools
 that are callable — a `direct` tool must be active. With `codemode` alone the
 sandbox has no `tools.read`/`tools.bash` (only MCP tools with `codemode`
 exposure stay reachable).
 
-**Cache safety and interruptions.** Changing tools with
-`pi.setActiveTools()` makes pi record a system-prompt *patch*
-(`toolsAdded` / `toolsRemoved`) in the transcript; it does not replace the
-already-cached prompt prefix. The extension never returns a replacement
-`systemPrompt`. When the selection changes while the agent is streaming,
-`/tools` aborts the in-flight turn, waits for idle, and starts a new turn with
-a compact tool-loadout message injected into the conversation — the same
-interrupt-then-continue idea as `subagent_interrupt`. When the agent is idle,
-the message is injected with the next prompt. The selected set is persisted per
-session branch and re-applied before every run.
+**Fixed on the first turn, no injected messages.** The selection is applied
+before the first run and then locked. That run builds its system prompt from the
+selected tools (pi renders them into the prompt's `<tools>` section), so the
+loadout is already in the system prompt — the extension **never injects a
+loadout message and never returns a replacement `systemPrompt`**. Changing tools
+mid-session would churn the cached prompt prefix, so it is refused until the
+next compaction; after a compaction the prompt is rebuilt anyway and `/tools`
+is allowed again for the rest of that session. `pi.setActiveTools()` records the
+change as a system-prompt *patch* (`toolsAdded` / `toolsRemoved`), so the
+existing cached prefix is preserved. The selected set is persisted per session
+branch and re-applied before every run.
 
 ## 9. codemode prompt patch — prefer codemode over single tool calls
 
@@ -596,8 +620,8 @@ Key behaviors:
 | `EXA_API_KEY` | Key for the EXA search and contents APIs |
 | `PI_DOCS_SECTION` | `always`/`never`/`auto` — when to include pi's docs section in the system prompt |
 | `PI_SUBAGENT_DEPTH` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_SCOPE` / `PI_TASK_BASE` | Set on subagent processes (depth guard, browser session id, edit scope, shared task board) |
-| `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`) |
-| `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool) |
+| `PI_SUBAGENT_MAX_SUBAGENTS` | Override the pi subagent concurrency limit (default `4`; `0` disables pi subagents) |
+| `PI_SUBAGENT_MAX_OPENCODE_SUBAGENTS` | Override the opencode subagent concurrency limit (default `2`, independent pool; `0` disables opencode subagents) |
 | `PI_SUBAGENT_SCOPE_BLOCK_TMP` | `1` = block scoped subagents from writing to the temp dir (default: allowed) |
 | `PI_SUBAGENT_TOOLS_SET` | Set by the parent when a subagent has an explicit tools list; skips default `codemode` activation in the child |
 | `PI_CACHE_RETENTION` | Prompt-cache retention for child processes: the harness sets `long` so a batch's shared prefix stays cached |

@@ -94,7 +94,11 @@ export interface SubagentConfig {
 	model?: string;
 	/** Thinking level for pi-backed subagents; undefined lets the model default apply. */
 	thinkingLevel?: ThinkingLevel;
-	/** Default runtime for new subagents: the pi CLI (default) or the opencode CLI. */
+	/**
+	 * Legacy backend preference. The spawn tool that is enabled decides the
+	 * backend (`subagent_spawn` = pi, `subagent_spawn_opencode` = OpenCode), so
+	 * this no longer selects it for main-agent spawns.
+	 */
 	backend?: SubagentBackend;
 	/** OpenCode model id used when the backend is opencode (default: a free model). */
 	opencodeModel?: string;
@@ -105,8 +109,9 @@ export interface SubagentConfig {
 	/** Comma-separated tool allowlist passed to pi children as `--tools`; unset = child defaults. */
 	tools?: string;
 
+	/** Concurrent pi-backed subagents allowed. 0 disables pi subagents. */
 	maxSubagents?: number;
-	/** Concurrent opencode-backed subagents allowed. Independent from maxSubagents (their own pool). */
+	/** Concurrent opencode-backed subagents allowed; an independent pool. 0 disables opencode subagents. */
 	maxOpencodeSubagents?: number;
 	/** Automatically resume interrupted subagents when a session is resumed/reloaded. Default true. */
 	autoResume?: boolean;
