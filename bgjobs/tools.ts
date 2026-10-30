@@ -6,9 +6,11 @@
  * inspecting and stopping jobs.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { findRecord, isAmbiguous, listRecords } from "./records.ts";
+import { findRecord, isAmbiguous, listRecords, listResultLogs } from "./records.ts";
 import { describeStatus, formatDuration, killJob, startJob, tailFile } from "./runtime.ts";
 import type { JobRecord } from "./types.ts";
 
@@ -41,7 +43,8 @@ function jobLine(rec: JobRecord): string {
 		? formatDuration(rec.finishedAt - rec.startedAt)
 		: formatDuration(Date.now() - rec.startedAt);
 	const state = rec.status === "running" ? "running" : describeStatus(rec);
-	return `${rec.name} [${rec.id}] — ${state} — ${duration}`;
+	const log = rec.resultPath ? ` — log: ${rec.resultPath}` : "";
+	return `${rec.name} [${rec.id}] — ${state} — ${duration}${log}`;
 }
 
 export function registerBgJobTools(pi: ExtensionAPI): void {
@@ -49,7 +52,7 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 		name: "bgjob_start",
 		label: "Background Job Start",
 		description:
-			"Run a shell command in the background. The tool returns immediately with a job id; the job keeps running while you do other things, and the harness calls you back with its exit code and the tail of its output when it ends. Use this for long commands (builds, test suites, installs, dev servers, long scripts) instead of a blocking bash call. Never poll or sleep for a job: if the next step depends on the result, end your turn and continue when the callback arrives.",
+			"Run a shell command in the background. The tool returns immediately with a job id; the job keeps running while you do other things, and the harness calls you back with its exit code, the tail of its output and the path of its full log when it ends. Use this for long commands (builds, test suites, installs, dev servers, long scripts) instead of a blocking bash call. Never poll or sleep for a job: if the next step depends on the result, end your turn and continue when the callback arrives.",
 		promptSnippet: "Run a shell command in the background and get called back when it finishes",
 		promptGuidelines: [
 			"Start long or slow commands with bgjob_start instead of bash: the job runs in the background and the harness notifies you as soon as it finishes, with the exit code and the tail of the output.",
@@ -57,6 +60,7 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 			"Give every job a short, unique name so it can be found again: bgjob_output, bgjob_kill and the listings all take the name or the id.",
 			"Use bgjob_output to look at a job's log while it runs, bgjob_list to see all jobs of this session, and bgjob_kill to stop a job that is not needed anymore.",
 			"A non-zero exit code means the command failed: read the output tail in the callback, fix the problem, and start the job again.",
+			"Jobs are transient: when a job finishes, its record is deleted, but its full log stays in the temp directory. The completion callback gives you that path — read it (cat, grep, tail) whenever you need more than the tail.",
 		],
 		parameters: Type.Object({
 			command: Type.String({
@@ -114,26 +118,41 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 		name: "bgjob_list",
 		label: "Background Job List",
 		description:
-			"List the background jobs of this session: name, id, state (running / finished successfully / failed / killed / timed out), exit code and how long it ran.",
+			"List the background jobs of this session: name, id, state (running / finished successfully / failed / killed / timed out), exit code and how long it ran, and the path of the result log of a finished job.",
 		promptSnippet: "List the background jobs of this session",
 		parameters: Type.Object({}),
 		async execute() {
 			const records = listRecords();
-			if (records.length === 0) {
+			const results = listResultLogs(10);
+			if (records.length === 0 && results.length === 0) {
 				return {
 					content: [{ type: "text", text: "No background jobs in this session." }],
-					details: { jobs: [] },
+					details: { jobs: [], results: [] },
 				};
 			}
+			const lines: string[] = [];
+			if (records.length > 0) lines.push(...records.map(jobLine));
+			if (results.length > 0) {
+				if (lines.length > 0) lines.push("");
+				lines.push("Recent result logs (in the temp directory):");
+				lines.push(
+					...results.map(
+						(r) =>
+							`  ${r.file} — ${Math.round(r.size / 1024)} KB — ${new Date(r.mtimeMs).toISOString()}`,
+					),
+				);
+			}
 			return {
-				content: [{ type: "text", text: records.map(jobLine).join("\n") }],
+				content: [{ type: "text", text: lines.join("\n") }],
 				details: {
 					jobs: records.map((r) => ({
 						id: r.id,
 						name: r.name,
 						status: r.status,
 						exitCode: r.exitCode,
+						resultPath: r.resultPath ?? null,
 					})),
+					results: results.map((r) => ({ path: r.path, size: r.size })),
 				},
 			};
 		},
@@ -143,7 +162,7 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 		name: "bgjob_output",
 		label: "Background Job Output",
 		description:
-			"Show the output (stdout and stderr) of a background job — the tail of its log by default. Works while the job is still running.",
+			"Show the output (stdout and stderr) of a background job — the tail of its log by default. Works while the job is still running, and for a finished job pass the result log path you got in the completion callback (or the job name while its record still exists).",
 		promptSnippet: "Read the output log of a background job",
 		parameters: Type.Object({
 			job: JobHandle,
@@ -158,18 +177,44 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params) {
 			const handle = params.job.trim();
 			if (!handle) return errorResult("Error: job is required.");
+			const lines = Math.min(500, Math.max(1, Math.round(params.lines ?? 50)));
+
+			// A path (the result log of a finished job) is read directly.
+			if (handle.startsWith("/") || handle.startsWith("~")) {
+				const file = handle.startsWith("~")
+					? path.join(process.env.HOME ?? "/root", handle.slice(1))
+					: handle;
+				if (!fs.existsSync(file)) {
+					return errorResult(`Error: no file at "${file}".`);
+				}
+				const tail = tailFile(file, lines, 256_000);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Result log ${file}\n--- output ---\n${tail || "(empty)"}`,
+						},
+					],
+					details: { ...jobDetails(undefined), path: file },
+				};
+			}
+
 			if (isAmbiguous(handle)) {
 				return errorResult(
 					`Error: "${handle}" matches more than one job. Use the exact name or id (see bgjob_list).`,
 				);
 			}
 			const rec = findRecord(handle);
-			if (!rec) return errorResult(`Error: no background job matching "${handle}".`);
+			if (!rec) {
+				return errorResult(
+					`Error: no background job matching "${handle}" (a finished job keeps only its result log — pass the path you got in the completion callback, or use bash to read it).`,
+				);
+			}
 
-			const lines = Math.min(500, Math.max(1, Math.round(params.lines ?? 50)));
-			const tail = tailFile(rec.logPath, lines, 64_000);
+			const logPath = rec.resultPath ?? rec.logPath;
+			const tail = tailFile(logPath, lines, 64_000);
 			const state = rec.status === "running" ? "still running" : describeStatus(rec);
-			const header = `Job "${rec.name}" [${rec.id}] — ${state}\nCommand: ${rec.command}\n`;
+			const header = `Job "${rec.name}" [${rec.id}] — ${state}\nCommand: ${rec.command}\nLog: ${logPath}\n`;
 			const body = tail ? `--- output ---\n${tail}` : "--- output ---\n(no output yet)";
 			return {
 				content: [{ type: "text", text: `${header}${body}` }],
@@ -196,7 +241,11 @@ export function registerBgJobTools(pi: ExtensionAPI): void {
 				);
 			}
 			const rec = findRecord(handle);
-			if (!rec) return errorResult(`Error: no background job matching "${handle}".`);
+			if (!rec) {
+				return errorResult(
+					`Error: no background job matching "${handle}" (finished jobs are deleted once reported).`,
+				);
+			}
 			if (rec.status !== "running") {
 				return {
 					content: [

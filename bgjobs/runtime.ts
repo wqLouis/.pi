@@ -15,12 +15,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	deleteJobFiles,
+	deleteJobState,
 	exitFile,
 	listRecords,
 	loadRecord,
 	logFile,
 	newJobId,
 	nameFromCommand,
+	promoteResultLog,
 	saveRecord,
 	scriptFile,
 	uniqueName,
@@ -135,8 +138,13 @@ export function describeStatus(rec: JobRecord): string {
 export function buildCompletionText(rec: JobRecord): string {
 	const duration = rec.finishedAt ? formatDuration(rec.finishedAt - rec.startedAt) : "unknown duration";
 	const head = `[bgjob] Job "${rec.name}" ${describeStatus(rec)} (${duration}, id ${rec.id}).`;
-	const tail = tailFile(rec.logPath, 20, 4000);
-	return tail ? `${head}\n--- output (tail) ---\n${tail}` : head;
+	// The full log stays in the temp directory: the agent gets its path and can
+	// read, grep or tail it whenever it needs to.
+	const logPath = rec.resultPath ?? rec.logPath;
+	const logLine = rec.resultPath ? `Full log: ${rec.resultPath}` : "";
+	const tail = tailFile(logPath, 40, 8000);
+	const parts = [head, logLine, tail ? `--- output (tail) ---\n${tail}` : ""].filter(Boolean);
+	return parts.join("\n");
 }
 
 /** Push the completion message to the agent and to the user's UI. */
@@ -151,6 +159,8 @@ export function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: JobReco
 		pi.sendUserMessage(buildCompletionText(rec), { deliverAs: "steer" });
 		rec.notifiedAt = Date.now();
 		saveRecord(rec);
+		// The job is over: its state goes away, its result log stays.
+		deleteJobState(rec);
 	} catch {
 		// A missing send target leaves the record pending; the flush timer retries.
 	}
@@ -159,15 +169,17 @@ export function notifyDone(pi: ExtensionAPI, ctx: ExtensionContext, rec: JobReco
 /** Re-deliver completion messages that were never pushed (reload, busy turn, ...). */
 export function flushPendingNotifications(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	if (isDisposed()) return;
-	try {
-		for (const rec of listRecords()) {
-			if (rec.status === "running" || rec.notifiedAt) continue;
+	for (const rec of listRecords()) {
+		if (rec.status === "running" || rec.notifiedAt) continue;
+		try {
 			pi.sendUserMessage(buildCompletionText(rec), { deliverAs: "steer" });
 			rec.notifiedAt = Date.now();
 			saveRecord(rec);
+			// The job is over: its state goes away, its result log stays.
+			deleteJobState(rec);
+		} catch {
+			// Still no send target: the next flush tries again.
 		}
-	} catch {
-		// Nothing to flush or the session is gone.
 	}
 }
 
@@ -188,6 +200,10 @@ export function finalizeJob(
 	else if (rec.exitCode === 0) rec.status = "done";
 	else if (rec.exitCode === null) rec.status = "lost";
 	else rec.status = "failed";
+	// Keep the output: the log moves to the results directory and the agent
+	// gets its path in the completion callback.
+	const result = promoteResultLog(rec);
+	if (result) rec.resultPath = result;
 	saveRecord(rec);
 	notifyDone(pi, ctx, rec);
 }
@@ -288,6 +304,8 @@ export function startJob(
 				// Nothing to do.
 			}
 		}
+		// Nothing was started: do not leave the wrapper script behind.
+		deleteJobFiles(rec);
 		return {
 			ok: false,
 			error: `failed to start job: ${error instanceof Error ? error.message : String(error)}`,

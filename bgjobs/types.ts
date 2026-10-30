@@ -27,6 +27,12 @@ export interface JobRecord {
 	finishedAt?: number;
 	/** Log file: stdout and stderr of the job. */
 	logPath: string;
+	/**
+	 * Result log of a finished job: the full output, kept in the temp
+	 * directory under a readable name. The agent gets this path in the
+	 * completion callback, so it can read the whole log afterwards.
+	 */
+	resultPath?: string;
 	/** File the wrapper writes the command's exit code to. */
 	exitFile: string;
 	/** Wrapper script that runs the command and records its exit code. */

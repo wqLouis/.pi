@@ -5,8 +5,9 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 let activeDir: string | undefined;
 let disposed = false;
@@ -41,11 +42,22 @@ export function isDisposed(): boolean {
 	return disposed;
 }
 
-/** Root directory holding every session's job records, logs and exit files. */
+/**
+ * Root directory holding every session's job records, logs and exit files.
+ *
+ * The store lives in the temp directory: a job is transient (its record is
+ * deleted as soon as it has been reported) and only its result log is kept
+ * there, so nothing is written to the agent's own state directory.
+ */
 export function jobsRoot(): string {
 	return process.env.PI_BGJOBS_DIR
 		? path.resolve(process.env.PI_BGJOBS_DIR)
-		: path.join(getAgentDir(), "bgjobs");
+		: path.join(os.tmpdir(), "pi-bgjobs");
+}
+
+/** Directory holding the result logs of finished jobs (one file per job). */
+export function resultsRoot(): string {
+	return path.join(jobsRoot(), "results");
 }
 
 /** Directory holding this session's job records, logs and exit files. */

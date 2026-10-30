@@ -8,17 +8,24 @@
  *
  * Jobs survive the pi process: a later session adopts the ones that are still
  * running, and the completion callback is delivered then.
+ *
+ * Jobs are transient: once a job has been reported, its record is deleted and
+ * only its result log (in the temp directory) is kept, so the agent can still
+ * read the whole output.
  */
 
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerBgJobCommand } from "./command.ts";
 import { adoptOrphanJobs, detachLiveJobs, flushPendingNotifications } from "./runtime.ts";
+import { pruneAllReportedArtifacts, pruneOldResults } from "./records.ts";
 import { jobsRoot, markDisposed, resetState, sessionScopeKey, setActiveJobsDir } from "./state.ts";
 import { registerBgJobTools } from "./tools.ts";
 
 const FLUSH_DELAY_MS = 500;
 const FLUSH_INTERVAL_MS = 30_000;
+/** Result logs in the temp directory are dropped after this long. */
+const RESULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export default function (pi: ExtensionAPI) {
 	resetState();
@@ -37,6 +44,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		setActiveJobsDir(path.join(jobsRoot(), sessionScopeKey(ctx)));
+		// Jobs are transient: drop whatever a crashed session left behind and
+		// keep the temp directory tidy.
+		try {
+			pruneAllReportedArtifacts();
+			pruneOldResults(RESULT_MAX_AGE_MS);
+		} catch {
+			// Nothing to prune.
+		}
 		// Jobs that outlived an earlier pi process are picked up again.
 		try {
 			adoptOrphanJobs(pi, ctx);

@@ -546,13 +546,14 @@ code and the tail of the output, so the agent never has to poll a long command.
 | Tool | Purpose |
 |---|---|
 | `bgjob_start { command, name?, cwd?, timeout? }` | Start a background job; returns immediately with a job id. The harness notifies the agent when it ends |
-| `bgjob_list {}` | The session's jobs: name, id, state, exit code, runtime |
-| `bgjob_output { job, lines? }` | The tail of a job's log (stdout + stderr), also while it runs |
+| `bgjob_list {}` | The session's jobs: name, id, state, exit code, runtime (finished jobs are gone) |
+| `bgjob_output { job, lines? }` | The tail of a running job's log (stdout + stderr) |
 | `bgjob_kill { job }` | Stop a running job (its whole process group) |
 
 ```text
 /bgjobs              # list all jobs
-/bgjobs show <job>   # show a job's output
+/bgjobs results      # list the result logs of finished jobs
+/bgjobs show <job>   # show a job's output (a job name, or a result log path)
 /bgjobs kill <job>   # stop a running job
 /bgjobs kill-all     # stop every running job
 ```
@@ -562,6 +563,14 @@ Key behaviors:
 - **Never poll** — `bgjob_start` returns immediately; the completion callback
   carries the exit code and the output tail. A missed callback (reload, busy
   turn) is re-delivered by the idle timer, so no result is ever lost.
+- **Transient jobs, lasting results** — a job is not stored: right after the
+  completion callback is delivered, its record, exit file and wrapper script
+  are deleted. What *is* kept is the **result log**: the full output moves to
+  `<tmp>/pi-bgjobs/results/<name>--<id>.log` and the callback hands the agent
+  that path, so the whole log can still be read (`cat`, `grep`, `tail`) —
+  or through `bgjob_output <path>` — long after the job is gone. The store
+  lives in the temp directory, never in the agent's own state directory, and
+  result logs are dropped after 24 h.
 - **Jobs outlive pi** — each job runs in its own process group with stdout and
   stderr redirected straight into its log file, so it keeps running (and keeps
   logging) when pi quits. A later session **adopts** the jobs that are still
@@ -569,8 +578,10 @@ Key behaviors:
 - **Exit codes survive** — the job runs through a small wrapper script that
   records the command's exit code in a file, so even a job that outlived its
   pi process reports *how* it ended (the agent sees `failed (exit code 3)`).
-- **Session-scoped** — records, logs and exit files live in
-  `~/.pi/agent/bgjobs/<session>/`; one session never sees another's jobs.
+- **Session-scoped** — the job state lives in
+  `<tmp>/pi-bgjobs/<session>/`; one session never sees another's jobs. The
+  result logs are shared (their file name carries the job name and id), so a
+  later session can still read what an earlier one produced.
 - **Safety nets** — an optional `timeout` kills a job that never ends
   (`timed out after 60s`), and `bgjob_kill` stops a whole process group.
 
@@ -593,7 +604,7 @@ Key behaviors:
 | `PI_PROMPT_CACHE_KEY` | Prompt-cache key for child processes: the harness sets one key per main session so a batch shares a cache slot (needs the patch from section 9) |
 | `PI_OPENCODE_BIN` | Path to the `opencode` CLI for opencode-backed subagents (default: `opencode` on `PATH`) |
 | `PI_TASK_DIR` | Task-board root (default `/tmp`) |
-| `PI_BGJOBS_DIR` | Root directory for background-job records, logs and exit files (default `~/.pi/agent/bgjobs`) |
+| `PI_BGJOBS_DIR` | Root directory for background-job state and result logs (default `<tmp>/pi-bgjobs`) |
 | `PI_PLAYWRIGHT_IMPORT` | Absolute path to a playwright entry file (override) |
 | `PI_BROWSER_DAEMON_FILE` | Absolute path to `browser-server.mjs` |
 | `PI_PLAYWRIGHT_GLOBAL_DIR` | Extra global node_modules dir to scan for playwright |
